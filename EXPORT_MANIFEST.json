@@ -1,5 +1,4 @@
 {
-  "export_path": "/root/public-bot-export",
   "source_head": "9b706aa01ddc1935b7f24aaaada9760923fda77e",
   "source_worktree_status": [],
   "policy": "allowlist copy; independent history; manual-only; autoexecution off",
