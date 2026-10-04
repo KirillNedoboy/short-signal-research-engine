@@ -2,7 +2,7 @@
 
 This repository contains a sanitized, research-oriented implementation of a short-side market-monitoring and manual-signal pipeline. It consumes supplied or public market data, evaluates deterministic strategy contracts, persists local observations, and can render human-readable Telegram messages.
 
-## What a trader can inspect
+## Repository scope
 
 - Feature construction and strategy evaluators under `app/features/` and `app/signals/`.
 - Event and lifecycle state under `app/events/` and `app/baseline/`.
