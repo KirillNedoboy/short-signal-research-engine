@@ -204,7 +204,7 @@ bc8980a2d097fa672a165db19fcb921183621dc67ae933456f17a801985ad34f  ./app/storage/
 26b2eea1419f55ecb3f3f35f0cd7a6d91787ddb3cc79e8d6c13090cf68b591ad  ./app/storage/repository.py
 46803309bdb37912a60588ac9072afa3c08e4c7739b68e573b30029b3ab081bf  ./config.example.yaml
 730958898e277b3618688c91e0422d742648acd9fef06db4cd9166e33d4173a3  ./CONTRIBUTING.md
-60cef906d9dc39831a02d8c4f8f67454c4417d0615fb0730c0560811445d50b6  ./data/research-storage-health.json
+0210259cc7fe09a7f0271ad1548570cd2caa253557c8537766db0ec97a63d11c  ./data/research-storage-health.json
 68111dd8f66ce024444c7a198726988b76595f9244cbc2a80f892f561cd405c4  ./deploy/short-telegram-bot-lite.service.example
 dd3e779d9ee93b84ed00127df06df6b846095d018747da29a3940980ade83fc1  ./docs/architecture/baseline-source-faithful-replay.md
 98f59eda748a164ee1222999b2573eab55686eadd11f4f1e89dcacb53830f0b2  ./docs/architecture/current-trading-contract.md
@@ -224,7 +224,7 @@ d90ea994dcf4012c0cc2cab2af970f9f7323097511a3bcba82c247ea152eb301  ./docs/MATHEMA
 21a8da329d764429be154e40efc075607ebb69955db5b6f97dfa591ea4b9e527  ./docs/reports/2026-10-03-low-volume-v2-counterfactual.md
 24c57acac7afdb133f61e3dc8e0c38b258d00830e104e2214a973856b3e17040  ./docs/SIGNAL_PIPELINE.md
 9e2b96b90492cfa2fc5eb4d80231934a2ec20412771da50e76cc4746f7df9d31  ./docs/SOURCE_OF_TRUTH.md
-53ae86ac19c3155fa19a4f92c949d47d2c6c237e2ad8980f574dbafef6e3a2a1  ./docs/STRATEGIES.md
+cbf039769069e5ff08efd8a5d6fc6017d62c173709be610c36cbad6848bddea7  ./docs/STRATEGIES.md
 fdf7a8e85bf2a766065330093c508295903b16f21a0bda208b60aa04ed4d270b  ./docs/TESTING.md
 55167b2dd7df41988cdba60b072af407e879d8a415e3826d172aaca42cea27e1  ./docs/trader-review/evidence-and-results.md
 7f7e35f6d24f9487636db8b9c69bc1885419c961d73105aea95f9114cec84e6a  ./docs/trader-review/manual-signal-checklist.md
