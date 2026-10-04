@@ -1,0 +1,10 @@
+{
+  "warning_id": "example-warning-001",
+  "symbol": "EXAMPLEUSDT",
+  "type": "EARLY_DROP_WARNING",
+  "classification": "WEAKENING",
+  "actionable": false,
+  "enters_short_admission": false,
+  "cooldown_minutes": 30,
+  "autoexecution": false
+}

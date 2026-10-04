@@ -1,0 +1,14 @@
+{
+  "signal_id": "example-signal-001",
+  "symbol": "EXAMPLEUSDT",
+  "decision": "ACTIONABLE",
+  "strategy": "BASELINE_PULLBACK",
+  "signal_type": "CONFIRM",
+  "score": 82,
+  "grade": "A",
+  "reasons": ["pump_event", "mature_pullback", "rejection", "liquidity_pass"],
+  "execution": "MANUAL_ONLY",
+  "autoexecution": false,
+  "release_provenance": "ce77d744",
+  "telegram_delivery": "OUTBOX_REQUIRED"
+}

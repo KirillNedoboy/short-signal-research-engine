@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Short Signal Bot Lite
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=<APP_ROOT>
+Environment=PYTHONUNBUFFERED=1
+ExecStart=<APP_ROOT>/.venv/bin/python scripts/run_live.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

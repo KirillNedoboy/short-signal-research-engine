@@ -1,0 +1,10 @@
+{
+  "symbol": "EXAMPLEUSDT",
+  "decision": "WATCH",
+  "strategy": "BASELINE_PULLBACK",
+  "score": 61,
+  "grade": "C",
+  "reason": "public_grade_gate",
+  "actionable": false,
+  "autoexecution": false
+}
