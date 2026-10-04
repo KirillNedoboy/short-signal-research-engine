@@ -18,6 +18,12 @@ Use the release's checked-in defaults first, then an operator-owned configuratio
 
 `app/config.py` and `config.example.yaml` contain different example/default values for several thresholds, including pullback minimum, short-zone lower bound, VWAP distance, and volume z-score. This is intentional documentation debt, not a value to guess around. For a reproducible deployment, pin one release and record the effective configuration after validation.
 
-## Production overlay
+## External deployment boundary
 
-The current Lane A overlay is documented in `SOURCE_OF_TRUTH.md` and `RELEASES.md`: 132 symbols, `$2M` minimum 24h volume, manual signals, and autoexecution disabled. Do not substitute the rejected 111-symbol / `$3M` candidate. Lane B remains isolated at 50 symbols / `$5M`.
+This repository contains example configuration only. External deployments may use different universes, thresholds, rate limits, databases, and delivery toggles. Review and record the effective configuration separately; do not infer it from a historical report or from an example file.
+
+The public contract remains manual-only:
+
+```text
+Autoexecution: OFF
+```

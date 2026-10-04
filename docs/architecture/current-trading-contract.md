@@ -1,10 +1,10 @@
 # Current Trading Contract
 
-Status: Phase 0 characterization baseline. This document describes the behavior at code SHA `261646f7e7653957438dee54b38a23104f35c4ea`; it is not a proposal to change the strategy.
+Status: Phase 0 characterization baseline. This document describes the behavior implemented by the checked-out public baseline; it is not a proposal to change the strategy.
 
 ## Runtime version
 
-- **Code SHA:** `261646f7e7653957438dee54b38a23104f35c4ea`.
+- **Code version:** checked-out public baseline; use the Git commit shown by `git rev-parse HEAD` for provenance.
 - **Config contract:** `AppConfig` in `app/config.py` is Pydantic with `ConfigDict(extra="ignore", validate_assignment=True, hide_input_in_errors=True)`. Unknown mapping keys are silently ignored. `config.yaml` is merged with selected `.env` overrides; environment values win. The strategy fingerprint is the SHA-256 of canonical JSON containing `climax_`, `volume_climax_`, `low_volume_`, derivatives, liquidity, and squeeze settings. The public runtime fingerprint excludes secrets, database URL, and chat IDs.
 - **Dataset epoch:** no dataset epoch is currently a runtime field. For replay or comparison, the epoch must be supplied externally as the exact closed-candle/derivatives/liquidity snapshot interval and source snapshot identity. `features.asof` is part of the frozen input; wall-clock time is not a strategy input.
 - **Config example:** `config.yaml` contains `climax_block_price_oi_accelerating_together`, which is not an `AppConfig` field and is therefore silently ignored under `extra="ignore"`.
@@ -33,7 +33,7 @@ Evaluation is checked only when `EventState.state` is `PULLBACK_OBSERVED` or `SH
 
 **WARNINGS**
 
-Weak-but-near rejection/volume may be represented as WATCH when watch candidates are enabled. Squeeze levels in the current production config use `warn_only`; `block_extreme` remains the explicit blocking mode. Risk flags include shallow pullback, near-high price, weak rejection, thin VWAP buffer, continuation, retest, liquidity, and recent breakout conditions.
+Weak-but-near rejection/volume may be represented as WATCH when watch candidates are enabled. Squeeze levels in the checked-in baseline configuration use `warn_only`; `block_extreme` remains the explicit blocking mode. Risk flags include shallow pullback, near-high price, weak rejection, thin VWAP buffer, continuation, retest, liquidity, and recent breakout conditions.
 
 **SCORE**
 
@@ -152,8 +152,8 @@ Method version: `ROOT_DETECTOR_SHADOW_V2_CONTRACT_V1`. It reuses the broad V1 ob
 ## Global safety invariants
 
 - **AUTOEXECUTION OFF:** no exchange order placement path exists; signal evaluation only creates decisions and persisted delivery work.
-- **WATCH OFF for Telegram:** `send_watch_to_telegram` is false in the checked-in production config; WATCH decisions remain non-actionable.
-- **Grade C non-public:** current public minimum is B; C is not an actionable/public signal.
+- **WATCH OFF for Telegram:** `send_watch_to_telegram` is false in the checked-in baseline configuration; WATCH decisions remain non-actionable.
+- **Grade C non-public:** baseline public minimum is B; C is not an actionable/public signal.
 - **Explicit bad liquidity remains protected:** missing or hard-bad liquidity vetoes all three admission paths.
 - **Dangerous squeeze remains protected:** low-volume active-short-squeeze is a hard veto; baseline's current `warn_only` squeeze mode intentionally records extreme risk as a warning unless `block_extreme` is configured.
 - **Determinism:** fixed strategy inputs, config, and code contract produce the same decision; `features.asof` is frozen and evaluators do not use wall-clock time.
