@@ -132,16 +132,27 @@ class GapTracker:
             self._health = replace(
                 self._health, late_candles=self._health.late_candles + 1
             )
-        prior_active = set(self._active)
+        prior_gaps = (
+            tuple(gap for gap in self._active.values() if gap.symbol == symbol)
+            if candle.source == REST_BACKFILL_SOURCE
+            else ()
+        )
         candles[candle.open_time] = candle
+        while len(candles) > self._max_candles:
+            candles.pop(min(candles))
         self._recompute_symbol(symbol, detected_at=candle.received_at)
-        current_active = set(self._active)
-        if candle.source == REST_BACKFILL_SOURCE and prior_active - current_active:
+        if prior_gaps and any(
+            gap.identity not in self._active
+            and gap.expected_start >= min(candles)
+            and all(
+                gap.expected_start + timedelta(minutes=index) in candles
+                for index in range(gap.missing_count)
+            )
+            for gap in prior_gaps
+        ):
             self._health = replace(
                 self._health, gaps_backfilled=self._health.gaps_backfilled + 1
             )
-        while len(candles) > self._max_candles:
-            candles.pop(min(candles))
 
     def mark_backfilling(self, gap: GapEvent) -> None:
         if gap.identity in self._active:
@@ -209,6 +220,8 @@ class GapTracker:
         for identity in prior_for_symbol:
             self._active.pop(identity, None)
         for identity, gap in prior_for_symbol.items():
+            if gap.expected_start < times[0]:
+                continue
             missing_times = {
                 gap.expected_start + timedelta(minutes=index)
                 for index in range(gap.missing_count)

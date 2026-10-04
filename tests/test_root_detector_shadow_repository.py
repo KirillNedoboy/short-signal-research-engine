@@ -110,3 +110,28 @@ def test_due_episode_selection_separates_runtime_and_legacy_batches(tmp_path):
     assert [row["episode_id"] for row in batches["runtime"]] == [runtime_episode]
     assert [row["episode_id"] for row in batches["legacy"]] == [legacy_episode]
     assert repo.estimate_shadow_episode_rate(now=datetime(2026, 1, 1, 2, tzinfo=timezone.utc)) == 1 / 24
+
+
+def test_due_count_excludes_episode_without_processable_observation(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'due-count.sqlite'}")
+    db.create_all()
+    repo = BotRepository(db)
+    ready = _candidate()
+    ready["candidate_id"] = "ready"
+    ready_episode = repo.record_root_detector_shadow_episode_observation(ready)
+    dormant = dict(
+        ready, candidate_id="dormant",
+        first_seen_at=datetime(2026, 1, 1, 2, tzinfo=timezone.utc),
+    )
+    dormant_episode = repo.record_root_detector_shadow_episode_observation(dormant)
+    with db.session() as session:
+        session.query(RootDetectorShadowObservationModel).filter_by(
+            episode_id=dormant_episode
+        ).delete()
+
+    asof = datetime(2026, 1, 1, 3, tzinfo=timezone.utc)
+    batches = repo.list_shadow_episode_outcomes_due(
+        now=asof, runtime_limit=10, legacy_limit=10,
+    )
+    assert [row["episode_id"] for row in batches["runtime"]] == [ready_episode]
+    assert repo.count_shadow_episode_outcomes_due(now=asof) == 1

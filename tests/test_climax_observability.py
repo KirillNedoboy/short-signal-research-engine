@@ -22,6 +22,34 @@ def test_fast_monitor_selection_is_round_robin_and_bounded():
     assert bot._select_fast_monitor_keys(keys) == [keys[4], keys[0]]
 
 
+def test_fast_monitor_error_clears_after_completion_not_poll_start(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'heartbeat.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    completed = started + timedelta(seconds=1)
+
+    repository.update_fast_monitor_heartbeat(
+        checked_at=started, pool_size=1, poll_sequence=1, last_error="provider timeout",
+    )
+    repository.update_fast_monitor_heartbeat(
+        checked_at=started, pool_size=1, poll_sequence=2, last_poll_at=started,
+    )
+    with database.engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "select fast_monitor_last_error from runtime_heartbeats where id=1"
+        ).scalar_one() == "provider timeout"
+
+    repository.update_fast_monitor_heartbeat(
+        checked_at=completed, pool_size=1, poll_sequence=2, last_complete_at=completed,
+    )
+    with database.engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "select fast_monitor_last_error, fast_monitor_last_complete_at "
+            "from runtime_heartbeats where id=1"
+        ).one()[0] is None
+
+
 def test_climax_candidate_ttl_is_not_refreshed_and_expired_event_is_not_added():
     class Events:
         def __init__(self):

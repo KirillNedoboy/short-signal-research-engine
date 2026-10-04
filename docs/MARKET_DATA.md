@@ -39,6 +39,11 @@ OI, funding, spread, slippage, and depth are independent inputs. A strategy that
 
 WebSocket reconnects, REST recovery, warmup, and continuity reconciliation are operational mechanisms, not strategy signals. Recovery must be bounded and must not turn a backlog into an unbounded request storm. A symbol remains non-actionable until its data quality is restored.
 
+Continuity is evaluated within the bounded retained candle ring. An
+unrepaired gap stops gating current candles once its missing interval falls
+outside that ring; merely evicting the gap is not counted as a successful REST
+backfill. Gaps still inside the retained window require actual repair.
+
 ## Universe boundary
 
 The baseline shortlist uses USDT perpetuals, configured volume and exclusion rules, then combines daily movers and scan-to-scan velocity candidates. The exact universe size, volume floor, and exclusions are configuration-dependent and are not asserted as current external deployment values in this public mirror.

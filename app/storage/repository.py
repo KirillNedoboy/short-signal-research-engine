@@ -1081,6 +1081,11 @@ class BotRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(RootDetectorShadowEpisodeOutcomeModel)
+                    .join(
+                        RootDetectorShadowEpisodeModel,
+                        RootDetectorShadowEpisodeModel.episode_id
+                        == RootDetectorShadowEpisodeOutcomeModel.episode_id,
+                    )
                     .where(
                         RootDetectorShadowEpisodeOutcomeModel.outcome_next_due_at.is_not(
                             None
@@ -1089,6 +1094,12 @@ class BotRepository:
                         <= now,
                         RootDetectorShadowEpisodeOutcomeModel.outcome_status
                         != "MATURE",
+                        select(RootDetectorShadowObservationModel.observation_id)
+                        .where(
+                            RootDetectorShadowObservationModel.episode_id
+                            == RootDetectorShadowEpisodeOutcomeModel.episode_id
+                        )
+                        .exists(),
                     )
                 )
                 or 0
@@ -3251,6 +3262,8 @@ class BotRepository:
                     heartbeat.fast_monitor_last_complete_at = last_complete_at
                 if last_error is not None:
                     heartbeat.fast_monitor_last_error = last_error[:255]
+                elif last_complete_at is not None:
+                    heartbeat.fast_monitor_last_error = None
                 heartbeat.runtime_instance_id = (
                     runtime_instance_id
                     or getattr(self, "_runtime_instance_id", None)

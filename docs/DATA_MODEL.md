@@ -37,6 +37,13 @@ Outcome calculations distinguish short-side MFE and MAE. Required horizons depen
 
 Persisted outcomes are research metrics, not executable fills. They do not automatically model fees, funding cash flow, latency, leverage, partial fills or liquidation.
 
+The shadow episode scheduler's due count includes only outcomes whose
+episodes have at least one observation and can be selected for processing.
+Dormant outcomes without observations remain stored but do not inflate the
+reported runnable backlog. A fast-monitor error stays visible while the next
+poll is in progress and clears only after that poll completes; heartbeat
+history retains the prior failure.
+
 ## Data hygiene
 
 Never store in Git:
