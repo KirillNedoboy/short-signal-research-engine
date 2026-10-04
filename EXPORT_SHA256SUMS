@@ -1,7 +1,7 @@
 d288147dc11f231e9ff00cc358a36e59b10a2b50896a356f955d5b35f613a445  ./.env.example
 96da146542617c1da73551f8ba6cd19878639f0541e0731006e6bc5c4ecabb51  ./.gitignore
 730958898e277b3618688c91e0422d742648acd9fef06db4cd9166e33d4173a3  ./CONTRIBUTING.md
-b0107fd253ebd83774e85f056dda5850ad53e40827021e352d1ad9c0b893d897  ./EXPORT_MANIFEST.json
+01c6e9419ec2c5872c66d4a270530c34ef67c7d40d476d03b4ccecebc1363f6d  ./EXPORT_MANIFEST.json
 1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685  ./LICENSE
 3e7f255f79a5310e672f2f25181bfff9b174d69ab6bead30b57860444f56b6c5  ./README.md
 08c42a193fa46867289168a083c689a9131ed974e3b919f6671dffdb7d0298a6  ./SECURITY.md
@@ -116,7 +116,7 @@ b91768c5ab3b4c0813da1ac06b7b5787f99a408e7a55a229a5b14b22482b1d19  ./app/storage/
 8ed5f57e5fe8b030342658ebb13691173b1ed6342357cd249200cad6cf867257  ./docs/DELIVERY.md
 59d012ac03e0132d421c7463fef0bb2e62940cd89b17aee53aecb791faaa71ff  ./docs/MARKET_DATA.md
 d90ea994dcf4012c0cc2cab2af970f9f7323097511a3bcba82c247ea152eb301  ./docs/MATHEMATICS.md
-243a04fa6f941d46bcc32fb4fe9fc6e9ff73d596528dae62e49ae4822c749089  ./docs/RELEASES.md
+028f23c0381f31c010cf7d7f8a7bac2f86120e7808e773c4a8d61bc481661691  ./docs/RELEASES.md
 24c57acac7afdb133f61e3dc8e0c38b258d00830e104e2214a973856b3e17040  ./docs/SIGNAL_PIPELINE.md
 79cecd72eef2fb63ac938bedcbe2ddd686a8bc59adfa7d9c671759c08e48f15a  ./docs/SOURCE_OF_TRUTH.md
 cbf039769069e5ff08efd8a5d6fc6017d62c173709be610c36cbad6848bddea7  ./docs/STRATEGIES.md
@@ -124,11 +124,10 @@ fdf7a8e85bf2a766065330093c508295903b16f21a0bda208b60aa04ed4d270b  ./docs/TESTING
 dd3e779d9ee93b84ed00127df06df6b846095d018747da29a3940980ade83fc1  ./docs/architecture/baseline-source-faithful-replay.md
 185822b8af6a438be0f1eccd2f8299695abefc6464d8e093024e58e6c62b48f6  ./docs/architecture/current-trading-contract.md
 87d31b14ad1222038b007291fc36e3ad19d085cdd390bd325b36cf2d4561097e  ./docs/architecture/replaybundle.md
-59aab12ad49dcb61a770c166a7a846d3599343b44c5509491b60d6233f4defa3  ./docs/examples/README.md
+5099daa1bc004ecabc43fe44b792c7c31624fc670571de291f847e5b9baf33fb  ./docs/examples/README.md
 e59d28ccafe11148e5a0d1ce0b7ba5cdda87d721cb6f7dbaf7f4f3faaf66edbc  ./docs/examples/actionable-signal.json
 8898a655eadc8bf88d307ca3e09143d48676fd96859a8296d53cbe6a92be7d28  ./docs/examples/early-drop-warning.json
 f3d6916377494dd74e86771e57d713e9bec7e117b6b185a792b5bf9d2a13c8a2  ./docs/examples/watch.json
-fb339f170212bcbf2213bf5a1f49d8540f6929af447f6d788014c05ff1dd5ab1  ./docs/llm-handoff.md
 21a8da329d764429be154e40efc075607ebb69955db5b6f97dfa591ea4b9e527  ./docs/reports/2026-10-03-low-volume-v2-counterfactual.md
 8085311a3f450b612d3e620f5dfe58a266b3f51ff4139cb74ebdf4aad80c7571  ./docs/trader-review/README.md
 55167b2dd7df41988cdba60b072af407e879d8a415e3826d172aaca42cea27e1  ./docs/trader-review/evidence-and-results.md

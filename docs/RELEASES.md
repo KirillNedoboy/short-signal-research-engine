@@ -10,7 +10,7 @@ The public repository is a sanitized research baseline with independent Git hist
 | External deployment | Not verified here | Requires a separately pinned checkout, effective configuration, credentials, database, and runtime evidence |
 | Historical research | Labeled per artifact | Only the stated cohort, timestamps, and coverage boundary |
 
-## What is intentionally omitted
+## Public boundary
 
 This public mirror does not publish production lane names, release identifiers, host details, database paths, PIDs, private configuration, Telegram routing, or deployment timings. External deployment claims must not be inferred from this repository.
 
