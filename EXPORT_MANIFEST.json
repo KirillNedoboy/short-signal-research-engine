@@ -1,6 +1,6 @@
 {
   "policy": "allowlist copy; independent history; manual-only; autoexecution off",
-  "file_count": 252,
+  "file_count": 251,
   "files": [
     ".env.example",
     ".gitignore",
@@ -202,7 +202,6 @@
     "tests/test_logger.py",
     "tests/test_low_volume_regression.py",
     "tests/test_low_volume_v2_replay.py",
-    "tests/test_manual_only_service_entrypoint.py",
     "tests/test_market_coverage.py",
     "tests/test_market_data_backfill.py",
     "tests/test_market_data_continuity.py",
