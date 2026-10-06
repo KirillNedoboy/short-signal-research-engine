@@ -45,8 +45,8 @@ class InstanceFence:
 
     def __init__(
         self,
-        identity: str = "bot-public",
-        path: Path = Path("/run/bot-public.lock"),
+        identity: str = "short-telegram-bot-lite",
+        path: Path = Path("/run/short-telegram-bot-lite.lock"),
     ) -> None:
         self.identity = identity
         self.path = path

@@ -176,7 +176,7 @@ runtime state were not modified.
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db", default="${DATA_DIR}/bot.sqlite")
+    parser.add_argument("--db", default="<APP_ROOT>/data/bot.sqlite")
     parser.add_argument("--strategy", default=STRATEGY)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()

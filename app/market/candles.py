@@ -18,6 +18,36 @@ OHLCV_COLUMNS = [
 ]
 
 
+
+def validate_closed_1m_frame(
+    frame: pd.DataFrame,
+    market_asof: datetime,
+    *,
+    max_age: timedelta = timedelta(minutes=5),
+) -> str | None:
+    """Return a normalized admission failure for an invalid 1m frame."""
+    if frame.empty:
+        return "EMPTY_RESPONSE"
+    if not set(OHLCV_COLUMNS).issubset(frame.columns):
+        return "MARKET_DATA_INCOMPLETE"
+    timestamps = _timestamps(frame)
+    if timestamps.isna().any():
+        return "MARKET_DATA_INCOMPLETE"
+    asof = pd.Timestamp(normalize_utc(market_asof))
+    ordered = timestamps.sort_values()
+    latest = ordered.iloc[-1]
+    if latest > asof:
+        return "STALE_MARKET_DATA"
+    if timestamps.duplicated().any():
+        return "MARKET_DATA_DISCONTINUITY"
+    if len(ordered) > 1 and (ordered.diff().dropna() != pd.Timedelta(minutes=1)).any():
+        return "MARKET_DATA_DISCONTINUITY"
+    if latest + timedelta(minutes=1) > asof:
+        return "STALE_MARKET_DATA"
+    if asof - (latest + timedelta(minutes=1)) > max_age:
+        return "STALE_MARKET_DATA"
+    return None
+
 def klines_to_frame(raw_klines: list[list[str]]) -> pd.DataFrame:
     """Convert Bybit kline payloads into an ascending OHLCV frame."""
 

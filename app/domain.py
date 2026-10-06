@@ -19,6 +19,29 @@ class EventStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class ManualDeliveryLifecycleState(StrEnum):
+    """Explicit bookkeeping states for the manual signal delivery path."""
+
+    INITIAL_ACTIONABLE = "INITIAL_ACTIONABLE"
+    DELIVERY_RECHECK = "DELIVERY_RECHECK"
+    FINAL_ACTIONABLE = "FINAL_ACTIONABLE"
+    BLOCKED_BY_RECHECK = "BLOCKED_BY_RECHECK"
+    DEDUPLICATED = "DEDUPLICATED"
+    PERSISTENCE_FAILED = "PERSISTENCE_FAILED"
+    SIGNAL_PERSISTED = "SIGNAL_PERSISTED"
+    OUTBOX_ENQUEUED = "OUTBOX_ENQUEUED"
+    SENT = "SENT"
+
+
+class ManualDeliveryTerminalOutcome(StrEnum):
+    """Terminal outcomes recorded by manual delivery bookkeeping."""
+
+    BLOCKED_BY_RECHECK = "BLOCKED_BY_RECHECK"
+    DEDUPLICATED = "DEDUPLICATED"
+    PERSISTENCE_FAILED = "PERSISTENCE_FAILED"
+    SENT = "SENT"
+
+
 class SignalType(StrEnum):
     """Supported signal classifications."""
 
@@ -57,6 +80,7 @@ class EventState:
     symbol: str
     event_id: str
     state: EventStatus = EventStatus.IDLE
+    lifecycle_state: str | None = None
     event_start_time: datetime | None = None
     event_high: float | None = None
     event_high_time: datetime | None = None

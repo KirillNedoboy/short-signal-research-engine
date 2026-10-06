@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.config import AppConfig
-from app.domain import EventStatus
+from app.domain import EventStatus, ManualDeliveryLifecycleState, ManualDeliveryTerminalOutcome
 from app.events.pump_detector import PumpDetector
 from app.events.pullback_tracker import PullbackTracker
 from app.events.short_zone import ShortZoneBuilder
@@ -189,3 +189,23 @@ def test_pump_detector_uses_or_trigger_for_event_windows(make_features) -> None:
 
     assert qualifies is True
     assert trigger_window == "1h"
+
+
+def test_manual_delivery_lifecycle_and_terminal_outcomes_are_explicit_stable_strings() -> None:
+    assert {state.name: state.value for state in ManualDeliveryLifecycleState} == {
+        "INITIAL_ACTIONABLE": "INITIAL_ACTIONABLE",
+        "DELIVERY_RECHECK": "DELIVERY_RECHECK",
+        "FINAL_ACTIONABLE": "FINAL_ACTIONABLE",
+        "BLOCKED_BY_RECHECK": "BLOCKED_BY_RECHECK",
+        "DEDUPLICATED": "DEDUPLICATED",
+        "PERSISTENCE_FAILED": "PERSISTENCE_FAILED",
+        "SIGNAL_PERSISTED": "SIGNAL_PERSISTED",
+        "OUTBOX_ENQUEUED": "OUTBOX_ENQUEUED",
+        "SENT": "SENT",
+    }
+    assert {outcome.name: outcome.value for outcome in ManualDeliveryTerminalOutcome} == {
+        "BLOCKED_BY_RECHECK": "BLOCKED_BY_RECHECK",
+        "DEDUPLICATED": "DEDUPLICATED",
+        "PERSISTENCE_FAILED": "PERSISTENCE_FAILED",
+        "SENT": "SENT",
+    }

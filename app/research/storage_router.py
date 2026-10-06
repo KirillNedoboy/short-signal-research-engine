@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from app.config import ResearchTelemetryStorageMode
+from app.market.coverage import sanitize_cycle_payload, sanitize_evidence_value, sanitize_symbol_result
 from app.infra.disk_capacity import DiskCapacitySnapshot
 from app.research.spool import DRecordLifecycle, ResearchSpool, make_spool_record
 
@@ -259,27 +260,50 @@ class ResearchRepositoryProxy:
             "evaluated_symbols": kwargs.get("evaluated_symbols", 0),
             "last_error": kwargs.get("last_error"),
         }
+        payload = sanitize_cycle_payload(payload)
         result = self._router.write(
             "market_scan_cycles",
             payload,
             identity=cycle_identity,
             observed_at_utc=completed,
+            _terminal=True,
         )
         for row in kwargs.get("symbol_results", []):
-            symbol = str(row.get("symbol", "UNKNOWN"))
+            if isinstance(row, dict):
+                symbol = str(row.get("symbol", "UNKNOWN"))
+                safe_row = sanitize_symbol_result(row)
+                raw_status = row.get("terminal_status")
+                safe_row["evidence_json"] = {
+                    "reason_code": safe_row["reason_code"],
+                    "observed_terminal_status": sanitize_evidence_value(
+                        raw_status, kind="status"
+                    ) if not isinstance(raw_status, str) or raw_status not in {
+                        "EXCLUDED", "SCANNED_OK", "SCAN_FAILED", "SCAN_SKIPPED"
+                    } else None,
+                }
+                row_payload = {"cycle_identity": cycle_identity, **safe_row}
+            else:
+                symbol = "MALFORMED"
+                row_payload = {
+                    "cycle_identity": cycle_identity,
+                    "malformed_row": {"redacted": "MALFORMED_ROW"},
+                    "malformed_row_type": type(row).__name__,
+                }
             self._router.write(
                 "market_scan_symbol_results",
-                {"cycle_identity": cycle_identity, **dict(row)},
+                row_payload,
                 identity=f"{cycle_identity}:{symbol}",
                 observed_at_utc=completed,
+                _terminal=True,
             )
         self._router.write(
             "market_coverage_ledger",
             {
                 "cycle_identity": cycle_identity,
-                "exchange_symbols": kwargs.get("exchange_symbols", []),
-                "eligible_symbols": kwargs.get("eligible_symbols", []),
-                "excluded": kwargs.get("excluded", []),
+                "exchange_symbols": payload["exchange_symbols"],
+                "eligible_symbols": payload["eligible_symbols"],
+                "excluded": payload["excluded"],
+                "last_error": payload["last_error"],
             },
             identity=f"coverage:{cycle_identity}",
             observed_at_utc=completed,
@@ -294,6 +318,13 @@ class ResearchRepositoryProxy:
             if callable(operational):
                 operational_kwargs = dict(kwargs)
                 operational_kwargs.pop("excluded", None)
+                operational_kwargs["last_error"] = payload["last_error"]
+                if payload.get("exclusion_sanitization_mismatch"):
+                    operational_kwargs["accounting_mismatch"] = {
+                        "exclusion_sanitization_mismatch": payload[
+                            "exclusion_sanitization_mismatch"
+                        ]
+                    }
                 return operational(**operational_kwargs)
             return {"cycle_id": cycle_identity, "rotation_id": "spool-only"}
         if result.sqlite_required:

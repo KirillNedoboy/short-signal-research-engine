@@ -41,4 +41,4 @@ WebSocket reconnects, REST recovery, warmup, and continuity reconciliation are o
 
 ## Universe boundary
 
-The baseline shortlist uses USDT perpetuals, configured volume and exclusion rules, then combines daily movers and scan-to-scan velocity candidates. The exact universe size, volume floor, and exclusions are configuration-dependent and are not asserted as current external deployment values in this public mirror.
+The baseline shortlist uses USDT perpetuals, configured volume and exclusion rules, then combines daily movers and scan-to-scan velocity candidates. Production release settings are documented separately because the active reported mode is 100 symbols / `$5M`, while the rejected candidate was 111 / `$3M`.

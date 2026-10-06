@@ -1,64 +1,117 @@
-# Public Short-Signal Research Bot
+# Short Telegram Bot
 
-This repository contains a sanitized, research-oriented implementation of a short-side market-monitoring and manual-signal pipeline. It consumes supplied or public market data, evaluates deterministic strategy contracts, persists local observations, and can render human-readable Telegram messages.
+> Documentation status: versioned public baseline with explicitly separated production and historical release overlays.
 
-## Repository scope
+## Source of truth
 
-- Feature construction and strategy evaluators under `app/features/` and `app/signals/`.
-- Event and lifecycle state under `app/events/` and `app/baseline/`.
-- Replay contracts and deterministic evaluators under `app/replay/`.
-- Market-data normalization and data-quality handling under `app/market/`, `app/market_data/`.
-- Regression and contract tests under `tests/`.
-- Review-oriented documentation in `docs/` and `docs/trader-review/`.
+Start with [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md). The public checkout is baseline commit `ce77d744`; the operator-reported production release is Lane A `bf47d2b1` from 2026-09-14, and Lane B `dfcdb9df` from 2026-09-17 is historical/experimental. The latter two release artifacts are not Git objects in this shallow public clone.
 
-## Signal lifecycle
+## Documentation map
 
-1. Market snapshots and closed candles are acquired or loaded from a fixture.
-2. Features, coverage, freshness, and liquidity evidence are built.
-3. Event state advances through the configured lifecycle.
-4. Strategy gates, vetoes, and scoring produce an outcome such as actionable, WATCH, or data-quality rejection.
-5. The decision and delivery intent can be persisted locally.
-6. A manual-readable Telegram message may be rendered when explicitly configured.
+- [Mathematical specification](docs/MATHEMATICS.md)
+- [Strategies and admission](docs/STRATEGIES.md)
+- [Signal pipeline](docs/SIGNAL_PIPELINE.md)
+- [Market-data contract](docs/MARKET_DATA.md)
+- [Signal and delivery contract](docs/DELIVERY.md)
+- [Data model](docs/DATA_MODEL.md)
+- [Release matrix](docs/RELEASES.md)
+- [Configuration](docs/CONFIGURATION.md)
+- [Testing and reproducibility](docs/TESTING.md)
+- [Sanitized examples](docs/examples/README.md)
 
-This export does not include live destinations or credentials.
+The repository is a signal and research system. It does not place live orders, enable copy-trading, or provide autoexecution. Ordinary short notifications are manual-entry only. The current operator-verified topology runs Lane A and Lane B simultaneously in isolated release/config/database contours. `EARLY_DROP_WARNING` and `WATCH` are non-actionable and never enter ordinary short admission.
 
-## V1 and V2
+A Bybit USDT-perpetual market-monitoring bot that detects short-side reversal and exhaustion setups, persists decisions in SQLite, and delivers human-readable Telegram alerts. **It is a signal and research system, not an order-execution engine.**
 
-V1 is the baseline source-faithful signal contract. V2 research adds stricter lifecycle/admission and evidence concepts while remaining review/replay material. See `docs/trader-review/v1-v2-comparison.md` and `docs/trader-review/strategy-matrix.md`.
+## Status
 
-## Manual-only boundary
+- Runtime: asynchronous single-process poller
+- Market data: Bybit REST, closed-candle aware feature pipeline
+- Storage: SQLite with WAL and durable Telegram outbox
+- Execution: no order placement; `AUTOEXECUTION=OFF`
+- Live V1 strategies: `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, `LOW_VOLUME_EXTENSION_FAILURE`
+- `TRAPPED_LONGS_REVERSAL`: evaluation/shadow contour; live Telegram delivery remains disabled
+- WATCH candidates: non-actionable by default
 
-**Autoexecution: OFF.** There is no order-placement interface, wallet integration, exchange credential, or automatic execution path in this public export. Telegram output is informational/manual review only.
+## Architecture
 
-## Local setup
+```text
+Bybit REST
+   │
+   ├─ tickers/instruments ─> universe filter + shortlist
+   ├─ 1m klines ────────────> candle normalization + features
+   ├─ OI/funding (optional) ─┘
+   └─ orderbook (optional) ──> liquidity features
+                                      │
+                              event/state machines
+                                      │
+                           strategy evaluation branches
+                                      │
+                 ┌────────────────────┴────────────────────┐
+                 │                                         │
+           live admission                         shadow observations
+                 │                                         │
+          signals + outbox                         outcomes/research
+                 │
+          Telegram notifier
+```
 
-Use Python 3.12+, create a virtual environment, and install `requirements.txt`:
+The composition root is `app/main.py:ShortSignalBot`. Detailed component boundaries are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Strategies
+
+| Strategy | Role | Default delivery |
+|---|---|---|
+| `BASELINE_PULLBACK` | Mature post-pump pullback inside the configured short zone | Live |
+| `VOLUME_CLIMAX_UNWIND` | High-volume exhaustion with unwind/rejection evidence | Live |
+| `LOW_VOLUME_EXTENSION_FAILURE` | Weak extension, low volume efficiency and failed high | Live |
+| `TRAPPED_LONGS_REVERSAL` | Experimental trapped-long reversal hypothesis | Shadow only |
+
+The authoritative strategy contracts and invariants are in [`docs/STRATEGIES.md`](docs/STRATEGIES.md). Do not infer profitability from score or grade alone.
+
+## Quick start
 
 ```bash
 python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m compileall -q app tests
-PYTHONPATH=. pytest -q
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env
+cp config.example.yaml config.yaml
+.venv/bin/python scripts/run_once.py
 ```
 
-Network access is not required for the unit and contract tests; tests use fakes and fixtures where applicable. Runtime integrations require separately supplied credentials and endpoints and are intentionally outside this export's operational scope.
+Run the service loop only after reviewing configuration and delivery policy:
 
-## Replay and limitations
+```bash
+.venv/bin/python scripts/run_live.py
+```
 
-Replay consumes local fixtures or explicit bundles; it does not read production databases or private paths. Results are bounded by fixture coverage, timestamps, data availability, and the selected contract. A replay result is not a profitability claim or a forecast. See `docs/architecture/replaybundle.md`, `docs/TESTING.md`, and `docs/trader-review/evidence-and-results.md`.
+## Quality gates
 
-## Evidence taxonomy
+```bash
+.venv/bin/pytest -q
+.venv/bin/python -m compileall -q app scripts tests
+.venv/bin/ruff check app scripts tests
+```
 
-- **Verified:** behavior directly exercised by source tests or deterministic replay in this repository.
-- **Historical:** supplied research context with stated time window and denominator; not current production proof.
-- **Experimental:** candidate or shadow behavior requiring further replay/live-cohort validation.
-- **Unknown:** coverage or timing not established by public fixtures.
+## Documentation
 
-## Security boundary
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, runtime flow and boundaries
+- [`docs/STRATEGIES.md`](docs/STRATEGIES.md) — strategy contracts and state machines
+- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — persistence, outbox and outcome semantics
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deployment, health checks and incident runbook
+- [`docs/SHADOW_VALIDATION.md`](docs/SHADOW_VALIDATION.md) — forward cohort and promotion rules
+- [`docs/current_bot_signal_pipeline.md`](docs/current_bot_signal_pipeline.md) — detailed signal pipeline
+- [`docs/current_bot_score_tier_map.md`](docs/current_bot_score_tier_map.md) — score and grade map
+- [`SECURITY.md`](SECURITY.md) — secret handling and operational security
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — development workflow
 
-The export intentionally omits `.env` files, real Telegram IDs/tokens, exchange credentials, private keys, databases/WAL/SHM, logs, caches, backups, production hostnames/PIDs, private telemetry, and absolute operator paths. Copy `.env.example` and `config.example.yaml` only as schemas; keep actual values outside version control.
+## Configuration and data hygiene
 
-## Contribution
+- `config.example.yaml` is the safe tracked template.
+- Real `config.yaml`, `.env`, databases, WAL/SHM files, logs and generated reports stay outside Git.
+- Never commit Telegram tokens, API keys, private keys, passwords, chat exports or connection strings.
+- The repository deliberately contains no production SQLite database.
 
-Read `CONTRIBUTING.md`, `SECURITY.md`, `docs/SOURCE_OF_TRUTH.md`, and `docs/trader-review/README.md` before changing strategy behavior. Add or update deterministic tests with behavior changes. Keep manual-only semantics and explicit evidence boundaries intact.
+## License
+
+Add the project license before public distribution. This repository is intended for private operational development unless explicitly sanitized for publication.

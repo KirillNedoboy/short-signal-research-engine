@@ -22,7 +22,10 @@ class SignalModel(Base):
     """Saved Telegram signal or WATCH entry."""
 
     __tablename__ = "signals"
-    __table_args__ = (UniqueConstraint("symbol", "event_id", "strategy_subtype", "model_version", name="uq_signal_enriched_identity"),)
+    __table_args__ = (
+        UniqueConstraint("symbol", "event_id", "strategy_subtype", "model_version", name="uq_signal_enriched_identity"),
+        UniqueConstraint("signal_identity", name="uq_signal_identity"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
@@ -54,6 +57,7 @@ class SignalModel(Base):
     strategy_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     strategy_subtype: Mapped[str | None] = mapped_column(String(64), nullable=True)
     model_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    signal_identity: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     telegram_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -213,6 +217,7 @@ class EventStateModel(Base):
     symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
     event_id: Mapped[str] = mapped_column(String(128), index=True)
     state: Mapped[str] = mapped_column(String(32), index=True)
+    lifecycle_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     event_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     event_high_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -340,6 +345,7 @@ class StrategyObservationModel(Base):
     strategy: Mapped[str] = mapped_column(String(64), index=True)
     evaluation_phase: Mapped[str] = mapped_column(String(32), index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
+    event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     root_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     event_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attempt_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
@@ -359,6 +365,11 @@ class StrategyObservationModel(Base):
     config_hash: Mapped[str] = mapped_column(String(64), index=True)
     input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     input_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    initial_evaluation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    initial_decision: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    final_decision: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    final_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     outcome_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     outcome_json: Mapped[dict] = mapped_column(JSON, default=dict)
     outcome_mfe_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -470,6 +481,16 @@ class RuntimeHeartbeatModel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    process_last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    full_scan_last_complete: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fast_monitor_last_complete: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    market_data_last_healthy: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outbox_last_progress: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outbox_last_observed: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    market_data_health: Mapped[str] = mapped_column(String(16), default="UNKNOWN")
+    outbox_health: Mapped[str] = mapped_column(String(16), default="UNKNOWN")
+    last_scan_duration_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_event_loop_lag_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     fast_monitor_last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fast_monitor_last_complete_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fast_monitor_pool_size: Mapped[int] = mapped_column(Integer, default=0)

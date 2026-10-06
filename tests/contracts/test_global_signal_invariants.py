@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.config import AppConfig
 from app.domain import EventStatus, ShortZone, SignalType
 from app.signals.climax import evaluate_climax
@@ -104,10 +106,9 @@ def test_same_frozen_strategy_input_is_deterministic(make_event_state, make_feat
     assert first.reject_reasons == second.reject_reasons
 
 
-def test_unknown_config_keys_are_currently_ignored():
-    config = AppConfig.model_validate({"phase0_unknown_key": "ignored"})
-
-    assert not hasattr(config, "phase0_unknown_key")
+def test_unknown_config_keys_are_rejected():
+    with pytest.raises(ValueError, match="phase0_unknown_key"):
+        AppConfig.model_validate({"phase0_unknown_key": "rejected"})
 
 
 def test_signal_persistence_precedes_outbox_claim_and_keeps_provenance(

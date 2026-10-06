@@ -7,17 +7,21 @@ import math
 import os
 import uuid
 from collections import Counter
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.domain import (
     EventState,
     EventStatus,
+    ManualDeliveryLifecycleState,
     SignalDecision,
     SignalOutcome,
     SignalProvenanceInput,
@@ -28,7 +32,13 @@ from app.infra.disk_capacity import is_sqlite_full
 from app.market.coverage import (
     build_coverage_rows,
     coverage_percent,
+    sanitize_evidence_value,
+    sanitize_excluded_with_diagnostics,
+    sanitize_cycle_counter,
+    sanitize_json_value,
+    sanitize_symbol_result,
     universe_fingerprint,
+    validate_scan_accounting,
 )
 from app.observability.delivery_funnel import audit_delivery_funnel
 from app.observability.strategy_observations import (
@@ -36,8 +46,10 @@ from app.observability.strategy_observations import (
     ObservationWriteStatus,
     StrategyObservation,
     canonicalize_json_payload,
+    validate_final_decision_audit,
 )
 from app.storage.db import Database
+from app.storage.identity import signal_identity
 from app.storage.models import (
     ClimaxEntryAttemptEventModel,
     ClimaxEntryAttemptModel,
@@ -90,6 +102,44 @@ def _is_valid_lifecycle_attempt_values(
     if attempt_created_at is None or confirmation_expires_at is None:
         return True
     return confirmation_expires_at > attempt_created_at
+
+
+class EventStateConflictError(RuntimeError):
+    """Raised when a signal would overwrite a newer event for the symbol."""
+
+
+_DELIVERY_PAYLOAD_UNSET = object()
+_LEGACY_DELIVERY_PAYLOAD = "LEGACY_SIGNAL_PAYLOAD"
+# Compatibility marker for NULL model_version decisions routed through the bundle.
+LEGACY_MODEL_VERSION = "LEGACY_MODEL_VERSION"
+
+
+def _is_compatible_legacy_null_owner(owner: SignalModel | None, decision: SignalDecision) -> bool:
+    """Allow NULL-version compatibility retries to adopt their linked legacy row."""
+    return bool(
+        owner is not None
+        and decision.model_version == LEGACY_MODEL_VERSION
+        and decision.strategy_metadata.get("original_model_version") is None
+        and owner.model_version is None
+        and owner.signal_identity is None
+        and owner.symbol == decision.symbol
+        and owner.event_id == decision.event_id
+        and owner.strategy_type == decision.strategy_type
+        and owner.strategy_subtype == decision.strategy_subtype
+    )
+
+
+@contextmanager
+def _rollback_outer_transaction_on_error(session):
+    session.begin()
+    if session.bind.dialect.name == "sqlite":
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    try:
+        yield
+    except Exception as exc:
+        if not isinstance(exc, (IntegrityError, EventStateConflictError)):
+            session.rollback()
+        raise
 
 
 class BotRepository:
@@ -203,16 +253,39 @@ class BotRepository:
                     or 0
                 ) + 1
                 cycle_id = uuid.uuid4().hex
+                scheduled_requested = [str(s).upper() for s in scheduled_symbols]
+                safe_excluded, exclusion_mismatch = sanitize_excluded_with_diagnostics(excluded)
+                safe_candidate, candidate_sanitized = sanitize_cycle_counter(candidate_symbols)
+                safe_evaluated, evaluated_sanitized = sanitize_cycle_counter(evaluated_symbols)
                 scheduled = sorted(
-                    {
-                        str(s).upper()
-                        for s in scheduled_symbols
-                        if str(s).upper() in eligible_set
-                    }
+                    {s for s in scheduled_requested if s in eligible_set}
                 )
-                result_map = {str(row["symbol"]).upper(): row for row in symbol_results}
-                for symbol, reason in excluded:
-                    symbol = str(symbol).upper()
+                accounting = validate_scan_accounting(
+                    scheduled_symbols=scheduled_requested, symbol_results=symbol_results
+                )
+                result_map = accounting["result_map"] if accounting["valid"] else {}
+                outside_eligible = sorted(set(scheduled_requested) - eligible_set)
+                if outside_eligible:
+                    mismatch = accounting["mismatch"]
+                    if isinstance(mismatch, dict):
+                        mismatch["scheduled_outside_eligible"] = outside_eligible
+                    accounting["valid"] = False
+                invalid_counters = [
+                    field for field, sanitized in (
+                        ("candidate_symbols", candidate_sanitized),
+                        ("evaluated_symbols", evaluated_sanitized),
+                    ) if sanitized
+                ]
+                if invalid_counters:
+                    accounting["mismatch"]["invalid_cycle_counters"] = invalid_counters
+                    accounting["valid"] = False
+                if exclusion_mismatch:
+                    accounting["mismatch"]["exclusion_sanitization_failed"] = exclusion_mismatch
+                    accounting["valid"] = False
+                accounting_error = not accounting["valid"]
+                if accounting_error:
+                    result_map = {}
+                for symbol, reason in safe_excluded:
                     if symbol in eligible_set:
                         continue
                     if (
@@ -241,43 +314,37 @@ class BotRepository:
                     observed_at=now,
                     exchange_symbols=exchange,
                     eligible_symbols=eligible,
-                    excluded=excluded,
+                    excluded=safe_excluded,
                     scheduled_symbols=scheduled,
                     symbol_results=symbol_results,
                 ):
                     session.add(MarketCoverageLedgerModel(**coverage))
-                for symbol in scheduled:
-                    row = result_map.get(
-                        symbol,
-                        {
-                            "terminal_status": "SCAN_SKIPPED",
-                            "reason_code": "NOT_SCHEDULED_IN_BATCH",
-                        },
-                    )
-                    existing = session.scalar(
-                        select(MarketScanSymbolResultModel.id).where(
-                            MarketScanSymbolResultModel.rotation_id
-                            == rotation.rotation_id,
-                            MarketScanSymbolResultModel.symbol == symbol,
-                        )
-                    )
-                    if existing is None:
-                        session.add(
-                            MarketScanSymbolResultModel(
-                                rotation_id=rotation.rotation_id,
-                                cycle_id=cycle_id,
-                                symbol=symbol,
-                                terminal_status=row.get(
-                                    "terminal_status", "SCAN_SKIPPED"
-                                ),
-                                reason_code=row.get("reason_code", "UNKNOWN"),
-                                scheduled_at=cycle_started_at,
-                                completed_at=now,
-                                duration_ms=row.get("duration_ms"),
-                                runtime_instance_id=runtime_id,
-                                details_json=row.get("details", {}),
+                if not accounting_error:
+                    for symbol in scheduled:
+                        row = result_map[symbol]
+                        existing = session.scalar(
+                            select(MarketScanSymbolResultModel.id).where(
+                                MarketScanSymbolResultModel.rotation_id
+                                == rotation.rotation_id,
+                                MarketScanSymbolResultModel.symbol == symbol,
                             )
                         )
+                        if existing is None:
+                            safe_row = sanitize_symbol_result({"symbol": symbol, **row})
+                            session.add(
+                                MarketScanSymbolResultModel(
+                                    rotation_id=rotation.rotation_id,
+                                    cycle_id=cycle_id,
+                                    symbol=safe_row["symbol"],
+                                    terminal_status=safe_row["terminal_status"],
+                                    reason_code=safe_row.get("reason_code", "UNKNOWN"),
+                                    scheduled_at=cycle_started_at,
+                                    completed_at=now,
+                                    duration_ms=safe_row.get("duration_ms"),
+                                    runtime_instance_id=runtime_id,
+                                    details_json=safe_row.get("details", {}),
+                                )
+                            )
                 session.add(
                     MarketScanCycleModel(
                         cycle_id=cycle_id,
@@ -292,7 +359,7 @@ class BotRepository:
                         ),
                         cycle_started_at=cycle_started_at,
                         cycle_completed_at=now,
-                        status="COMPLETED" if not last_error else "PARTIAL",
+                        status="FAILED" if accounting_error else ("COMPLETED" if not last_error else "PARTIAL"),
                         exchange_universe_size=len(exchange),
                         eligible_universe_size=len(eligible),
                         scheduled_symbols=len(scheduled),
@@ -314,8 +381,8 @@ class BotRepository:
                             if result_map.get(s, {}).get("terminal_status")
                             == "SCAN_SKIPPED"
                         ),
-                        candidate_symbols=candidate_symbols,
-                        evaluated_symbols=evaluated_symbols,
+                        candidate_symbols=safe_candidate,
+                        evaluated_symbols=safe_evaluated,
                         scheduled_fingerprint=universe_fingerprint(scheduled),
                         scanned_ok_fingerprint=universe_fingerprint(
                             [
@@ -328,9 +395,17 @@ class BotRepository:
                         duration_ms=max(
                             0, int((now - cycle_started_at).total_seconds() * 1000)
                         ),
-                        last_error=last_error,
+                        last_error=(
+                            "scan_accounting_conservation_failed"
+                            if accounting_error
+                            else sanitize_evidence_value(last_error, kind="error")
+                        ),
                         details_json={
-                            "historical_100_100_semantics": "scheduled_batch"
+                            "historical_100_100_semantics": "scheduled_batch",
+                            "started_symbols": accounting["started_symbols"],
+                            "unfinished_symbols": accounting["unfinished_symbols"],
+                            "terminal_counts": accounting["terminal_counts"],
+                            "accounting_mismatch": sanitize_json_value(accounting["mismatch"]),
                         },
                     )
                 )
@@ -402,7 +477,11 @@ class BotRepository:
                     or 0
                 )
                 rotation.last_batch_sequence = cycle_sequence
-                rotation.last_error = last_error
+                rotation.last_error = (
+                    "scan_accounting_conservation_failed"
+                    if accounting_error
+                    else sanitize_evidence_value(last_error, kind="error")
+                )
                 rotation.details_json = {
                     "reason_counts": reason_counts,
                     "failed_symbols": sorted(failed),
@@ -421,7 +500,10 @@ class BotRepository:
                 return {
                     "rotation_id": rotation.rotation_id,
                     "cycle_id": cycle_id,
-                    "status": rotation.status,
+                    "status": "FAILED" if accounting_error else rotation.status,
+                    "cycle_status": "FAILED" if accounting_error else "COMPLETED" if not last_error else "PARTIAL",
+                    "accounting_error": accounting_error,
+                    "accounting_mismatch": accounting["mismatch"],
                     "eligible_coverage_pct": rotation.eligible_coverage_pct,
                     "exchange_coverage_pct": rotation.exchange_coverage_pct,
                     "eligible_universe_size": len(eligible),
@@ -551,6 +633,7 @@ class BotRepository:
         candidate_symbols: int = 0,
         evaluated_symbols: int = 0,
         last_error: str | None = None,
+        accounting_mismatch: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Persist only the operational scan-cycle row.
 
@@ -562,14 +645,42 @@ class BotRepository:
             runtime_id = getattr(self, "_runtime_instance_id", "unknown")
             exchange = sorted({str(s).upper() for s in exchange_symbols})
             eligible = sorted({str(s).upper() for s in eligible_symbols})
+            scheduled_requested = [str(s).upper() for s in scheduled_symbols]
             scheduled = sorted(
-                {
-                    str(s).upper()
-                    for s in scheduled_symbols
-                    if str(s).upper() in set(eligible)
-                }
+                {s for s in scheduled_requested if s and s in set(eligible)}
             )
-            result_map = {str(row["symbol"]).upper(): row for row in symbol_results}
+            accounting = validate_scan_accounting(
+                scheduled_symbols=scheduled_symbols, symbol_results=symbol_results
+            )
+            if accounting_mismatch:
+                safe_mismatch = sanitize_json_value(accounting_mismatch)
+                mismatch = accounting["mismatch"]
+                if isinstance(mismatch, dict) and isinstance(safe_mismatch, dict):
+                    mismatch.update(safe_mismatch)
+                accounting["valid"] = False
+            outside_eligible = sorted(
+                {s for s in scheduled_requested if s and s not in set(eligible)}
+            )
+            if outside_eligible:
+                mismatch = accounting["mismatch"]
+                if isinstance(mismatch, dict):
+                    mismatch["scheduled_outside_eligible"] = outside_eligible
+                accounting["valid"] = False
+            accounting_error = not accounting["valid"]
+            result_map = accounting["result_map"] if not accounting_error else {}
+            safe_candidate, candidate_sanitized = sanitize_cycle_counter(candidate_symbols)
+            safe_evaluated, evaluated_sanitized = sanitize_cycle_counter(evaluated_symbols)
+            invalid_counters = [
+                field for field, sanitized in (
+                    ("candidate_symbols", candidate_sanitized),
+                    ("evaluated_symbols", evaluated_sanitized),
+                ) if sanitized
+            ]
+            if invalid_counters:
+                accounting["mismatch"]["invalid_cycle_counters"] = invalid_counters
+                accounting["valid"] = False
+                accounting_error = True
+                result_map = {}
             now = cycle_completed_at
             with self._db.session() as session:
                 rotation = session.scalars(
@@ -598,7 +709,7 @@ class BotRepository:
                         ),
                         cycle_started_at=cycle_started_at,
                         cycle_completed_at=now,
-                        status="COMPLETED" if not last_error else "PARTIAL",
+                        status="FAILED" if accounting_error else "COMPLETED" if not last_error else "PARTIAL",
                         exchange_universe_size=len(exchange),
                         eligible_universe_size=len(eligible),
                         scheduled_symbols=len(scheduled),
@@ -620,8 +731,8 @@ class BotRepository:
                             if result_map.get(symbol, {}).get("terminal_status")
                             == "SCAN_SKIPPED"
                         ),
-                        candidate_symbols=candidate_symbols,
-                        evaluated_symbols=evaluated_symbols,
+                        candidate_symbols=safe_candidate,
+                        evaluated_symbols=safe_evaluated,
                         scheduled_fingerprint=universe_fingerprint(scheduled),
                         scanned_ok_fingerprint=universe_fingerprint(
                             [
@@ -634,12 +745,28 @@ class BotRepository:
                         duration_ms=max(
                             0, int((now - cycle_started_at).total_seconds() * 1000)
                         ),
-                        last_error=last_error,
-                        details_json={"historical_100_100_semantics": "scheduled_batch"},
+                        last_error=(
+                            "scan_accounting_conservation_failed"
+                            if accounting_error else sanitize_evidence_value(last_error, kind="error")
+                        ),
+                        details_json={
+                            "historical_100_100_semantics": "scheduled_batch",
+                            "started_symbols": accounting["started_symbols"],
+                            "unfinished_symbols": accounting["unfinished_symbols"],
+                            "terminal_counts": accounting["terminal_counts"],
+                            "accounting_mismatch": sanitize_json_value(accounting["mismatch"]),
+                        },
                     )
                 )
                 session.flush()
-                return {"rotation_id": rotation.rotation_id, "cycle_id": cycle_id}
+                return {
+                    "rotation_id": rotation.rotation_id,
+                    "cycle_id": cycle_id,
+                    "status": "FAILED" if accounting_error else "COMPLETED",
+                    "cycle_status": "FAILED" if accounting_error else "COMPLETED" if not last_error else "PARTIAL",
+                    "accounting_error": accounting_error,
+                    "accounting_mismatch": accounting["mismatch"],
+                }
         except Exception:
             logger.exception("operational market scan cycle write failed")
             return None
@@ -1345,8 +1472,25 @@ class BotRepository:
                     state=state.state.value,
                 )
                 session.add(model)
+            incoming_updated_at = _ensure_utc(state.updated_at)
+            existing_updated_at = _ensure_utc(model.updated_at)
+            if model.signal_id is not None and model.event_id != state.event_id:
+                raise EventStateConflictError(
+                    f"event state conflict for {state.symbol}: "
+                    f"claimed event {model.event_id} cannot roll over to {state.event_id}"
+                )
+            if (
+                model.signal_id is not None
+                and incoming_updated_at is not None
+                and existing_updated_at is not None
+                and incoming_updated_at <= existing_updated_at
+            ):
+                session.refresh(model)
+                return _event_from_model(model)
             model.event_id = state.event_id
             model.state = state.state.value
+            if state.lifecycle_state is not None or model.lifecycle_state is None:
+                model.lifecycle_state = state.lifecycle_state
             model.event_start_time = state.event_start_time
             model.event_high = state.event_high
             model.event_high_time = state.event_high_time
@@ -1360,7 +1504,8 @@ class BotRepository:
             model.zone_low = state.zone_low
             model.zone_high = state.zone_high
             model.signal_sent_at = state.signal_sent_at
-            model.signal_id = state.signal_id
+            if state.signal_id is not None or model.signal_id is None:
+                model.signal_id = state.signal_id
             model.expires_at = state.expires_at
             session.flush()
             session.refresh(model)
@@ -1398,17 +1543,441 @@ class BotRepository:
         state.expires_at = when
         return self.upsert_event_state(state)
 
+    def persist_final_signal_bundle(
+        self,
+        decision: SignalDecision,
+        event_state: EventState,
+        *,
+        delivery_payload: str | None,
+        telegram_sent: bool = False,
+        provenance: SignalProvenanceInput,
+        audit_root_event_id: str | None = None,
+        audit_strategy: str | None = None,
+        lifecycle_state: str = "OUTBOX_ENQUEUED",
+        expected_event_id: str | None = None,
+        expected_event_signal_id: int | None = None,
+        claim_event_state: bool = True,
+    ) -> SignalRecord:
+        """Atomically persist the final signal, evidence, outbox, state, and audit link.
+
+        The signal identity is the conflict guard. A retry repairs any missing
+        child/link row left by an older interrupted implementation and returns
+        the original signal instead of creating a second chain.
+        """
+        if decision.signal_type.value == "Watch":
+            raise ValueError("WATCH decisions must be stored via save_watch_candidate")
+        if not delivery_payload:
+            raise ValueError("delivery payload is required for a persisted signal")
+        try:
+            lifecycle = ManualDeliveryLifecycleState(str(lifecycle_state))
+        except ValueError as exc:
+            raise ValueError(f"invalid lifecycle state: {lifecycle_state}") from exc
+        final_audit_required = lifecycle is ManualDeliveryLifecycleState.FINAL_ACTIONABLE
+        expected_strategy = decision.strategy_subtype or decision.strategy_type
+        if final_audit_required and (not audit_root_event_id or not audit_strategy):
+            raise ValueError("audit root event and strategy are required together")
+        if audit_strategy is not None and audit_strategy != expected_strategy:
+            raise ValueError("audit strategy does not match decision strategy")
+        if audit_strategy is not None and audit_strategy != provenance.strategy_branch:
+            raise ValueError("audit strategy does not match provenance strategy branch")
+        identity = signal_identity(
+            symbol=decision.symbol,
+            event_id=decision.event_id,
+            strategy_type=decision.strategy_type,
+            strategy_subtype=decision.strategy_subtype,
+            model_version=decision.model_version,
+        )
+        audit = None
+        expected = expected_event_id or event_state.event_id
+        with self._db.session() as session, _rollback_outer_transaction_on_error(session):
+            if not claim_event_state:
+                event = session.get(EventStateModel, event_state.symbol)
+                if event is None:
+                    raise EventStateConflictError(
+                        f"event state conflict for {event_state.symbol}: event state not found"
+                    )
+                expected_owner = (
+                    event_state.signal_id
+                    if expected_event_signal_id is None
+                    else expected_event_signal_id
+                )
+                if event.event_id != expected or event.signal_id != expected_owner:
+                    raise EventStateConflictError(
+                        f"event state conflict for {event_state.symbol}: expected {expected}, "
+                        f"found {event.event_id} with signal {event.signal_id}"
+                    )
+                if decision.strategy_type != "BASELINE_PULLBACK":
+                    owner = session.get(SignalModel, event.signal_id) if event.signal_id is not None else None
+                    if owner is None or (
+                        owner.signal_identity != identity
+                        and not _is_compatible_legacy_null_owner(owner, decision)
+                    ):
+                        raise EventStateConflictError(
+                            f"event state conflict for {event_state.symbol}: "
+                            f"signal {event.signal_id} belongs to another identity"
+                        )
+            if final_audit_required or audit_root_event_id is not None or audit_strategy is not None:
+                if not audit_root_event_id or not audit_strategy:
+                    raise ValueError("audit root event and strategy are required together")
+                audit_filters = [
+                    StrategyObservationModel.symbol == decision.symbol,
+                    StrategyObservationModel.event_id == decision.event_id,
+                    StrategyObservationModel.root_event_id == audit_root_event_id,
+                    StrategyObservationModel.strategy == expected_strategy,
+                    StrategyObservationModel.evaluation_phase == "PRE_DELIVERY_RECHECK",
+                    StrategyObservationModel.final_decision == "ACTIONABLE",
+                    StrategyObservationModel.final_reason == "final_actionable",
+                    StrategyObservationModel.model_version == decision.model_version,
+                ]
+                if provenance.root_event_id is not None:
+                    audit_filters.append(
+                        StrategyObservationModel.root_event_id == provenance.root_event_id
+                    )
+                if provenance.decision_evaluation_id is not None:
+                    audit_filters.append(
+                        StrategyObservationModel.initial_evaluation_id
+                        == provenance.decision_evaluation_id
+                    )
+                if provenance.admission_evaluation_id is not None:
+                    audit_filters.append(
+                        StrategyObservationModel.evaluation_id
+                        == provenance.admission_evaluation_id
+                    )
+                event_revision = getattr(provenance, "event_revision", None)
+                if event_revision is None:
+                    event_revision = decision.strategy_metadata.get("event_revision")
+                if hasattr(StrategyObservationModel, "event_revision") and event_revision is not None:
+                    audit_filters.append(StrategyObservationModel.event_revision == event_revision)
+                audit_rows = session.scalars(
+                    select(StrategyObservationModel)
+                    .where(*audit_filters)
+                    .order_by(StrategyObservationModel.observed_at.desc())
+                ).all()
+                if len(audit_rows) != 1:
+                    raise ValueError("final decision audit row not found")
+                audit = audit_rows[0]
+            model = session.scalar(
+                select(SignalModel).where(SignalModel.signal_identity == identity)
+            )
+            legacy_model = None
+            if model is None:
+                legacy_null_rows = []
+                if (
+                    decision.model_version == LEGACY_MODEL_VERSION
+                    and decision.strategy_metadata.get("original_model_version") is None
+                ):
+                    legacy_null_rows = session.scalars(
+                        select(SignalModel).where(
+                            SignalModel.symbol == decision.symbol,
+                            SignalModel.event_id == decision.event_id,
+                            SignalModel.strategy_type == decision.strategy_type,
+                            SignalModel.strategy_subtype == decision.strategy_subtype,
+                            SignalModel.model_version.is_(None),
+                        )
+                    ).all()
+                    if len(legacy_null_rows) > 1:
+                        raise ValueError("ambiguous legacy signal")
+                    if legacy_null_rows:
+                        model = legacy_null_rows[0]
+                        model.model_version = LEGACY_MODEL_VERSION
+                        model.signal_identity = identity
+                if model is not None:
+                    legacy_model = model
+                else:
+                    legacy_model = session.scalar(select(SignalModel).where(
+                        SignalModel.symbol == decision.symbol,
+                        SignalModel.event_id == decision.event_id,
+                        SignalModel.strategy_type == decision.strategy_type,
+                        SignalModel.strategy_subtype == decision.strategy_subtype,
+                        SignalModel.model_version == decision.model_version,
+                    ))
+            if model is None and legacy_model is None:
+                features = decision.features_snapshot
+                if provenance.event_id != decision.event_id:
+                    raise ValueError("signal provenance event_id must match signal event_id")
+                candidate = SignalModel(
+                    symbol=decision.symbol,
+                    signal_time=decision.signal_time,
+                    signal_type=decision.signal_type.value,
+                    grade=decision.grade,
+                    score=decision.score,
+                    market_price=decision.market_price,
+                    short_zone_low=decision.short_zone_low,
+                    short_zone_high=decision.short_zone_high,
+                    event_id=decision.event_id,
+                    event_high=provenance.decision_event_high or event_state.event_high or decision.market_price,
+                    event_base_price=event_state.event_base_price or decision.market_price,
+                    event_range_pct=event_state.event_range_pct or 0.0,
+                    pullback_from_high_pct=_required_float(features.get("pullback_from_high_pct"), field_name="pullback_from_high_pct"),
+                    dist_to_vwap_pct=_required_float(features.get("dist_to_vwap_pct"), field_name="dist_to_vwap_pct"),
+                    upper_wick_ratio=_required_float(features.get("upper_wick_ratio"), field_name="upper_wick_ratio"),
+                    rejection_from_high_pct=_required_float(features.get("rejection_from_high_pct"), field_name="rejection_from_high_pct"),
+                    vol_zscore_30m=_required_float(features.get("vol_zscore_30m"), field_name="vol_zscore_30m"),
+                    dist_to_ema20_atr=_required_float(features.get("dist_to_ema20_atr"), field_name="dist_to_ema20_atr"),
+                    rsi_15m=_required_float(features.get("rsi_15m"), field_name="rsi_15m"),
+                    ret_1h=_required_float(features.get("ret_1h"), field_name="ret_1h"),
+                    ret_4h=_required_float(features.get("ret_4h"), field_name="ret_4h"),
+                    range_atr_ratio=_required_float(features.get("range_atr_ratio"), field_name="range_atr_ratio"),
+                    oi_change_15m=_nullable_float(features.get("oi_change_15m")),
+                    oi_change_1h=_nullable_float(features.get("oi_change_1h")),
+                    funding_rate=_nullable_float(features.get("funding_rate")),
+                    strategy_type=decision.strategy_type,
+                    strategy_subtype=decision.strategy_subtype,
+                    model_version=decision.model_version,
+                    signal_identity=identity,
+                    context_json=_json_ready({
+                        **decision.features_snapshot,
+                        **decision.strategy_metadata,
+                        "strategy_type": decision.strategy_type,
+                        "strategy_subtype": decision.strategy_subtype,
+                        "model_version": decision.model_version,
+                        "reasons": decision.reasons,
+                        "risk_flags": decision.risk_flags,
+                        "score_breakdown": decision.score_breakdown,
+                        "decision_type": decision.decision_type,
+                        "actionable": decision.actionable,
+                        "blockers": decision.blockers,
+                        "squeeze_risk_score": decision.squeeze_risk_score,
+                        "squeeze_risk_level": decision.squeeze_risk_level,
+                        "squeeze_risk_reasons": decision.squeeze_risk_reasons,
+                        "squeeze_guard_action": decision.squeeze_guard_action,
+                        "data_quality_warnings": decision.data_quality_warnings,
+                    }),
+                    telegram_sent=telegram_sent,
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(candidate)
+                        session.flush()
+                    model = candidate
+                except IntegrityError:
+                    model = session.scalar(
+                        select(SignalModel).where(SignalModel.signal_identity == identity)
+                    )
+                    if model is None:
+                        raise
+            if model is None and legacy_model is not None:
+                model = legacy_model
+                if model.signal_identity is None:
+                    model.signal_identity = identity
+            if model is None:
+                raise RuntimeError("signal persistence produced no model")
+            persisted_values = {
+                "symbol": decision.symbol, "event_id": decision.event_id,
+                "strategy_type": decision.strategy_type,
+                "strategy_subtype": decision.strategy_subtype,
+                "model_version": decision.model_version, "score": decision.score,
+                "market_price": decision.market_price, "grade": decision.grade,
+            }
+            if any(getattr(model, field) != value for field, value in persisted_values.items()):
+                raise ValueError("conflicting persisted signal payload")
+            if model.event_id != provenance.event_id:
+                raise ValueError("signal provenance event_id must match signal event_id")
+            provenance_values = {
+                "signal_id": model.id,
+                "strategy_family": provenance.strategy_family,
+                "strategy_branch": provenance.strategy_branch,
+                "event_id": provenance.event_id,
+                "root_event_id": provenance.root_event_id,
+                "decision_evaluation_id": provenance.decision_evaluation_id,
+                "admission_evaluation_id": provenance.admission_evaluation_id,
+                "code_version": provenance.code_version,
+                "config_hash": provenance.config_hash,
+                "runtime_instance_id": provenance.runtime_instance_id,
+                "runtime_started_at": provenance.runtime_started_at,
+                "decision_at": provenance.decision_at,
+                "signal_created_at": model.created_at,
+                "decision_entry_price": provenance.decision_entry_price,
+                "decision_event_high": provenance.decision_event_high,
+                "decision_distance_from_high": provenance.decision_distance_from_high,
+                "provenance_anomaly": provenance.provenance_anomaly,
+            }
+            existing_provenance = session.get(SignalProvenanceModel, model.id)
+            if existing_provenance is None:
+                try:
+                    with session.begin_nested():
+                        session.add(SignalProvenanceModel(**provenance_values))
+                        session.flush()
+                except IntegrityError:
+                    existing_provenance = session.get(SignalProvenanceModel, model.id)
+                    if existing_provenance is None:
+                        raise RuntimeError(
+                            "provenance insert conflicted but the persisted row is unavailable"
+                        )
+            if existing_provenance is not None:
+                for field, value in provenance_values.items():
+                    if field in {"signal_id", "signal_created_at"}:
+                        continue
+                    existing_value = getattr(existing_provenance, field)
+                    if isinstance(value, datetime):
+                        matches = _ensure_utc(existing_value) == _ensure_utc(value)
+                    else:
+                        matches = existing_value == value
+                    if not matches:
+                        raise ValueError("conflicting provenance for persisted signal")
+            outbox = session.scalar(select(TelegramDeliveryOutboxModel).where(
+                TelegramDeliveryOutboxModel.idempotency_key == f"telegram:signal:{model.id}"
+            ))
+            if outbox is not None and delivery_payload is not None and outbox.payload != delivery_payload:
+                raise ValueError("conflicting delivery payload for persisted signal")
+            if outbox is None:
+                outbox = TelegramDeliveryOutboxModel(
+                    entity_type="SIGNAL", entity_id=model.id, payload=delivery_payload,
+                    idempotency_key=f"telegram:signal:{model.id}", status="PENDING"
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(outbox)
+                        session.flush()
+                except IntegrityError:
+                    outbox = session.scalar(select(TelegramDeliveryOutboxModel).where(
+                        TelegramDeliveryOutboxModel.idempotency_key == f"telegram:signal:{model.id}"
+                    ))
+                    if outbox is None:
+                        raise RuntimeError(
+                            "outbox insert conflicted but the persisted row is unavailable"
+                        )
+            if outbox is None:
+                raise RuntimeError("persisted signal is missing its delivery outbox")
+            event_state_by_lifecycle = {
+                ManualDeliveryLifecycleState.INITIAL_ACTIONABLE: EventStatus.PULLBACK_OBSERVED,
+                ManualDeliveryLifecycleState.DELIVERY_RECHECK: EventStatus.SHORT_ZONE_ACTIVE,
+                ManualDeliveryLifecycleState.FINAL_ACTIONABLE: EventStatus.SIGNAL_SENT,
+                ManualDeliveryLifecycleState.SIGNAL_PERSISTED: EventStatus.SIGNAL_SENT,
+                ManualDeliveryLifecycleState.OUTBOX_ENQUEUED: EventStatus.SIGNAL_SENT,
+                ManualDeliveryLifecycleState.SENT: EventStatus.SIGNAL_SENT,
+                ManualDeliveryLifecycleState.DEDUPLICATED: EventStatus.SIGNAL_SENT,
+            }
+            event_values = {
+                "state": event_state_by_lifecycle[lifecycle].value,
+                "lifecycle_state": lifecycle.value,
+                "notes": lifecycle.value,
+                "signal_sent_at": decision.signal_time,
+                "signal_id": model.id,
+                "updated_at": decision.signal_time,
+            }
+            if claim_event_state:
+                claim = session.execute(
+                    update(EventStateModel)
+                    .where(
+                        EventStateModel.symbol == event_state.symbol,
+                        EventStateModel.event_id == expected,
+                        EventStateModel.signal_id.is_(None),
+                    )
+                    .values(**event_values)
+                )
+            else:
+                claim = None
+            if claim_event_state and claim is not None and claim.rowcount == 0:
+                event = session.get(EventStateModel, event_state.symbol)
+                if event is None:
+                    raise ValueError(f"event state not found: {event_state.symbol}")
+                if event.event_id != expected or event.signal_id not in (None, model.id):
+                    session.commit()
+                    raise EventStateConflictError(
+                        f"event state conflict for {event_state.symbol}: expected {expected}, "
+                        f"found {event.event_id} with signal {event.signal_id}"
+                    )
+                if event.signal_id != model.id:
+                    session.commit()
+                    raise EventStateConflictError(
+                        f"event state conflict for {event_state.symbol}: claim was not applied"
+                    )
+                repair = session.execute(
+                    update(EventStateModel)
+                    .where(
+                        EventStateModel.symbol == event_state.symbol,
+                        EventStateModel.event_id == expected,
+                        EventStateModel.signal_id == model.id,
+                    )
+                    .values(**event_values)
+                )
+                if repair.rowcount == 0:
+                    session.rollback()
+                    raise EventStateConflictError(
+                        f"event state conflict for {event_state.symbol}: repair was not applied"
+                    )
+            if audit_root_event_id is not None or audit_strategy is not None:
+                if audit is None:
+                    raise ValueError("final decision audit row not found")
+                if audit.signal_id not in (None, model.id):
+                    raise ValueError("final decision audit already linked to another signal")
+                audit.signal_id = model.id
+            session.flush()
+            session.refresh(model)
+            return _signal_from_model(model)
+
     def save_signal(
         self,
         decision: SignalDecision,
         event_state: EventState,
-        telegram_sent: bool,
-        delivery_payload: str | None = None,
+        telegram_sent: bool = False,
+        delivery_payload: Any = _DELIVERY_PAYLOAD_UNSET,
         *,
         provenance: SignalProvenanceInput,
+        audit_root_event_id: str | None = None,
+        audit_strategy: str | None = None,
+        lifecycle_state: str = "OUTBOX_ENQUEUED",
     ) -> SignalRecord:
         if decision.signal_type.value == "Watch":
             raise ValueError("WATCH decisions must be stored via save_watch_candidate")
+        if delivery_payload is None:
+            raise ValueError("delivery payload is required for a persisted signal")
+        if delivery_payload is _DELIVERY_PAYLOAD_UNSET:
+            delivery_payload = _LEGACY_DELIVERY_PAYLOAD
+        persistence_decision = decision
+        if decision.model_version is None:
+            persistence_decision = replace(
+                decision,
+                model_version=LEGACY_MODEL_VERSION,
+                strategy_metadata={
+                    **decision.strategy_metadata,
+                    "original_model_version": decision.model_version,
+                },
+            )
+        if persistence_decision.model_version and delivery_payload is not _DELIVERY_PAYLOAD_UNSET:
+            current_state = self.get_event_state(event_state.symbol)
+            claim_event_state = True
+            expected_event_signal_id = None
+            if current_state is not None and current_state.signal_id is not None:
+                expected_event_signal_id = current_state.signal_id
+                # Baseline save_signal is a compatibility path and historically
+                # persisted multiple identities without claiming the event row.
+                if persistence_decision.strategy_type == "BASELINE_PULLBACK":
+                    claim_event_state = False
+                else:
+                    identity = signal_identity(
+                        symbol=persistence_decision.symbol,
+                        event_id=persistence_decision.event_id,
+                        strategy_type=persistence_decision.strategy_type,
+                        strategy_subtype=persistence_decision.strategy_subtype,
+                        model_version=persistence_decision.model_version,
+                    )
+                    with self._db.session() as session:
+                        owner = session.get(SignalModel, current_state.signal_id)
+                        owner_identity = owner.signal_identity if owner is not None else None
+                        if owner_identity != identity and not _is_compatible_legacy_null_owner(
+                            owner, persistence_decision
+                        ):
+                            raise EventStateConflictError(
+                                f"event state conflict for {event_state.symbol}: "
+                                f"signal {current_state.signal_id} belongs to another identity"
+                            )
+                    claim_event_state = False
+            return self.persist_final_signal_bundle(
+                persistence_decision,
+                event_state,
+                delivery_payload=delivery_payload,
+                telegram_sent=telegram_sent,
+                provenance=provenance,
+                audit_root_event_id=audit_root_event_id,
+                audit_strategy=audit_strategy,
+                lifecycle_state=lifecycle_state,
+                expected_event_signal_id=expected_event_signal_id,
+                claim_event_state=claim_event_state,
+            )
+        if delivery_payload is _DELIVERY_PAYLOAD_UNSET:
+            delivery_payload = None
         features = decision.features_snapshot
         with self._db.session() as session:
             decision_event_high = provenance.decision_event_high
@@ -1459,6 +2028,17 @@ class BotRepository:
                 strategy_type=decision.strategy_type,
                 strategy_subtype=decision.strategy_subtype,
                 model_version=decision.model_version,
+                signal_identity=(
+                    signal_identity(
+                        symbol=decision.symbol,
+                        event_id=decision.event_id,
+                        strategy_type=decision.strategy_type,
+                        strategy_subtype=decision.strategy_subtype,
+                        model_version=decision.model_version,
+                    )
+                    if decision.model_version
+                    else None
+                ),
                 context_json=_json_ready(
                     {
                         **decision.features_snapshot,
@@ -1740,15 +2320,28 @@ class BotRepository:
         observed_at = now or datetime.now(timezone.utc)
         with self._db.session() as session:
             signals = [
-                {"id": int(signal_id), "telegram_sent": bool(telegram_sent)}
-                for signal_id, telegram_sent in session.execute(
-                    select(SignalModel.id, SignalModel.telegram_sent)
+                {
+                    "id": int(signal_id),
+                    "telegram_sent": bool(telegram_sent),
+                    "signal_identity": signal_identity,
+                    "symbol": symbol,
+                    "event_id": event_id,
+                    "identity_required": True,
+                }
+                for signal_id, telegram_sent, signal_identity, symbol, event_id in session.execute(
+                    select(
+                        SignalModel.id,
+                        SignalModel.telegram_sent,
+                        SignalModel.signal_identity,
+                        SignalModel.symbol,
+                        SignalModel.event_id,
+                    ).order_by(SignalModel.id)
                 )
             ]
             provenances = [
                 {"signal_id": int(signal_id)}
                 for (signal_id,) in session.execute(
-                    select(SignalProvenanceModel.signal_id)
+                    select(SignalProvenanceModel.signal_id).order_by(SignalProvenanceModel.signal_id)
                 )
             ]
             outbox = [
@@ -1766,6 +2359,74 @@ class BotRepository:
                         TelegramDeliveryOutboxModel.entity_id,
                         TelegramDeliveryOutboxModel.status,
                         TelegramDeliveryOutboxModel.lease_until,
+                    ).order_by(
+                        TelegramDeliveryOutboxModel.entity_type,
+                        TelegramDeliveryOutboxModel.entity_id,
+                        TelegramDeliveryOutboxModel.id,
+                    )
+                )
+            ]
+            event_states = [
+                {"symbol": symbol, "event_id": event_id, "signal_id": signal_id}
+                for symbol, event_id, signal_id in session.execute(
+                    select(
+                        EventStateModel.symbol,
+                        EventStateModel.event_id,
+                        EventStateModel.signal_id,
+                    ).order_by(EventStateModel.symbol, EventStateModel.event_id)
+                )
+            ]
+            final_audits = [
+                {
+                    "observation_id": observation_id,
+                    "evaluation_id": evaluation_id,
+                    "initial_evaluation_id": initial_evaluation_id,
+                    "symbol": symbol,
+                    "event_id": event_id,
+                    "root_event_id": root_event_id,
+                    "strategy": strategy,
+                    "evaluation_phase": evaluation_phase,
+                    "live_decision": live_decision,
+                    "initial_decision": initial_decision,
+                    "final_decision": final_decision,
+                    "final_reason": final_reason,
+                    "outcome_status": outcome_status,
+                    "finalized_at": finalized_at,
+                }
+                for (
+                    observation_id,
+                    evaluation_id,
+                    initial_evaluation_id,
+                    symbol,
+                    event_id,
+                    root_event_id,
+                    strategy,
+                    evaluation_phase,
+                    live_decision,
+                    initial_decision,
+                    final_decision,
+                    final_reason,
+                    outcome_status,
+                    finalized_at,
+                ) in session.execute(
+                    select(
+                        StrategyObservationModel.observation_id,
+                        StrategyObservationModel.evaluation_id,
+                        StrategyObservationModel.initial_evaluation_id,
+                        StrategyObservationModel.symbol,
+                        StrategyObservationModel.event_id,
+                        StrategyObservationModel.root_event_id,
+                        StrategyObservationModel.strategy,
+                        StrategyObservationModel.evaluation_phase,
+                        StrategyObservationModel.live_decision,
+                        StrategyObservationModel.initial_decision,
+                        StrategyObservationModel.final_decision,
+                        StrategyObservationModel.final_reason,
+                        StrategyObservationModel.outcome_status,
+                        StrategyObservationModel.finalized_at,
+                    ).order_by(
+                        StrategyObservationModel.observation_id,
+                        StrategyObservationModel.evaluation_id,
                     )
                 )
             ]
@@ -1773,6 +2434,8 @@ class BotRepository:
             signals=signals,
             provenances=provenances,
             outbox=outbox,
+            event_states=event_states,
+            final_audits=final_audits,
             now=observed_at,
         )
 
@@ -1829,7 +2492,10 @@ class BotRepository:
             stmt = select(func.count(SignalModel.id)).where(
                 SignalModel.telegram_sent.is_(False),
                 SignalModel.strategy_subtype.is_(None),
-                SignalModel.model_version.is_(None),
+                or_(
+                    SignalModel.model_version.is_(None),
+                    SignalModel.model_version == LEGACY_MODEL_VERSION,
+                ),
             )
             return int(session.scalar(stmt) or 0)
 
@@ -1886,6 +2552,7 @@ class BotRepository:
         """Append one research observation without interrupting the scanner."""
 
         try:
+            validate_final_decision_audit(observation)
             values = {
                 "observation_id": observation.observation_id,
                 "idempotency_key": observation.idempotency_key,
@@ -1897,6 +2564,7 @@ class BotRepository:
                 "strategy": observation.strategy,
                 "evaluation_phase": observation.evaluation_phase,
                 "symbol": observation.symbol,
+                "event_id": observation.event_id,
                 "root_event_id": observation.root_event_id,
                 "event_revision": observation.event_revision,
                 "attempt_id": observation.attempt_id,
@@ -1916,6 +2584,11 @@ class BotRepository:
                 "config_hash": observation.config_hash,
                 "input_fingerprint": observation.input_fingerprint,
                 "input_snapshot_json": _json_ready(observation.input_snapshot),
+                "initial_evaluation_id": observation.initial_evaluation_id,
+                "initial_decision": observation.initial_decision,
+                "final_decision": observation.final_decision,
+                "final_reason": observation.final_reason,
+                "finalized_at": observation.finalized_at,
             }
             with self._db.session() as session:
                 statement = (
@@ -1943,6 +2616,35 @@ class BotRepository:
                 if is_sqlite_full(exc)
                 else "ERROR",
             )
+
+    def attach_signal_to_final_decision_audit(
+        self, *, root_event_id: str, event_id: str | None = None,
+        strategy: str, signal_id: int, decision_evaluation_id: int | None = None,
+        admission_evaluation_id: int | None = None,
+    ) -> bool:
+        """Attach a signal only to one fully identified final audit row."""
+        if not event_id or decision_evaluation_id is None or admission_evaluation_id is None:
+            raise ValueError("exact final audit identity is required")
+        with self._db.session() as session:
+            rows = session.scalars(
+                select(StrategyObservationModel)
+                .where(
+                    StrategyObservationModel.event_id == event_id,
+                    StrategyObservationModel.root_event_id == root_event_id,
+                    StrategyObservationModel.strategy == strategy,
+                    StrategyObservationModel.evaluation_phase == "PRE_DELIVERY_RECHECK",
+                    StrategyObservationModel.final_decision == "ACTIONABLE",
+                    StrategyObservationModel.final_reason == "final_actionable",
+                    StrategyObservationModel.initial_evaluation_id == decision_evaluation_id,
+                    StrategyObservationModel.evaluation_id == admission_evaluation_id,
+                    StrategyObservationModel.signal_id.is_(None),
+                )
+            ).all()
+            if len(rows) != 1:
+                return False
+            rows[0].signal_id = signal_id
+            session.flush()
+            return True
 
     def list_strategy_observations_due_outcomes(
         self,
@@ -3218,6 +3920,69 @@ class BotRepository:
                 action,
             )
 
+    def update_runtime_health(
+        self,
+        *,
+        checked_at: datetime,
+        process_last_seen: datetime | None = None,
+        full_scan_last_complete: datetime | None = None,
+        fast_monitor_last_complete: datetime | None = None,
+        market_data_last_healthy: datetime | None = None,
+        outbox_last_progress: datetime | None = None,
+        outbox_last_observed: datetime | None = None,
+        market_data_health: str | None = None,
+        outbox_health: str | None = None,
+        last_scan_duration_ms: float | None = None,
+        last_event_loop_lag_ms: float | None = None,
+    ) -> None:
+        """Persist component health without performing schema repair."""
+        try:
+            with self._db.session() as session:
+                heartbeat = session.get(RuntimeHeartbeatModel, 1)
+                if heartbeat is None:
+                    heartbeat = RuntimeHeartbeatModel(id=1)
+                    session.add(heartbeat)
+                heartbeat.checked_at = checked_at
+                for name, value in {
+                    "process_last_seen": process_last_seen,
+                    "full_scan_last_complete": full_scan_last_complete,
+                    "fast_monitor_last_complete": fast_monitor_last_complete,
+                    "market_data_last_healthy": market_data_last_healthy,
+                    "outbox_last_progress": outbox_last_progress,
+                    "outbox_last_observed": outbox_last_observed,
+                    "market_data_health": market_data_health,
+                    "outbox_health": outbox_health,
+                    "last_scan_duration_ms": _nullable_float(last_scan_duration_ms),
+                    "last_event_loop_lag_ms": _nullable_float(last_event_loop_lag_ms),
+                }.items():
+                    if value is not None:
+                        setattr(heartbeat, name, value)
+        except Exception:
+            logger.exception("runtime health write failed")
+
+    def get_runtime_health(self) -> dict[str, object]:
+        """Read the singleton health row as a secret-free projection."""
+        with self._db.session() as session:
+            heartbeat = session.get(RuntimeHeartbeatModel, 1)
+            if heartbeat is None:
+                return {}
+            return _json_ready({
+                "process_last_seen": _ensure_utc(heartbeat.process_last_seen).isoformat() if heartbeat.process_last_seen else None,
+                "full_scan_last_complete": _ensure_utc(heartbeat.full_scan_last_complete).isoformat() if heartbeat.full_scan_last_complete else None,
+                "fast_monitor_last_complete": _ensure_utc(heartbeat.fast_monitor_last_complete).isoformat() if heartbeat.fast_monitor_last_complete else None,
+                "market_data_last_healthy": _ensure_utc(heartbeat.market_data_last_healthy).isoformat() if heartbeat.market_data_last_healthy else None,
+                "outbox_last_progress": _ensure_utc(heartbeat.outbox_last_progress).isoformat() if heartbeat.outbox_last_progress else None,
+                "outbox_last_observed": (
+                    _ensure_utc(heartbeat.outbox_last_observed).isoformat()
+                    if heartbeat.outbox_last_observed
+                    else None
+                ),
+                "market_data_health": heartbeat.market_data_health,
+                "outbox_health": heartbeat.outbox_health,
+                "last_scan_duration_ms": heartbeat.last_scan_duration_ms,
+                "last_event_loop_lag_ms": heartbeat.last_event_loop_lag_ms,
+            })
+
     def update_fast_monitor_heartbeat(
         self,
         *,
@@ -3494,6 +4259,7 @@ def _event_from_model(model: EventStateModel) -> EventState:
         symbol=model.symbol,
         event_id=model.event_id,
         state=EventStatus(model.state),
+        lifecycle_state=model.lifecycle_state,
         event_start_time=_ensure_utc(model.event_start_time),
         event_high=model.event_high,
         event_high_time=_ensure_utc(model.event_high_time),

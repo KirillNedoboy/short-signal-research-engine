@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 import pandas as pd
 
 from app.config import AppConfig, CanonicalMarketDataProviderMode
+from app.market.candles import validate_closed_1m_frame
 from app.domain import MarketSnapshot
 
 from .continuity import GapState
@@ -280,6 +281,10 @@ class CanonicalMarketDataProvider:
     def shortlist(self, snapshots: list[MarketSnapshot]) -> list[MarketSnapshot]:
         return self._scanner.shortlist(snapshots)
 
+    @property
+    def last_scan_failures(self) -> dict[str, dict[str, object]]:
+        return dict(getattr(self._scanner, "last_scan_failures", {}))
+
     async def prefetch_historical_frames(self, symbols: list[str]) -> dict[str, FrozenCandleFrame]:
         frames = await self._scanner.fetch_symbol_frames(symbols)
         captured = _utc(self._clock())
@@ -312,12 +317,39 @@ class CanonicalMarketDataProvider:
         else:
             frame_available = _utc(self._clock())
             frozen = FrozenCandleFrame(symbol, frame_1m, "REST", frame_available, frame_available)
-        effective_price = price if price is not None else float(frozen.frame["close"].iloc[-1])
+        frame = frozen.frame
+        admission_failure = validate_closed_1m_frame(
+            frame, frozen.captured_at_utc,
+            max_age=timedelta(
+                seconds=max(120, self._config.scan_interval_sec * 2)
+            ),
+        )
+        if admission_failure is not None:
+            self._evidence.record(
+                "decision_snapshot_rejected", symbol=symbol, reason=admission_failure
+            )
+            return None
+        effective_price = price if price is not None else float(frame["close"].iloc[-1])
         resolved_derivatives = (
             deepcopy(dict(derivatives))
             if derivatives is not None
             else await self.fetch_optional_derivatives(symbol)
         )
+        if (
+            isinstance(resolved_derivatives.get("scan_failure"), Mapping)
+            or (
+                self._config.derivatives_enabled
+                and (
+                    not resolved_derivatives.get("open_interest")
+                    or not resolved_derivatives.get("funding")
+                )
+            )
+        ):
+            self._evidence.record(
+                "decision_snapshot_rejected",
+                symbol=symbol, reason="MARKET_DATA_INCOMPLETE",
+            )
+            return None
         liquidity = (
             await self.fetch_optional_liquidity(symbol, effective_price)
             if include_liquidity

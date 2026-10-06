@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from app.market_data.models import HealthStatus, MarketDataHealth, SubscriptionState
+from app.market.scanner import _normalize_derivatives_result
 from scripts.validate_market_data_ws_shadow import build_report
 
 
@@ -51,3 +52,30 @@ def test_validation_script_can_be_invoked_directly() -> None:
     )
     assert result.returncode == 0
     assert "Finite, read-only Ubuntu validation" in result.stdout
+
+
+def test_derivative_failure_is_degraded_when_derivatives_are_not_required() -> None:
+    result = _normalize_derivatives_result(
+        "AAAUSDT",
+        [],
+        [],
+        derivatives_required=False,
+    )
+
+    assert result["derivatives_status"] == "MISSING"
+    assert result["scan_failure"] is None
+    assert "derivatives_missing" in result["data_quality_warnings"]
+
+
+def test_required_missing_derivatives_are_scan_failure_incomplete() -> None:
+    result = _normalize_derivatives_result(
+        "AAAUSDT",
+        [],
+        [],
+        derivatives_required=True,
+    )
+
+    assert result["scan_failure"] == {
+        "terminal_status": "SCAN_FAILED",
+        "reason_code": "MARKET_DATA_INCOMPLETE",
+    }

@@ -14,6 +14,9 @@ from app.research.storage_router import (
     ResearchStorageRouter,
 )
 from app.research.spool_compactor import compact_sealed_segment
+from app.storage.db import Database
+from app.storage.models import MarketScanCycleModel
+from app.storage.repository import BotRepository
 
 
 def _capacity(free_bytes: int = 3_000_000_000) -> DiskCapacitySnapshot:
@@ -104,6 +107,38 @@ def test_terminal_row_is_not_removal_eligible_before_identity_verification(tmp_p
     assert router.removal_eligibility(token) is False
     router.verify_identity(token, verified=True)
     assert router.removal_eligibility(token) is True
+
+
+
+
+def test_spool_canonical_operational_path_persists_accounting_failure(tmp_path: Path) -> None:
+    db = Database(f"sqlite:///{tmp_path / 'operational.sqlite'}")
+    db.create_all()
+    repository = BotRepository(db)
+    repository.set_runtime_metadata(runtime_instance_id="runtime-1", config_fingerprint="c" * 64)
+    repository.prepare_market_scan_rotation(
+        rotation_started_at=datetime.now(timezone.utc),
+        exchange_symbols=["BTCUSDT"],
+        eligible_symbols=["BTCUSDT"],
+    )
+    proxy = _router(tmp_path, ResearchTelemetryStorageMode.SPOOL_CANONICAL).wrap_repository(repository)
+    now = datetime.now(timezone.utc)
+
+    result = proxy.record_market_scan_cycle(
+        cycle_started_at=now,
+        cycle_completed_at=now,
+        exchange_symbols=["BTCUSDT"],
+        eligible_symbols=["BTCUSDT"],
+        scheduled_symbols=["BTCUSDT"],
+        symbol_results=[{"terminal_status": "SCANNED_OK"}],
+    )
+
+    assert result["cycle_status"] == "FAILED"
+    assert result["accounting_error"] is True
+    with db.session() as session:
+        cycle = session.query(MarketScanCycleModel).one()
+        assert cycle.status == "FAILED"
+        assert cycle.details_json["accounting_mismatch"]["missing_symbol_rows"] == [0]
 
 
 def test_low_disk_pauses_canonical_capture_without_sqlite_fallback(tmp_path: Path) -> None:

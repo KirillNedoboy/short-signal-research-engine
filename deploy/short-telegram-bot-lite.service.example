@@ -5,9 +5,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=<APP_ROOT>
+WorkingDirectory=<RELEASE_DIR>
 Environment=PYTHONUNBUFFERED=1
-ExecStart=<APP_ROOT>/.venv/bin/python scripts/run_live.py
+Environment=AUTOEXECUTION=OFF
+ExecStart=<RELEASE_DIR>/.venv/bin/python <RELEASE_DIR>/scripts/run_live.py
 Restart=always
 RestartSec=10
 User=root

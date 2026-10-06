@@ -73,6 +73,7 @@ def test_market_scanner_classifies_rate_limit_without_crashing_cycle() -> None:
     assert result["derivatives_status"] == "RATE_LIMITED"
     assert "bybit_rate_limit" in result["derivatives_reasons"]
     assert "derivatives_missing" in result["data_quality_warnings"]
+    assert result["scan_failure"]["reason_code"] == "MARKET_DATA_INCOMPLETE"
 
 
 def test_market_scanner_classifies_api_error_without_crashing_cycle() -> None:

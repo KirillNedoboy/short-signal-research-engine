@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from app.domain import ManualDeliveryLifecycleState
+
 MAX_SNAPSHOT_BYTES = 32 * 1024
 _SENSITIVE_KEY_PARTS = (
     "token",
@@ -29,6 +31,14 @@ class ObservationWriteStatus(StrEnum):
     INSERTED = "INSERTED"
     DUPLICATE = "DUPLICATE"
     FAILED = "FAILED"
+
+
+def serialize_lifecycle_state(
+    state: ManualDeliveryLifecycleState | str,
+) -> str:
+    """Return the stable wire representation of a delivery lifecycle state."""
+
+    return ManualDeliveryLifecycleState(state).value
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +61,7 @@ class StrategyObservation:
     strategy: str
     evaluation_phase: str
     symbol: str
+    event_id: str | None
     root_event_id: str | None
     event_revision: int | None
     attempt_id: str | None
@@ -70,6 +81,41 @@ class StrategyObservation:
     config_hash: str
     input_fingerprint: str
     input_snapshot: dict[str, Any]
+    # Final-decision audit fields are nullable for historical observations.
+    initial_evaluation_id: int | None = None
+    initial_decision: str | None = None
+    final_decision: str | None = None
+    final_reason: str | None = None
+    finalized_at: datetime | None = None
+
+
+def validate_final_decision_audit(observation: StrategyObservation) -> None:
+    """Reject incomplete new audit payloads while preserving nullable history."""
+    fields = (
+        observation.initial_evaluation_id,
+        observation.initial_decision,
+        observation.final_decision,
+        observation.final_reason,
+        observation.finalized_at,
+    )
+    if not any(value is not None for value in fields):
+        return
+    if observation.final_decision is None:
+        raise ValueError("final decision audit requires final_decision")
+    if observation.initial_evaluation_id is None:
+        raise ValueError("final decision audit requires initial_evaluation_id")
+    if observation.initial_decision is None or observation.finalized_at is None:
+        raise ValueError("final decision audit requires initial_decision and finalized_at")
+    if observation.final_decision == "BLOCKED_BY_RECHECK":
+        if not observation.final_reason:
+            raise ValueError("blocked final decision audit requires final_reason")
+    elif observation.final_decision == "ACTIONABLE":
+        if not observation.final_reason:
+            raise ValueError("actionable final decision audit requires final_reason")
+        if observation.final_reason != "final_actionable":
+            raise ValueError("actionable final decision audit has invalid final_reason")
+    else:
+        raise ValueError(f"unsupported final decision: {observation.final_decision}")
 
 
 @dataclass(frozen=True, slots=True)

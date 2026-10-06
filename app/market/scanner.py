@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 import pandas as pd
 
@@ -12,8 +13,8 @@ from app.config import AppConfig
 from app.domain import MarketSnapshot
 from app.infra.cache import TTLCache
 from app.market.bybit_client import BybitClient
-from app.market.candles import klines_to_frame
-from app.market.coverage import ScanUniverseTelemetry
+from app.market.candles import klines_to_frame, validate_closed_1m_frame
+from app.market.coverage import ScanUniverseTelemetry, normalize_scan_failure
 from app.market.shortlist import build_shortlist, filter_universe
 
 _DERIVATIVES_SUCCESS_TTL_SEC = 180
@@ -30,6 +31,7 @@ class MarketScanner:
         self._snapshot_cache: TTLCache[MarketSnapshot] = TTLCache()
         self._derivatives_cache: TTLCache[dict[str, Any]] = TTLCache()
         self._last_universe_telemetry: ScanUniverseTelemetry | None = None
+        self._last_scan_failures: dict[str, dict[str, object]] = {}
 
     @property
     def client(self) -> BybitClient:
@@ -40,6 +42,10 @@ class MarketScanner:
     @property
     def last_universe_telemetry(self) -> ScanUniverseTelemetry | None:
         return self._last_universe_telemetry
+
+    @property
+    def last_scan_failures(self) -> dict[str, dict[str, object]]:
+        return {symbol: dict(result) for symbol, result in self._last_scan_failures.items()}
 
     async def fetch_market_snapshots(self) -> list[MarketSnapshot]:
         """Fetch and normalize liquid ticker snapshots."""
@@ -111,7 +117,7 @@ class MarketScanner:
 
     async def fetch_symbol_frames(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
         """Fetch recent 1m candles for a set of symbols."""
-
+        self._last_scan_failures = {}
         tasks = [
             self._client.fetch_klines(symbol, "1", limit=self._config.deep_scan_kline_limit)
             for symbol in symbols
@@ -120,10 +126,29 @@ class MarketScanner:
         frames: dict[str, pd.DataFrame] = {}
         for symbol, result in zip(symbols, results, strict=True):
             if isinstance(result, Exception):
+                self._last_scan_failures[symbol] = normalize_scan_failure(
+                    str(result), exception=result
+                )
                 continue
-            frame = klines_to_frame(result)
+            try:
+                frame = klines_to_frame(cast(list[list[str]], result))
+            except Exception as exc:  # noqa: BLE001 - malformed provider payload is per-symbol
+                self._last_scan_failures[symbol] = normalize_scan_failure(
+                    "PROVIDER_ERROR", exception=exc
+                )
+                continue
             if not frame.empty:
+                market_asof = getattr(self._client, "extract_market_time", lambda: datetime.now(UTC))()
+                admission_failure = validate_closed_1m_frame(
+                    frame, market_asof,
+                    max_age=timedelta(seconds=max(120, self._config.scan_interval_sec * 2)),
+                )
+                if admission_failure is not None:
+                    self._last_scan_failures[symbol] = normalize_scan_failure(admission_failure)
+                    continue
                 frames[symbol] = frame
+            else:
+                self._last_scan_failures[symbol] = normalize_scan_failure("EMPTY_RESPONSE")
         return frames
 
     async def fetch_optional_derivatives(self, symbol: str) -> dict[str, Any]:
@@ -142,7 +167,12 @@ class MarketScanner:
             return_exceptions=True,
         )
 
-        result = _normalize_derivatives_result(symbol, open_interest_result, funding_result)
+        result = _normalize_derivatives_result(
+            symbol,
+            open_interest_result,
+            funding_result,
+            derivatives_required=self._config.derivatives_enabled,
+        )
         ttl = _DERIVATIVES_SUCCESS_TTL_SEC if result["derivatives_status"] == "OK" else _DERIVATIVES_FAILURE_TTL_SEC
         self._derivatives_cache.set(symbol, result, ttl_seconds=ttl)
         if result["derivatives_status"] != "OK":
@@ -169,6 +199,8 @@ def _normalize_derivatives_result(
     symbol: str,
     open_interest_result: list[dict[str, Any]] | Exception,
     funding_result: list[dict[str, Any]] | Exception,
+    *,
+    derivatives_required: bool = False,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     data_quality_warnings: list[str] = []
@@ -213,6 +245,11 @@ def _normalize_derivatives_result(
         "derivatives_reasons": _dedupe(reasons),
         "data_quality_warnings": _dedupe(data_quality_warnings),
         "symbol": symbol,
+        "scan_failure": (
+            normalize_scan_failure("MARKET_DATA_INCOMPLETE", exception=None)
+            if derivatives_required and (not open_interest or not funding)
+            else None
+        ),
     }
     return normalized
 

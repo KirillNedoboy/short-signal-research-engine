@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from enum import StrEnum
 from typing import Any
@@ -19,6 +20,10 @@ from pydantic import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ManualOnlyConfigurationError(RuntimeError):
+    """Raised when a runtime config is not explicitly manual-only."""
 
 
 class CanonicalMarketDataProviderMode(StrEnum):
@@ -44,8 +49,10 @@ class AppConfig(BaseModel):
     """Validated runtime configuration."""
 
     model_config = ConfigDict(
-        extra="ignore", validate_assignment=True, hide_input_in_errors=True
+        extra="forbid", validate_assignment=True, hide_input_in_errors=True
     )
+
+    autoexecution: str | None = None
 
     scan_interval_sec: int = 60
     shortlist_size: int = 100
@@ -210,13 +217,15 @@ class AppConfig(BaseModel):
     research_telemetry_storage_mode: ResearchTelemetryStorageMode = (
         ResearchTelemetryStorageMode.SQLITE_ONLY
     )
-    research_spool_root: str = "data/research_spool"
+    research_spool_root: str = "<APP_ROOT>/shared/research_spool"
     research_spool_max_bytes: int = Field(default=1_073_741_824, ge=1)
     research_spool_record_max_bytes: int = Field(default=65_536, ge=1024)
     research_spool_shadow_headroom_bytes: int = Field(
         default=1_073_741_824, ge=1
     )
-    research_storage_health_path: str = "data/research-storage-health.json"
+    research_storage_health_path: str = (
+        "<APP_ROOT>/shared/runtime/research-storage-health.json"
+    )
 
     @field_validator(
         "event_ret_15m_min",
@@ -387,6 +396,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _coerce_env_values(values: dict[str, Any]) -> dict[str, Any]:
     env_map = {
+        "AUTOEXECUTION": "autoexecution",
         "TELEGRAM_TOKEN": "telegram_token",
         "SIGNAL_CHAT_ID": "signal_chat_id",
         "ALERTS_CHAT_ID": "alerts_chat_id",
@@ -424,10 +434,30 @@ def load_config(
     env_file = Path(env_path)
 
     raw_config = _read_yaml(config_file)
+    if "AUTOEXECUTION" in raw_config:
+        raw_value = raw_config["AUTOEXECUTION"]
+        if raw_value is True:
+            raw_value = "ON"
+        elif raw_value is False:
+            raw_value = "OFF"
+        raw_config = {**raw_config, "autoexecution": raw_value}
+        del raw_config["AUTOEXECUTION"]
     raw_env = dotenv_values(env_file) if env_file.exists() else {}
+    if "AUTOEXECUTION" in os.environ:
+        raw_env = {**raw_env, "AUTOEXECUTION": os.environ["AUTOEXECUTION"]}
     merged = {**raw_config, **_coerce_env_values(raw_env)}
 
     try:
         return AppConfig.model_validate(merged)
     except ValidationError as exc:
         raise RuntimeError(f"Invalid configuration: {exc}") from exc
+
+
+def require_manual_only(config: AppConfig) -> AppConfig:
+    """Fail closed unless the runtime explicitly declares AUTOEXECUTION=OFF."""
+
+    if config.autoexecution != "OFF":
+        raise ManualOnlyConfigurationError(
+            "AUTOEXECUTION must be explicitly set to OFF for this manual-only runtime"
+        )
+    return config

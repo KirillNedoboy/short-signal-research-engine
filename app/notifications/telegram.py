@@ -6,6 +6,8 @@ import logging
 
 from telegram import Bot
 
+from app.logger import sanitize_text
+
 
 class TelegramNotifier:
     """Long-lived Telegram Bot client with separate signal and alert chats."""
@@ -62,5 +64,5 @@ class TelegramNotifier:
             self._logger.warning("Telegram alerts chat is not configured; skipping alert send.")
             return False
         await self.start()
-        await self._bot.send_message(chat_id=self._alerts_chat_id, text=message)
+        await self._bot.send_message(chat_id=self._alerts_chat_id, text=sanitize_text(message))
         return True

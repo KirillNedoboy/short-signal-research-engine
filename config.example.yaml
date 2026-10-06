@@ -1,3 +1,4 @@
+AUTOEXECUTION: OFF
 scan_interval_sec: 60
 shortlist_size: 100
 min_24h_volume: 5000000

@@ -39,4 +39,4 @@ Baseline score uses bounded buckets and risk penalties; baseline engine grade is
 
 ## Release overlay
 
-Operational deployments may run isolated comparison lanes with different effective configurations. This public mirror does not publish lane names, release identifiers, host details, or private runtime settings. Thresholds must be read from the checked-out example configuration and source code; production configuration is outside this repository.
+The current operator-verified topology runs Lane A `bf47d2b1` and Lane B `dfcdb9df` simultaneously in isolated contours. Lane A is the primary production lane. Lane B contains the split climax evaluators and keeps `TRAPPED_LONGS_REVERSAL` live delivery disabled in its effective configuration. Thresholds must be read from the pinned effective release configuration, not copied from this baseline narrative.

@@ -31,6 +31,11 @@ def test_corrected_config_defaults_pass_validation() -> None:
     assert config.request_min_delay_ms == 350
 
 
+def test_unknown_config_keys_are_rejected() -> None:
+    with pytest.raises(ValueError, match="phase0_unknown_key"):
+        AppConfig.model_validate({"phase0_unknown_key": "rejected"})
+
+
 def test_relaxed_config_file_passes_validation() -> None:
     config = load_config(config_path=Path("config.yaml"), env_path=Path(".env.missing"))
 
@@ -88,12 +93,12 @@ def test_env_db_url_is_source_of_truth(tmp_path) -> None:
     env_path = tmp_path / ".env"
     config_path.write_text("db_url: sqlite:///./from-config.sqlite\n", encoding="utf-8")
     env_path.write_text(
-        "DB_URL=sqlite:////srv/bot-public/data/bot.sqlite\n", encoding="utf-8"
+        "DB_URL=sqlite:///<APP_ROOT>/data/bot.sqlite\n", encoding="utf-8"
     )
 
     config = load_config(config_path=config_path, env_path=env_path)
 
-    assert config.db_url == "sqlite:////srv/bot-public/data/bot.sqlite"
+    assert config.db_url == "sqlite:///<APP_ROOT>/data/bot.sqlite"
 
 
 def test_request_timeout_env_override_is_loaded(tmp_path) -> None:

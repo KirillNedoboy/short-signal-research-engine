@@ -12,6 +12,7 @@ from app.domain import SignalOutcome
 from app.scripts.short_derivatives_report import main as derivatives_report_main
 from app.scripts.short_outcome_quality_report import main as outcome_report_main
 from app.scripts.short_reject_report import main as reject_report_main
+from app.scripts.reporting_cli import build_two_lane_coverage_report
 from app.storage.db import Database
 from app.storage.repository import BotRepository
 
@@ -235,3 +236,218 @@ def test_reject_report_invalid_since_returns_useful_error(tmp_path, monkeypatch,
 
     assert exc_info.value.code == 2
     assert "Invalid --since timestamp" in capsys.readouterr().err
+
+
+def test_two_lane_coverage_report_reconciles_rows_and_labels_incomplete(tmp_path) -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE market_scan_symbol_results (
+            id INTEGER PRIMARY KEY, rotation_id TEXT, symbol TEXT,
+            terminal_status TEXT, reason_code TEXT, scheduled_at TEXT,
+            completed_at TEXT, duration_ms REAL, runtime_instance_id TEXT
+        );
+        CREATE TABLE strategy_observations (
+            observation_id TEXT PRIMARY KEY, runtime_instance_id TEXT,
+            observed_at TEXT, initial_decision TEXT, final_decision TEXT,
+            final_reason TEXT, signal_id INTEGER
+        );
+        CREATE TABLE signals (id INTEGER PRIMARY KEY, created_at TEXT);
+        CREATE TABLE signal_provenance (
+            signal_id INTEGER, runtime_instance_id TEXT, decision_at TEXT
+        );
+        CREATE TABLE telegram_delivery_outbox (
+            entity_type TEXT, entity_id INTEGER, status TEXT, sent_at TEXT
+        );
+        CREATE TABLE runtime_heartbeat_history (
+            runtime_instance_id TEXT, created_at TEXT, event_loop_lag_ms REAL
+        );
+        INSERT INTO market_scan_symbol_results VALUES
+          (1, 'ra', 'BTC', 'SCANNED_OK', 'ok', '2026-06-20T04:00:00+00:00', '2026-06-20T04:00:01+00:00', 120, 'runtime-a'),
+          (2, 'rb', 'ETH', 'SCAN_FAILED', 'timeout', '2026-06-20T04:00:00+00:00', NULL, 900, 'runtime-b');
+        INSERT INTO strategy_observations VALUES
+          ('oa', 'runtime-a', '2026-06-20T04:00:02+00:00', 'ACTIONABLE', 'ACTIONABLE', 'final_actionable', 10),
+          ('ob', 'runtime-b', '2026-06-20T04:00:02+00:00', 'ACTIONABLE', 'BLOCKED', 'blocked_by_recheck', NULL);
+        INSERT INTO signals VALUES (10, '2026-06-20T04:00:03+00:00');
+        INSERT INTO signal_provenance VALUES (10, 'runtime-a', '2026-06-20T04:00:03+00:00');
+        INSERT INTO telegram_delivery_outbox VALUES ('SIGNAL', 10, 'SENT', '2026-06-20T04:00:04+00:00');
+        INSERT INTO runtime_heartbeat_history VALUES ('runtime-a', '2026-06-20T04:05:00+00:00', 12.5);
+        """
+    )
+
+    report = build_two_lane_coverage_report(
+        connection,
+        {"A": "runtime-a", "B": "runtime-b"},
+        since="2026-06-20T04:00:00+00:00",
+        until="2026-06-20T05:00:00+00:00",
+        now="2026-06-20T05:00:00+00:00",
+    )
+
+    assert [row["lane"] for row in report["lanes"]] == ["A", "B"]
+    assert report["lanes"][0]["scheduled"] == 1
+    assert report["lanes"][0]["completed"] == 1
+    assert report["lanes"][0]["scanned_ok"] == 1
+    assert report["lanes"][0]["signals_persisted"] == 1
+    assert report["lanes"][0]["outbox_sent"] == 1
+    assert report["lanes"][1]["scan_failed_by_reason"] == {"timeout": 1}
+    assert report["lanes"][1]["blocked_by_recheck"] == 1
+    assert report["lanes"][1]["coverage"] == "INCOMPLETE"
+    assert "mfe" not in json.dumps(report).lower()
+
+
+def test_two_lane_coverage_report_returns_incomplete_without_explicit_b_mapping() -> None:
+    import sqlite3
+
+    report = build_two_lane_coverage_report(sqlite3.connect(":memory:"), {"A": "runtime-a"})
+
+    assert report["coverage"] == "INCOMPLETE"
+    assert report["window"]["status"] == "INCOMPLETE"
+    assert report["diagnostic"] == "invalid explicit A/B lane mapping"
+
+
+@pytest.mark.parametrize("mapping", [{"A": "same", "B": "same"}, {"A": "", "B": "runtime-b"}, {"A": "runtime-a"}])
+def test_two_lane_coverage_report_sanitizes_invalid_lane_mapping(mapping) -> None:
+    import sqlite3
+
+    report = build_two_lane_coverage_report(sqlite3.connect(":memory:"), mapping)
+
+    assert report["coverage"] == "INCOMPLETE"
+    assert report["mapping"] == {}
+    assert "same" not in json.dumps(report)
+
+
+def test_two_lane_coverage_report_requires_telemetry_and_windows_heartbeat_metrics() -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE market_scan_symbol_results (
+            id INTEGER PRIMARY KEY, terminal_status TEXT, reason_code TEXT,
+            scheduled_at TEXT, completed_at TEXT, duration_ms REAL, runtime_instance_id TEXT
+        );
+        CREATE TABLE strategy_observations (
+            observation_id TEXT PRIMARY KEY, runtime_instance_id TEXT,
+            observed_at TEXT, initial_decision TEXT, final_decision TEXT, final_reason TEXT, signal_id INTEGER
+        );
+        CREATE TABLE signals (id INTEGER PRIMARY KEY, created_at TEXT);
+        CREATE TABLE signal_provenance (signal_id INTEGER, runtime_instance_id TEXT, decision_at TEXT);
+        CREATE TABLE telegram_delivery_outbox (entity_type TEXT, entity_id INTEGER, status TEXT, sent_at TEXT);
+        CREATE TABLE runtime_heartbeat_history (
+            runtime_instance_id TEXT, created_at TEXT, event_loop_lag_ms REAL
+        );
+        INSERT INTO market_scan_symbol_results VALUES
+          (1, 'SCANNED_OK', 'ok', '2026-06-20T04:00:00+00:00', '2026-06-20T04:00:01+00:00', 120, 'runtime-a');
+        INSERT INTO strategy_observations VALUES
+          ('oa', 'runtime-a', '2026-06-20T04:00:02+00:00', 'ACTIONABLE', 'BLOCKED', 'x', NULL);
+        INSERT INTO runtime_heartbeat_history VALUES
+          ('runtime-a', '2026-06-20T03:59:00+00:00', 1.0),
+          ('runtime-a', '2026-06-20T04:30:00+00:00', 7.0),
+          ('runtime-a', '2026-06-20T05:01:00+00:00', 99.0);
+        """
+    )
+
+    report = build_two_lane_coverage_report(
+        connection, {"A": "runtime-a", "B": "runtime-b"},
+        since="2026-06-20T04:00:00+00:00", until="2026-06-20T05:00:00+00:00",
+        now="2026-06-20T05:00:00+00:00",
+    )
+
+    lane_a, lane_b = report["lanes"]
+    assert lane_a["coverage"] == "INCOMPLETE"
+    assert lane_a["heartbeat_age"] == 1800.0
+    assert lane_a["max_event_loop_lag"] == 7.0
+    assert lane_b["coverage"] == "INCOMPLETE"
+
+
+def test_two_lane_coverage_report_trims_lane_ids_and_rejects_whitespace_collision() -> None:
+    import sqlite3
+
+    report = build_two_lane_coverage_report(
+        sqlite3.connect(":memory:"), {"A": " runtime-a ", "B": "runtime-a"}
+    )
+
+    assert report["coverage"] == "INCOMPLETE"
+    assert report["mapping"] == {}
+    assert "runtime-a" not in json.dumps(report)
+
+
+def test_two_lane_coverage_report_anchors_scan_metrics_to_scheduled_window() -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript("""
+        CREATE TABLE market_scan_symbol_results (
+            id INTEGER PRIMARY KEY, terminal_status TEXT, reason_code TEXT,
+            scheduled_at TEXT, completed_at TEXT, duration_ms REAL, runtime_instance_id TEXT
+        );
+        CREATE TABLE strategy_observations (
+            observation_id TEXT PRIMARY KEY, runtime_instance_id TEXT,
+            observed_at TEXT, initial_decision TEXT, final_decision TEXT, final_reason TEXT, signal_id INTEGER
+        );
+        CREATE TABLE signals (id INTEGER PRIMARY KEY, created_at TEXT);
+        CREATE TABLE signal_provenance (signal_id INTEGER, runtime_instance_id TEXT, decision_at TEXT);
+        CREATE TABLE telegram_delivery_outbox (entity_type TEXT, entity_id INTEGER, status TEXT, sent_at TEXT);
+        CREATE TABLE runtime_heartbeat_history (runtime_instance_id TEXT, created_at TEXT, event_loop_lag_ms REAL);
+        INSERT INTO market_scan_symbol_results VALUES
+          (1, 'SCANNED_OK', 'ok', '2026-06-20T04:59:59+00:00', '2026-06-20T05:00:01+00:00', 120, 'runtime-a'),
+          (2, 'SCANNED_OK', 'ok', '2026-06-20T05:00:00+00:00', '2026-06-20T04:59:59+00:00', 999, 'runtime-a');
+        INSERT INTO strategy_observations VALUES
+          ('oa', 'runtime-a', '2026-06-20T04:30:00+00:00', 'BLOCKED', 'BLOCKED', 'x', NULL);
+        INSERT INTO runtime_heartbeat_history VALUES ('runtime-a', '2026-06-20T04:30:00+00:00', 1.0);
+    """)
+
+    report = build_two_lane_coverage_report(
+        connection, {"A": "runtime-a", "B": "runtime-b"},
+        since="2026-06-20T04:00:00+00:00", until="2026-06-20T05:00:00+00:00",
+        now="2026-06-20T05:00:00+00:00",
+    )
+
+    lane_a = report["lanes"][0]
+    assert lane_a["scheduled"] == 1
+    assert lane_a["completed"] == 1
+    assert lane_a["scanned_ok"] == 1
+    assert lane_a["max_duration"] == 120
+
+
+def test_two_lane_coverage_report_counts_signals_without_observations() -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE market_scan_symbol_results (
+            id INTEGER PRIMARY KEY, terminal_status TEXT, reason_code TEXT,
+            scheduled_at TEXT, completed_at TEXT, duration_ms REAL, runtime_instance_id TEXT
+        );
+        CREATE TABLE strategy_observations (
+            observation_id TEXT PRIMARY KEY, runtime_instance_id TEXT,
+            observed_at TEXT, initial_decision TEXT, final_decision TEXT, final_reason TEXT, signal_id INTEGER
+        );
+        CREATE TABLE signals (id INTEGER PRIMARY KEY, created_at TEXT);
+        CREATE TABLE signal_provenance (signal_id INTEGER, runtime_instance_id TEXT, decision_at TEXT);
+        CREATE TABLE telegram_delivery_outbox (entity_type TEXT, entity_id INTEGER, status TEXT, sent_at TEXT);
+        CREATE TABLE runtime_heartbeat_history (runtime_instance_id TEXT, created_at TEXT, event_loop_lag_ms REAL);
+        INSERT INTO market_scan_symbol_results VALUES
+          (1, 'SCANNED_OK', 'ok', '2026-06-20T04:00:00+00:00', '2026-06-20T04:00:01+00:00', 120, 'runtime-a');
+        INSERT INTO signals VALUES (10, '2026-06-20T04:00:03+00:00');
+        INSERT INTO signal_provenance VALUES (10, 'runtime-a', '2026-06-20T04:00:03+00:00');
+        INSERT INTO telegram_delivery_outbox VALUES ('SIGNAL', 10, 'SENT', '2026-06-20T04:00:04+00:00');
+        INSERT INTO runtime_heartbeat_history VALUES ('runtime-a', '2026-06-20T04:05:00+00:00', 12.5);
+        """
+    )
+
+    report = build_two_lane_coverage_report(
+        connection, {"A": "runtime-a", "B": "runtime-b"},
+        since="2026-06-20T04:00:00+00:00", until="2026-06-20T05:00:00+00:00",
+        now="2026-06-20T05:00:00+00:00",
+    )
+
+    assert report["lanes"][0]["signals_persisted"] == 1
+    assert report["lanes"][0]["outbox_sent"] == 1

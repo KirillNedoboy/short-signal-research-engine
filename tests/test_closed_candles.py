@@ -1,7 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
 from app.features.builder import FeatureBuilder
-from app.market.candles import closed_1m_rows, complete_5m_ohlcv, normalize_utc
+from app.market.candles import (
+    closed_1m_rows,
+    complete_5m_ohlcv,
+    normalize_utc,
+    validate_closed_1m_frame,
+)
 
 
 UTC = timezone.utc
@@ -70,3 +75,31 @@ def test_normalize_utc_treats_naive_sqlite_datetime_as_utc() -> None:
     normalized = normalize_utc(naive)
 
     assert normalized == datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+
+
+def test_admission_rejects_forming_candle(make_frame) -> None:
+    start = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+    frame = make_frame([100.0, 101.0], start=start)
+
+    assert validate_closed_1m_frame(frame, start + timedelta(minutes=1, seconds=30)) == "STALE_MARKET_DATA"
+
+
+def test_admission_rejects_gap_duplicate_future_and_stale_data(make_frame) -> None:
+    start = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+    asof = start + timedelta(minutes=5)
+
+    gap = make_frame([100.0, 101.0, 102.0], start=start).drop(index=start + timedelta(minutes=1))
+    assert validate_closed_1m_frame(gap, asof) == "MARKET_DATA_DISCONTINUITY"
+
+    duplicate = make_frame([100.0, 101.0], start=start)
+    import pandas as pd
+    duplicate = pd.concat([duplicate, duplicate.iloc[[1]]])
+    assert validate_closed_1m_frame(duplicate, asof) == "MARKET_DATA_DISCONTINUITY"
+
+    future = make_frame([100.0, 101.0], start=start)
+    future.index = [start, asof + timedelta(minutes=1)]
+    future["timestamp"] = future.index
+    assert validate_closed_1m_frame(future, asof) == "STALE_MARKET_DATA"
+
+    stale = make_frame([100.0, 101.0], start=start)
+    assert validate_closed_1m_frame(stale, asof + timedelta(minutes=20)) == "STALE_MARKET_DATA"

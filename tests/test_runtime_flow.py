@@ -19,7 +19,10 @@ from app.signals.climax import ClimaxEvaluation, ClimaxEvaluationBundle
 from app.storage.db import Database
 from app.storage.models import (
     RejectStatModel,
+    ClimaxEvaluationModel,
+    EventStateModel,
     SignalModel,
+    SignalProvenanceModel,
     StrategyObservationModel,
     TelegramDeliveryOutboxModel,
     WatchCandidateModel,
@@ -227,7 +230,7 @@ def test_disabled_watch_delivery_is_not_drained(
 
 class _FailingRepository:
     def __init__(self) -> None:
-        self.db_url = "sqlite:///${DATA_DIR}/bot.sqlite"
+        self.db_url = "sqlite:///<APP_ROOT>/data/bot.sqlite"
 
     def check_storage_health(self):
         raise RuntimeError("readonly database")
@@ -463,14 +466,25 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
     assert all(runtime_started_at is not None for *_, runtime_started_at in rows)
 
 
-def test_low_volume_recheck_records_all_branches_before_delivery_veto(
+@pytest.mark.parametrize(
+    ("final_actionable", "final_snapshot_available"),
+    [(False, True), (True, True), (False, False)],
+)
+def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
     tmp_path,
     make_event_state,
     make_features,
     make_frame,
     monkeypatch,
+    final_actionable,
+    final_snapshot_available,
 ) -> None:
-    async def _run() -> tuple[list[tuple[str, str]], int]:
+    async def _run() -> tuple[
+        list[tuple[str, str]],
+        int,
+        int,
+        list[tuple[int | None, str | None, str | None, str | None, datetime | None, int | None]],
+    ]:
         database = Database(f"sqlite:///{tmp_path / 'climax-observation-recheck.db'}")
         database.create_all()
         repository = BotRepository(database)
@@ -479,7 +493,9 @@ def test_low_volume_recheck_records_all_branches_before_delivery_veto(
         fresh_features = make_features(
             asof=state.updated_at + timedelta(minutes=1), price=111.0
         )
-        fresh_frame = make_frame([110.0, 111.0])
+        fresh_frame = make_frame(
+            [110.0, 111.0], start=datetime.now(timezone.utc) - timedelta(minutes=2)
+        )
         initial_low = ClimaxEvaluation(
             subtype="LOW_VOLUME_EXTENSION_FAILURE",
             score=75,
@@ -504,6 +520,25 @@ def test_low_volume_recheck_records_all_branches_before_delivery_veto(
             veto_reasons=["microstructure_break_missing"],
             data_quality=[],
         )
+        final_low = (
+            ClimaxEvaluation(
+                subtype="LOW_VOLUME_EXTENSION_FAILURE",
+                score=75,
+                grade="B",
+                metadata={
+                    "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
+                    "model_version": "climax-v1",
+                    "event_high": state.event_high,
+                    "entry_distance_below_high_pct": (
+                        (state.event_high - fresh_features.price) / state.event_high * 100
+                    ),
+                },
+                veto_reasons=[],
+                data_quality=[],
+            )
+            if final_actionable
+            else blocked_low
+        )
         blocked_volume = ClimaxEvaluation(
             subtype=None,
             score=40,
@@ -520,10 +555,10 @@ def test_low_volume_recheck_records_all_branches_before_delivery_veto(
             },
         )
         recheck_bundle = ClimaxEvaluationBundle(
-            selected=blocked_low,
+            selected=final_low,
             branch_evaluations={
                 "VOLUME_CLIMAX_UNWIND": blocked_volume,
-                "LOW_VOLUME_EXTENSION_FAILURE": blocked_low,
+                "LOW_VOLUME_EXTENSION_FAILURE": final_low,
             },
         )
         bundles = iter([initial_bundle, recheck_bundle])
@@ -532,19 +567,37 @@ def test_low_volume_recheck_records_all_branches_before_delivery_veto(
             lambda *_args, **_kwargs: next(bundles),
             raising=False,
         )
+        notifier = _FakeNotifier()
         bot = ShortSignalBot(
             config=AppConfig(
                 climax_short_enabled=True, volume_climax_lifecycle_shadow_enabled=False
             ),
             repository=repository,
             scanner=_RecheckScanner(fresh_frame),
-            notifier=_FakeNotifier(),
+            notifier=notifier,
         )
+        save_calls = []
+        original_save_signal = repository.save_signal
+
+        def save_signal_once(*args, **kwargs):
+            save_calls.append(True)
+            return original_save_signal(*args, **kwargs)
+
+        repository.save_signal = save_signal_once
         bot._feature_builder.build = lambda *_args, **_kwargs: fresh_features
+        if not final_snapshot_available:
+            async def _missing_final_snapshot(*_args, **_kwargs):
+                return None
+
+            bot._market_data_provider.capture_decision_snapshot = _missing_final_snapshot
 
         await bot._evaluate_and_send_climax(
             "ONTUSDT", object(), state, features=initial_features
         )
+        if final_actionable and final_snapshot_available:
+            await bot._evaluate_and_send_climax(
+                "ONTUSDT", object(), state, features=initial_features
+            )
         with database.session() as session:
             rows = [
                 (row.strategy, row.evaluation_phase)
@@ -555,10 +608,41 @@ def test_low_volume_recheck_records_all_branches_before_delivery_veto(
                     )
                 ).all()
             ]
+            audit_rows = [
+                (
+                    row.initial_evaluation_id,
+                    row.initial_decision,
+                    row.final_decision,
+                    row.final_reason,
+                    row.finalized_at,
+                    row.signal_id,
+                )
+                for row in session.scalars(
+                    select(StrategyObservationModel).where(
+                        StrategyObservationModel.evaluation_phase
+                        == "PRE_DELIVERY_RECHECK",
+                        StrategyObservationModel.final_decision.is_not(None),
+                    )
+                ).all()
+            ]
             signal_count = len(session.scalars(select(SignalModel)).all())
-        return rows, signal_count
+            outbox_count = len(session.scalars(select(TelegramDeliveryOutboxModel)).all())
+            provenance_count = len(session.scalars(select(SignalProvenanceModel)).all())
+            state_row = session.get(EventStateModel, state.symbol)
+            final_evaluation = session.scalars(
+                select(ClimaxEvaluationModel)
+                .where(ClimaxEvaluationModel.lifecycle_state == "FINAL_ACTIONABLE")
+            ).first()
+        if final_actionable and final_snapshot_available:
+            assert save_calls == [True]
+            assert provenance_count == 1
+            assert state_row is not None
+            assert state_row.signal_id == audit_rows[0][5]
+            assert state_row.state == EventStatus.SIGNAL_SENT.value
+            assert final_evaluation is not None
+        return rows, signal_count, outbox_count, audit_rows
 
-    rows, signal_count = asyncio.run(_run())
+    rows, signal_count, outbox_count, audit_rows = asyncio.run(_run())
 
     assert rows == [
         ("LOW_VOLUME_EXTENSION_FAILURE", "INITIAL"),
@@ -566,7 +650,23 @@ def test_low_volume_recheck_records_all_branches_before_delivery_veto(
         ("LOW_VOLUME_EXTENSION_FAILURE", "PRE_DELIVERY_RECHECK"),
         ("VOLUME_CLIMAX_UNWIND", "PRE_DELIVERY_RECHECK"),
     ]
-    assert signal_count == 0
+    assert signal_count == (1 if final_actionable and final_snapshot_available else 0)
+    assert outbox_count == (1 if final_actionable and final_snapshot_available else 0)
+    assert len(audit_rows) == 1
+    expected_final_reason = (
+        "final_actionable"
+        if final_actionable
+        else "microstructure_break_missing"
+        if final_snapshot_available
+        else "final_recheck_data_missing"
+    )
+    expected_signal = audit_rows[0][5]
+    assert audit_rows[0][0] is not None
+    assert audit_rows[0][1] == "ACTIONABLE"
+    assert audit_rows[0][2] == ("ACTIONABLE" if final_actionable else "BLOCKED_BY_RECHECK")
+    assert audit_rows[0][3] == expected_final_reason
+    assert audit_rows[0][4] is not None
+    assert (expected_signal is not None) is final_actionable
 
 
 def test_failed_observation_write_alerts_without_changing_signal_delivery(

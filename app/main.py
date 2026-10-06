@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Self, cast
@@ -42,9 +42,9 @@ from app.infra.disk_capacity import (
 from app.infra.health import ServiceHealth
 from app.infra.request_scheduler import RequestScheduler
 from app.infra.runtime_metadata import resolve_code_version
-from app.logger import configure_logging
+from app.logger import configure_logging, safe_exception_summary
 from app.market.bybit_client import BybitClient
-from app.market.coverage import select_rotation_batch
+from app.market.coverage import normalize_scan_failure, select_rotation_batch
 from app.market.scanner import MarketScanner
 from app.market_data.provider import CanonicalMarketDataProvider
 from app.market_data.provider import ComparisonClassification
@@ -592,6 +592,25 @@ class ShortSignalBot:
                 "MarketDataHub universe update failed; REST remains canonical"
             )
 
+    def _persist_runtime_health(self) -> None:
+        writer = getattr(self._repository, "update_runtime_health", None)
+        if not callable(writer):
+            return
+        projection = self._health.snapshot()
+        writer(
+            checked_at=datetime.now(timezone.utc),
+            process_last_seen=self._health.process_last_seen,
+            full_scan_last_complete=self._health.full_scan_last_complete,
+            fast_monitor_last_complete=self._health.fast_monitor_last_complete,
+            market_data_last_healthy=self._health.market_data_last_healthy,
+            outbox_last_progress=self._health.outbox_last_progress,
+            outbox_last_observed=self._health.outbox_last_observed,
+            market_data_health=str(projection["market_data_health"]),
+            outbox_health=str(projection["outbox_health"]),
+            last_scan_duration_ms=self._health.last_scan_duration_ms,
+            last_event_loop_lag_ms=self._health.last_event_loop_lag_ms,
+        )
+
     @classmethod
     def from_files(
         cls,
@@ -715,7 +734,7 @@ class ShortSignalBot:
         except Exception as exc:  # noqa: BLE001 - delivery failures are converted to retry state
             self._repository.mark_delivery_retry(
                 delivery_id,
-                error=f"{type(exc).__name__}: {exc}",
+                error=safe_exception_summary(exc),
                 next_attempt_at=datetime.now(timezone.utc) + timedelta(minutes=1),
             )
             self._logger.warning(
@@ -726,6 +745,8 @@ class ShortSignalBot:
             return False
         if sent:
             self._repository.mark_delivery_sent(delivery_id)
+            self._health.mark_outbox()
+            self._persist_runtime_health()
             return True
         self._repository.mark_delivery_retry(
             delivery_id,
@@ -736,6 +757,7 @@ class ShortSignalBot:
 
     async def _drain_delivery_outbox(self, *, limit: int = 5) -> int:
         delivered = 0
+        watch_claims: list[dict[str, object]] = []
         signal_claims = self._repository.claim_due_deliveries(
             datetime.now(timezone.utc),
             limit=limit,
@@ -759,6 +781,11 @@ class ShortSignalBot:
                 if await self._deliver_outbox_item(delivery):
                     self._watch_sent_in_cycle += 1
                     delivered += 1
+        if not signal_claims and not (
+            self._config.send_watch_to_telegram and watch_budget and watch_claims
+        ):
+            self._health.mark_outbox_observed()
+        self._persist_runtime_health()
         return delivered
 
     async def _send_new_delivery(self, *, entity_type: str, entity_id: int) -> bool:
@@ -789,7 +816,9 @@ class ShortSignalBot:
         if not self._ready:
             raise RuntimeError("runtime is not READY")
         self._health.on_cycle_start()
+        self._persist_runtime_health()
         cycle_started_at = datetime.now(timezone.utc)
+        cycle_started_monotonic = time.perf_counter()
         self._shadow_rotation_id = "unknown"
         self._watch_sent_in_cycle = 0
         decisions: list[SignalDecision] = []
@@ -803,6 +832,8 @@ class ShortSignalBot:
             active_selection_at = datetime.now(timezone.utc)
             active_states = self._state_store.load_active(now=active_selection_at)
             scan_snapshot = await self._market_data_provider.build_scan_snapshot()
+            self._health.mark_market_data()
+            self._persist_runtime_health()
             snapshots = list(scan_snapshot.snapshots)
             self._publish_market_data_universe(
                 getattr(self._scanner, "last_universe_telemetry", None)
@@ -878,8 +909,19 @@ class ShortSignalBot:
                 symbol: frozen.frame.copy(deep=True)
                 for symbol, frozen in frozen_frames.items()
             }
+            scan_failures = getattr(self._scanner, "last_scan_failures", {})
 
             for symbol in symbols:
+                scan_failure = scan_failures.get(symbol)
+                if scan_failure is not None:
+                    normalized_failure = normalize_scan_failure(
+                        scan_failure.get("reason_code", "PROVIDER_ERROR"),
+                        exception=None,
+                    )
+                    if isinstance(scan_failure.get("details"), dict):
+                        normalized_failure["details"] = dict(scan_failure["details"])
+                    symbol_results.append({"symbol": symbol, **normalized_failure})
+                    continue
                 frame = frames.get(symbol)
                 if frame is None or frame.empty:
                     symbol_results.append(
@@ -896,6 +938,29 @@ class ShortSignalBot:
                     include_liquidity=False,
                 )
                 if decision_market is None:
+                    symbol_results.append(
+                        {
+                            "symbol": symbol,
+                            **normalize_scan_failure("MARKET_DATA_INCOMPLETE"),
+                        }
+                    )
+                    continue
+                derivative_failure = (
+                    decision_market.derivatives.get("scan_failure")
+                    if isinstance(decision_market.derivatives, dict)
+                    else None
+                )
+                if isinstance(derivative_failure, dict):
+                    symbol_results.append(
+                        {
+                            "symbol": symbol,
+                            **normalize_scan_failure(
+                                derivative_failure.get(
+                                    "reason_code", "MARKET_DATA_INCOMPLETE"
+                                )
+                            ),
+                        }
+                    )
                     continue
                 frame = decision_market.frame_1m.frame
                 try:
@@ -933,8 +998,7 @@ class ShortSignalBot:
                         {
                             "symbol": symbol,
                             "terminal_status": "SCAN_FAILED",
-                            "reason_code": "SCAN_EXCEPTION",
-                            "details": {"error_code": type(exc).__name__},
+                            **normalize_scan_failure(str(exc), exception=exc),
                         }
                     )
                     await self._handle_error(f"symbol:{symbol}", exc)
@@ -987,6 +1051,10 @@ class ShortSignalBot:
             )
             self._publish_research_storage_health()
             self._publish_provider_evidence()
+            self._health.mark_scan(
+                duration_ms=(time.perf_counter() - cycle_started_monotonic) * 1000.0
+            )
+            self._persist_runtime_health()
             return decisions
         except Exception as exc:  # noqa: BLE001 - cycle boundary must preserve runtime loop
             await self._handle_error("cycle", exc)
@@ -1003,7 +1071,13 @@ class ShortSignalBot:
         """Bounded, fair active-candidate monitor; never scans the full universe."""
         while self._fast_monitor_running:
             try:
+                sleep_started = time.perf_counter()
                 await asyncio.sleep(self._config.climax_fast_poll_sec)
+                event_loop_lag_ms = max(
+                    0.0,
+                    (time.perf_counter() - sleep_started - self._config.climax_fast_poll_sec)
+                    * 1000.0,
+                )
                 poll_started = datetime.now(timezone.utc)
                 self._fast_monitor_poll_sequence += 1
                 poll_sequence = self._fast_monitor_poll_sequence
@@ -1013,7 +1087,9 @@ class ShortSignalBot:
                     pool_size=len(keys),
                     poll_sequence=poll_sequence,
                     last_poll_at=poll_started,
+                    event_loop_lag_ms=event_loop_lag_ms,
                 )
+                self._health.mark_event_loop_lag(event_loop_lag_ms)
                 if not keys:
                     completed = datetime.now(timezone.utc)
                     self._repository.update_fast_monitor_heartbeat(
@@ -1022,6 +1098,8 @@ class ShortSignalBot:
                         poll_sequence=poll_sequence,
                         last_complete_at=completed,
                     )
+                    self._health.mark_fast_monitor(completed)
+                    self._persist_runtime_health()
                     self._repository.record_climax_monitor_event(
                         created_at=completed,
                         symbol="__FAST_MONITOR__",
@@ -1149,6 +1227,8 @@ class ShortSignalBot:
                     poll_sequence=poll_sequence,
                     last_complete_at=completed,
                 )
+                self._health.mark_fast_monitor(completed)
+                self._persist_runtime_health()
                 self._repository.record_climax_monitor_event(
                     created_at=completed,
                     symbol="__FAST_MONITOR__",
@@ -1510,10 +1590,9 @@ class ShortSignalBot:
         if not live_delivery_enabled(decision, self._config):
             return None
         payload = format_signal_message(decision, self._config.timezone)
-        record = self._repository.save_signal(
+        record = self._repository.persist_final_signal_bundle(
             decision,
             state,
-            telegram_sent=False,
             delivery_payload=payload,
             provenance=self._signal_provenance(
                 decision,
@@ -2079,6 +2158,7 @@ class ShortSignalBot:
             },
         )
         admission_evaluation_id = evaluation_id
+        final_recheck_performed = False
         if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE":
             event_high = float(decision.strategy_metadata.get("event_high") or 0.0)
             stored_distance = float(
@@ -2134,6 +2214,33 @@ class ShortSignalBot:
                     )
                     if recheck_attempt < recheck_attempts and recheck_delay_sec:
                         await asyncio.sleep(recheck_delay_sec)
+                if decision_market is None or decision_market.frame_1m.frame.empty:
+                    finalized_at = datetime.now(timezone.utc)
+                    observation_results = self._record_strategy_observations(
+                        bundle,
+                        evaluation_phase="PRE_DELIVERY_RECHECK",
+                        state=state,
+                        features=features,
+                        root_event_id=root_event_id,
+                        event_revision=event_revision,
+                        attempt_id=shadow_attempt_id,
+                        evaluation_id=None,
+                        lifecycle_shadow=lifecycle_shadow,
+                        observed_at=finalized_at,
+                        initial_evaluation_id=evaluation_id,
+                        initial_decision="ACTIONABLE",
+                        final_decision="BLOCKED_BY_RECHECK",
+                        final_reason="final_recheck_data_missing",
+                        finalized_at=finalized_at,
+                    )
+                    await self._report_strategy_observation_failures(
+                        observation_results, root_event_id=root_event_id
+                    )
+                    self._logger.info(
+                        "Climax delivery veto: final_recheck_data_missing symbol=%s",
+                        symbol,
+                    )
+                    return None
                 if decision_market is not None and not decision_market.frame_1m.frame.empty:
                     fresh_frame = decision_market.frame_1m.frame.copy(deep=True)
                     fresh_derivatives = dict(decision_market.derivatives)
@@ -2216,7 +2323,11 @@ class ShortSignalBot:
                             "change_pct": fresh_features.oi_change_pct,
                         },
                         features=asdict(fresh_features),
-                        lifecycle_state="DELIVERY_RECHECK",
+                        lifecycle_state=(
+                            "FINAL_ACTIONABLE"
+                            if fresh_eval.actionable
+                            else "BLOCKED_BY_RECHECK"
+                        ),
                         telegram_eligible=fresh_eval.actionable,
                         runtime_instance_id=self._runtime_instance_id,
                         root_event_id=root_event_id,
@@ -2236,6 +2347,16 @@ class ShortSignalBot:
                         evaluation_id=fresh_evaluation_id,
                         lifecycle_shadow=lifecycle_shadow,
                         observed_at=datetime.now(timezone.utc),
+                        initial_evaluation_id=evaluation_id,
+                        initial_decision="ACTIONABLE",
+                        final_decision=("ACTIONABLE" if fresh_eval.actionable else "BLOCKED_BY_RECHECK"),
+                        final_reason=(
+                            "final_actionable"
+                            if fresh_eval.actionable
+                            else ";".join(fresh_eval.veto_reasons)
+                            or "final_recheck_blocked"
+                        ),
+                        finalized_at=datetime.now(timezone.utc),
                     )
                     await self._report_strategy_observation_failures(
                         observation_results, root_event_id=root_event_id
@@ -2251,6 +2372,23 @@ class ShortSignalBot:
                         )
                         return None
                     admission_evaluation_id = fresh_evaluation_id
+                    final_recheck_performed = True
+                    decision = replace(
+                        decision,
+                        grade=fresh_eval.grade,
+                        score=fresh_eval.score,
+                        market_price=fresh_features.price,
+                        signal_time=fresh_features.asof,
+                        features_snapshot=asdict(fresh_features),
+                        strategy_subtype=fresh_eval.subtype or decision.strategy_subtype,
+                        model_version=str(fresh_eval.metadata.get("model_version", decision.model_version)),
+                        strategy_metadata={
+                            **fresh_eval.metadata,
+                            "veto_reasons": fresh_eval.veto_reasons,
+                            "fast_monitor": fast_monitor,
+                        },
+                    )
+                    features = fresh_features
         if not live_delivery_enabled(decision, self._config):
             self._logger.warning(
                 "live_delivery_disabled strategy_type=%s strategy_subtype=%s",
@@ -2262,7 +2400,6 @@ class ShortSignalBot:
         record = self._repository.save_signal(
             decision,
             state,
-            telegram_sent=False,
             delivery_payload=payload,
             provenance=self._signal_provenance(
                 decision,
@@ -2270,6 +2407,9 @@ class ShortSignalBot:
                 decision_evaluation_id=evaluation_id,
                 admission_evaluation_id=admission_evaluation_id,
             ),
+            audit_root_event_id=root_event_id if final_recheck_performed else None,
+            audit_strategy=decision.strategy_subtype if final_recheck_performed else None,
+            lifecycle_state="FINAL_ACTIONABLE" if final_recheck_performed else "OUTBOX_ENQUEUED",
         )
         try:
             telegram_sent = await self._send_new_delivery(
@@ -2304,6 +2444,11 @@ class ShortSignalBot:
         evaluation_id: int | None,
         lifecycle_shadow: object | None,
         observed_at: datetime,
+        initial_evaluation_id: int | None = None,
+        initial_decision: str | None = None,
+        final_decision: str | None = None,
+        final_reason: str | None = None,
+        finalized_at: datetime | None = None,
     ) -> list[ObservationWriteResult]:
         """Persist every enabled climax branch without affecting live evaluation."""
 
@@ -2369,6 +2514,7 @@ class ShortSignalBot:
                     strategy=strategy,
                     evaluation_phase=evaluation_phase,
                     symbol=features.symbol,
+                    event_id=state.event_id,
                     root_event_id=root_event_id,
                     event_revision=event_revision,
                     attempt_id=attempt_id,
@@ -2395,6 +2541,21 @@ class ShortSignalBot:
                     config_hash=self._strategy_config_hash,
                     input_fingerprint=evidence.input_fingerprint,
                     input_snapshot=evidence.snapshot,
+                    initial_evaluation_id=initial_evaluation_id
+                    if branch_evaluation is bundle.selected
+                    else None,
+                    initial_decision=initial_decision
+                    if branch_evaluation is bundle.selected
+                    else None,
+                    final_decision=final_decision
+                    if branch_evaluation is bundle.selected
+                    else None,
+                    final_reason=final_reason
+                    if branch_evaluation is bundle.selected
+                    else None,
+                    finalized_at=finalized_at
+                    if branch_evaluation is bundle.selected
+                    else None,
                 )
                 results.append(record_observation(observation))
             except Exception:
@@ -2810,10 +2971,9 @@ class ShortSignalBot:
             )
             return None, state
         payload = format_signal_message(decision, self._config.timezone)
-        record = self._repository.save_signal(
+        record = self._repository.persist_final_signal_bundle(
             decision,
             state,
-            telegram_sent=False,
             delivery_payload=payload,
             provenance=self._signal_provenance(decision),
         )
@@ -3167,14 +3327,15 @@ class ShortSignalBot:
 
     async def _handle_error(self, key: str, exc: Exception) -> None:
         self._health.on_error()
-        self._logger.exception("Runtime error in %s: %s", key, exc)
+        summary = safe_exception_summary(exc)
+        self._logger.error("Runtime error in %s: %s", key, summary)
         if is_sqlite_full(exc):
             await self._emit_storage_incident(
                 self._storage_incident.record_failure(at=time.time())
             )
             return
         if self._error_throttler.should_send(key):
-            await self._notifier.send_alert(f"Short signal bot error in {key}: {exc!r}")
+            await self._notifier.send_alert(f"Short signal bot error in {key}: {summary}")
 
     def _capacity_snapshot(self) -> DiskCapacitySnapshot | None:
         if not self._repository.db_url.startswith("sqlite:///"):

@@ -2,7 +2,7 @@
 
 - **Status:** `INSUFFICIENT_DATA_CONTINUE_OBSERVATION`
 - **Canonical unit:** `(root_event_id, strategy)`; repeated observations are deduplicated.
-- **Source:** read-only SQLite `${DATA_DIR}/bot.sqlite`
+- **Source:** read-only SQLite `<APP_ROOT>/data/bot.sqlite`
 - **Coverage:** `2026-08-31 21:01:44.602559` – `2026-10-03 13:01:58.282441` (observation timestamps)
 - **Signals:** 0; **retained episodes:** 1382
 - **Chronological split:** research 967 / holdout 415 (70/30 target)

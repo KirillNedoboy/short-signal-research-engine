@@ -47,6 +47,7 @@ def _observation(
         strategy=strategy,
         evaluation_phase="INITIAL",
         symbol="TESTUSDT",
+        event_id="event-1",
         root_event_id="root-1",
         event_revision=1,
         attempt_id=None,
@@ -240,6 +241,87 @@ def test_strategy_observation_contract_has_row_level_provenance() -> None:
     field_names = {field.name for field in fields(StrategyObservation)}
 
     assert {"runtime_instance_id", "code_version", "config_hash", "runtime_started_at"} <= field_names
+
+
+def test_strategy_observation_persists_final_decision_audit_without_signal(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'final-decision-audit.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    observation = replace(
+        _observation(),
+        initial_evaluation_id=41,
+        initial_decision="ACTIONABLE",
+        final_decision="BLOCKED_BY_RECHECK",
+        final_reason="liquidity_block",
+        finalized_at=datetime(2026, 7, 24, 12, 0, 5, tzinfo=timezone.utc),
+    )
+
+    result = repository.record_strategy_observation(observation)
+
+    assert result.status is ObservationWriteStatus.INSERTED
+    with database.engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "select initial_evaluation_id, initial_decision, final_decision, "
+            "final_reason, finalized_at, signal_id from strategy_observations"
+        ).one()
+    assert row[:5] == (41, "ACTIONABLE", "BLOCKED_BY_RECHECK", "liquidity_block", "2026-07-24 12:00:05.000000")
+    assert row[5] is None
+
+
+def test_strategy_observation_rejects_incomplete_final_audit_but_keeps_legacy_nullable_rows(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'final-decision-validation.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+
+    historical = repository.record_strategy_observation(_observation())
+    invalid = repository.record_strategy_observation(
+        replace(
+            _observation(),
+            observation_id="observation-invalid",
+            idempotency_key="invalid-audit-key",
+            final_decision="BLOCKED_BY_RECHECK",
+            finalized_at=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert historical.status is ObservationWriteStatus.INSERTED
+    assert invalid.status is ObservationWriteStatus.FAILED
+
+
+
+def test_strategy_observation_rejects_final_audit_without_initial_evaluation_id(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'missing-initial-evaluation.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+
+    result = repository.record_strategy_observation(
+        replace(
+            _observation(),
+            final_decision="ACTIONABLE",
+            final_reason="final_actionable",
+            finalized_at=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status is ObservationWriteStatus.FAILED
+
+
+def test_strategy_observation_rejects_actionable_final_audit_without_reason(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'missing-final-reason.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+
+    result = repository.record_strategy_observation(
+        replace(
+            _observation(),
+            initial_evaluation_id=41,
+            initial_decision="ACTIONABLE",
+            final_decision="ACTIONABLE",
+            finalized_at=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.status is ObservationWriteStatus.FAILED
 
 
 def test_additive_strategy_observation_migration_preserves_existing_rows(tmp_path) -> None:
