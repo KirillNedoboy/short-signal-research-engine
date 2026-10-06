@@ -21,9 +21,11 @@ from app.config import AppConfig, load_config
 from app.domain import (
     EventState,
     EventStatus,
+    CandidateEvaluation,
     SignalDecision,
     SignalProvenanceInput,
     SignalType,
+    ShortZone,
     SymbolFeatures,
 )
 from app.events.pullback_tracker import PullbackTracker
@@ -99,6 +101,15 @@ from app.signals.engine import SignalEngine
 from app.signals.formatter import format_signal_message
 from app.storage.db import Database
 from app.storage.repository import BotRepository
+from app.strategies.baseline import BaselineAdapter
+from app.strategies.climax import (
+    ClimaxAdapter,
+    LowVolumeExtensionFailureAdapter,
+    VolumeClimaxUnwindAdapter,
+)
+from app.strategies.contracts import StrategyContext, StrategyEvaluation, StrategyEvaluationError
+from app.strategies.registry import StrategyRegistry
+from app.strategies.trapped_longs import TrappedLongsAdapter
 
 
 def _attach_market_data_observer(hub: object, observer: object) -> None:
@@ -444,6 +455,9 @@ class ShortSignalBot:
             zone_builder=self._zone_builder,
         )
         self._signal_engine = SignalEngine(config)
+        # Adapters are pure and frame-bound, so build the complete registry at
+        # the validated evaluation seam rather than mutating runtime state.
+        self._strategy_registry: StrategyRegistry | None = None
         self._outcome_tracker = OutcomeTracker(self._market_data_provider, repository)
         self._error_throttler = ErrorThrottler(config.error_alert_ttl_sec)
         self._storage_incident = StorageIncidentTracker(
@@ -456,6 +470,135 @@ class ShortSignalBot:
             self._logger.warning(
                 "Derivatives confirmation unavailable; derivatives_enabled=false."
             )
+
+    def _evaluate_registered_strategies(
+        self,
+        *,
+        state: EventState,
+        features: SymbolFeatures,
+        frame_1m: pd.DataFrame,
+        short_zone: object | None,
+        decision_timestamp: datetime,
+        trapped_attempt_created_at: datetime | None = None,
+        trapped_confirmation_expires_at: datetime | None = None,
+    ) -> tuple[StrategyEvaluation, ...]:
+        """Run every canonical adapter after validated market data is built."""
+        # Characterization harnesses may inject pre-built legacy features that
+        # lack the canonical market timestamp; keep that compatibility seam
+        # fail-closed without bypassing validated production evaluations.
+        if features.market_asof is None:
+            self._strategy_registry = None
+            return ()
+        try:
+            context = StrategyContext(
+                symbol=features.symbol,
+                event_id=state.event_id,
+                event_state=state,
+                features=features,
+                short_zone=short_zone if isinstance(short_zone, ShortZone) else None,
+                decision_timestamp=decision_timestamp,
+                strategy_config_fingerprint=self._strategy_config_hash,
+                input_quality="VALID",
+            )
+        except StrategyEvaluationError:
+            self._strategy_registry = None
+            return ()
+        self._strategy_registry = StrategyRegistry(
+            [
+                BaselineAdapter(self._config),
+                ClimaxAdapter(self._config, frame_1m),
+                VolumeClimaxUnwindAdapter(self._config, frame_1m),
+                LowVolumeExtensionFailureAdapter(self._config, frame_1m),
+                TrappedLongsAdapter(
+                    self._config,
+                    frame_1m,
+                    attempt_created_at=trapped_attempt_created_at,
+                    confirmation_expires_at=trapped_confirmation_expires_at,
+                ),
+            ]
+        )
+        return self._strategy_registry.evaluate_all(context)
+
+    @staticmethod
+    def _registered_evaluation(
+        evaluations: tuple[StrategyEvaluation, ...], strategy_type: str
+    ) -> StrategyEvaluation | None:
+        """Select one canonical evaluation without changing runtime priority."""
+        return next(
+            (evaluation for evaluation in evaluations if evaluation.strategy_type == strategy_type),
+            None,
+        )
+
+    @staticmethod
+    def _decision_from_registered_evaluation(
+        decision: SignalDecision, evaluation: StrategyEvaluation
+    ) -> SignalDecision:
+        """Project canonical registry fields onto the established decision shape."""
+        return replace(
+            decision,
+            grade=evaluation.grade,
+            score=evaluation.score,
+            reasons=list(evaluation.reasons),
+            blockers=list(evaluation.blockers),
+            risk_flags=list(evaluation.risk_flags),
+            strategy_type=evaluation.strategy_type,
+            strategy_subtype=evaluation.strategy_subtype,
+            model_version=evaluation.model_version or "baseline-v1",
+            actionable=evaluation.actionable,
+            strategy_metadata=dict(evaluation.strategy_metadata),
+        )
+
+    @staticmethod
+    def _new_decision_from_registered_evaluation(
+        *,
+        state: EventState,
+        features: SymbolFeatures,
+        zone: ShortZone,
+        signal_time: datetime,
+        evaluation: StrategyEvaluation,
+    ) -> SignalDecision:
+        """Build the established baseline decision shape from canonical data."""
+        return SignalDecision(
+            symbol=features.symbol,
+            event_id=state.event_id,
+            signal_type=(
+                SignalType.WATCH
+                if evaluation.strategy_metadata.get("signal_type") == SignalType.WATCH.value
+                else SignalType.CONFIRM
+            ),
+            grade=evaluation.grade,
+            score=evaluation.score,
+            market_price=features.price,
+            short_zone_low=zone.low,
+            short_zone_high=zone.high,
+            signal_time=signal_time,
+            reasons=list(evaluation.reasons),
+            risk_flags=list(evaluation.risk_flags),
+            features_snapshot=asdict(features),
+            score_breakdown={"registry_score": float(evaluation.score)},
+            decision_type="SIGNAL",
+            actionable=evaluation.actionable,
+            lifecycle_state=state.state.value,
+            blockers=list(evaluation.blockers),
+            strategy_type=evaluation.strategy_type,
+            strategy_subtype=evaluation.strategy_subtype,
+            model_version=evaluation.model_version or "baseline-v1",
+            strategy_metadata=dict(evaluation.strategy_metadata),
+        )
+
+    @staticmethod
+    def _climax_evaluation_from_registry(
+        evaluation: StrategyEvaluation,
+    ) -> ClimaxEvaluation:
+        """Keep existing climax lifecycle consumers on canonical values."""
+        return ClimaxEvaluation(
+            evaluation.strategy_subtype,
+            evaluation.score,
+            evaluation.grade,
+            dict(evaluation.strategy_metadata),
+            list(evaluation.vetoes),
+            list(evaluation.risk_flags),
+        )
 
     async def _start_market_data_shadow(self) -> None:
         """Start the optional WS shadow without making it a readiness dependency."""
@@ -1444,26 +1587,46 @@ class ShortSignalBot:
             minutes=int(getattr(self._config, "trapped_longs_max_lifetime_minutes", 15))
         )
         stored_attempt = self._repository.get_shadow_entry_attempt(attempt_id=attempt_id)
-        attempt_created_at = (
+        stored_attempt_created_at = (
             stored_attempt["attempt_created_at"]
             if stored_attempt and stored_attempt["attempt_created_at"] is not None
-            else evaluation_time
+            else None
         )
-        confirmation_expires_at = (
+        stored_confirmation_expires_at = (
             stored_attempt["confirmation_expires_at"]
             if stored_attempt and stored_attempt["confirmation_expires_at"] is not None
-            else proposed_expiry
+            else None
         )
-        evaluation = self.evaluate_trapped_longs_reversal(
-            state,
-            features,
-            frame_1m,
-            attempt_created_at=attempt_created_at,
-            confirmation_expires_at=confirmation_expires_at,
-            decision_time=evaluation_time,
+        attempt_created_at = (
+            stored_attempt_created_at
+            if isinstance(stored_attempt_created_at, datetime)
+            else _parse_optional_datetime(stored_attempt_created_at)
+        ) or evaluation_time
+        confirmation_expires_at = (
+            stored_confirmation_expires_at
+            if isinstance(stored_confirmation_expires_at, datetime)
+            else _parse_optional_datetime(stored_confirmation_expires_at)
+        ) or proposed_expiry
+        registered_evaluations = self._evaluate_registered_strategies(
+            state=state,
+            features=features,
+            frame_1m=frame_1m,
+            short_zone=None,
+            decision_timestamp=evaluation_time,
+            trapped_attempt_created_at=attempt_created_at,
+            trapped_confirmation_expires_at=confirmation_expires_at,
         )
+        evaluation = self._registered_evaluation(
+            registered_evaluations, TRAPPED_LONGS_REVERSAL
+        )
+        if evaluation is None:
+            return None
+        evaluation_vetoes = list(evaluation.vetoes)
+        evaluation_metadata = dict(evaluation.strategy_metadata)
+        evaluation_subtype = evaluation.strategy_subtype
+        evaluation_quality = list(evaluation.risk_flags)
         expiry_blocked = bool(
-            set(evaluation.veto_reasons)
+            set(evaluation_vetoes)
             & {"CONFIRMATION_WINDOW_EXPIRED", "BORN_EXPIRED_ATTEMPT"}
         )
         lifecycle = advance_trapped_longs_lifecycle(
@@ -1471,14 +1634,14 @@ class ShortSignalBot:
             breakout_at=breakout_at,
             observed_at=features.asof,
             event_revision=1,
-            breakout_confirmed="breakout_not_confirmed" not in evaluation.veto_reasons,
-            oi_confirmed="oi_missing" not in evaluation.veto_reasons and "oi_below_threshold" not in evaluation.veto_reasons,
-            closed_candles=int(evaluation.metadata.get("closed_structural_candles") or 0),
-            close_below_reference=bool(evaluation.metadata.get("close_below_breakout_reference")),
-            failed_retest=bool(evaluation.metadata.get("failed_retest_confirmed")),
-            no_new_high=bool(evaluation.metadata.get("no_new_high")),
-            liquidity_ok=not any(reason in evaluation.veto_reasons for reason in {"liquidity_unavailable", "liquidity_incomplete", "liquidity_block"}),
-            rejection_ok="rejection_below_threshold" not in evaluation.veto_reasons,
+            breakout_confirmed="breakout_not_confirmed" not in evaluation_vetoes,
+            oi_confirmed="oi_missing" not in evaluation_vetoes and "oi_below_threshold" not in evaluation_vetoes,
+            closed_candles=int(evaluation_metadata.get("closed_structural_candles") or 0),
+            close_below_reference=bool(evaluation_metadata.get("close_below_breakout_reference")),
+            failed_retest=bool(evaluation_metadata.get("failed_retest_confirmed")),
+            no_new_high=bool(evaluation_metadata.get("no_new_high")),
+            liquidity_ok=not any(reason in evaluation_vetoes for reason in {"liquidity_unavailable", "liquidity_incomplete", "liquidity_block"}),
+            rejection_ok="rejection_below_threshold" not in evaluation_vetoes,
             max_lifetime_minutes=int(getattr(self._config, "trapped_longs_max_lifetime_minutes", 15)),
         )
         self._repository.upsert_shadow_entry_attempt(
@@ -1486,7 +1649,7 @@ class ShortSignalBot:
             root_event_id=root_id,
             observed_at=evaluation_time,
             local_retest_high=features.last_high,
-            breakdown_level=float(evaluation.metadata.get("breakout_reference") or 0.0),
+            breakdown_level=float(evaluation_metadata.get("breakout_reference") or 0.0),
             attempt_state=(
                 "EXPIRED"
                 if expiry_blocked
@@ -1496,7 +1659,7 @@ class ShortSignalBot:
             confirmation_expires_at=proposed_expiry,
             event_revision=lifecycle.event_revision,
             runtime_instance_id=self._runtime_instance_id,
-            model_version=TRAPPED_LONGS_MODEL_VERSION,
+            model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
             max_attempts_per_root_event=1,
         )
         if lifecycle.state == "ADMITTED" and evaluation.actionable:
@@ -1510,16 +1673,16 @@ class ShortSignalBot:
                 observed_at=evaluation_time,
                 market_asof=features.asof,
                 runtime_instance_id=self._runtime_instance_id,
-                model_version=TRAPPED_LONGS_MODEL_VERSION,
+                model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
             )
         evaluation_id = self._repository.record_climax_evaluation(
             evaluation_time=evaluation_time,
             symbol=features.symbol,
             strategy=TRAPPED_LONGS_REVERSAL,
-            subtype_candidate=evaluation.subtype or TRAPPED_LONGS_REVERSAL,
-            model_version=TRAPPED_LONGS_MODEL_VERSION,
+            subtype_candidate=evaluation_subtype or TRAPPED_LONGS_REVERSAL,
+            model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
             event_id=root_id,
-            event_high=evaluation.metadata.get("event_high"),
+            event_high=evaluation_metadata.get("event_high"),
             event_high_time=state.event_high_time,
             event_detected_at=state.event_start_time,
             candidate_added_at=None,
@@ -1534,9 +1697,9 @@ class ShortSignalBot:
             grade=evaluation.grade,
             actionable=evaluation.actionable,
             admission_passed=evaluation.actionable,
-            veto_reasons=evaluation.veto_reasons,
-            passed_conditions=[k for k, v in evaluation.metadata.items() if isinstance(v, bool) and v],
-            data_quality=evaluation.data_quality,
+            veto_reasons=evaluation_vetoes,
+            passed_conditions=[k for k, v in evaluation_metadata.items() if isinstance(v, bool) and v],
+            data_quality=evaluation_quality,
             liquidity={
                 "available": features.liquidity_available,
                 "spread_pct": features.spread_pct,
@@ -1545,7 +1708,7 @@ class ShortSignalBot:
                 "depth_2pct_usdt": features.orderbook_depth_usdt_2pct,
             },
             oi={"change_15m_pct": features.oi_change_15m, "status": features.derivatives_status},
-            features={**asdict(features), "trapped_longs": evaluation.metadata},
+            features={**asdict(features), "trapped_longs": evaluation_metadata},
             lifecycle_state=(
                 "EXPIRED" if expiry_blocked else "ADMITTED" if evaluation.actionable else "RETEST_IN_PROGRESS"
             ),
@@ -1558,15 +1721,15 @@ class ShortSignalBot:
             market_asof=features.asof,
             evaluation_completed_at=evaluation_time,
             live_decision="ACTIONABLE" if evaluation.actionable else "BLOCKED",
-            live_veto_reasons=evaluation.veto_reasons,
+            live_veto_reasons=evaluation_vetoes,
         )
         if not evaluation.actionable or evaluation_id is None:
             return None
         if self._repository.has_signal_for_event(
-            features.symbol, root_id, TRAPPED_LONGS_REVERSAL, TRAPPED_LONGS_MODEL_VERSION
+            features.symbol, root_id, TRAPPED_LONGS_REVERSAL, evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION
         ):
             return None
-        reference = float(evaluation.metadata["breakout_reference"])
+        reference = float(evaluation_metadata["breakout_reference"])
         decision = SignalDecision(
             symbol=features.symbol,
             event_id=root_id,
@@ -1577,15 +1740,16 @@ class ShortSignalBot:
             short_zone_low=reference * 0.99,
             short_zone_high=reference * 1.01,
             signal_time=features.asof,
-            reasons=["False breakout", "OI build-up", "Failed retest below breakout level"],
-            risk_flags=[],
+            reasons=list(evaluation.reasons),
+            risk_flags=list(evaluation.risk_flags),
             features_snapshot=asdict(features),
-            score_breakdown={"trapped_longs_v1": float(evaluation.score)},
-            strategy_type=TRAPPED_LONGS_REVERSAL,
-            strategy_subtype=TRAPPED_LONGS_REVERSAL,
-            model_version=TRAPPED_LONGS_MODEL_VERSION,
+            score_breakdown={"registry_score": float(evaluation.score)},
+            strategy_type=evaluation.strategy_type,
+            strategy_subtype=evaluation.strategy_subtype,
+            model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
             lifecycle_state="TRAPPED_LONGS_ADMITTED",
-            strategy_metadata=evaluation.metadata,
+            blockers=list(evaluation.blockers),
+            strategy_metadata=evaluation_metadata,
         )
         if not live_delivery_enabled(decision, self._config):
             return None
@@ -1651,11 +1815,24 @@ class ShortSignalBot:
                 liquidity=liquidity,
                 market_asof=market_asof,
             )
+        registered_evaluations = self._evaluate_registered_strategies(
+            state=state,
+            features=features,
+            frame_1m=frame_1m,
+            short_zone=None,
+            decision_timestamp=datetime.now(timezone.utc),
+        )
+        registered_climax = self._registered_evaluation(
+            registered_evaluations, "CLIMAX_EXHAUSTION"
+        )
+        if registered_climax is None:
+            return None
+        evaluation = self._climax_evaluation_from_registry(registered_climax)
+        shadow_evaluation: ClimaxEvaluation | None = None
+        # Retain the legacy bundle only as an observation ledger payload.
         bundle = evaluate_climax_bundle(
             state, features, frame_1m, self._config, strict_closed_candles=True
         )
-        evaluation: ClimaxEvaluation = bundle.selected
-        shadow_evaluation: ClimaxEvaluation | None = None
         if (
             self._config.low_volume_frozen_initial_extension_enabled
             and self._config.low_volume_frozen_initial_extension_shadow_only
@@ -2254,6 +2431,22 @@ class ShortSignalBot:
                         liquidity=fresh_liquidity,
                         market_asof=recheck_market_asof,
                     )
+                    fresh_registered = self._evaluate_registered_strategies(
+                        state=state,
+                        features=fresh_features,
+                        frame_1m=fresh_frame,
+                        short_zone=None,
+                        decision_timestamp=datetime.now(timezone.utc),
+                    )
+                    fresh_registered_climax = self._registered_evaluation(
+                        fresh_registered, "CLIMAX_EXHAUSTION"
+                    )
+                    if fresh_registered_climax is None:
+                        return None
+                    fresh_eval = self._climax_evaluation_from_registry(
+                        fresh_registered_climax
+                    )
+                    # The legacy bundle is retained only for observation output.
                     fresh_bundle = evaluate_climax_bundle(
                         state,
                         fresh_features,
@@ -2261,7 +2454,6 @@ class ShortSignalBot:
                         self._config,
                         strict_closed_candles=True,
                     )
-                    fresh_eval = fresh_bundle.selected
                     if not fresh_features.liquidity_available:
                         self._logger.info(
                             "Climax fresh recheck status=LIQUIDITY_DATA_MISSING symbol=%s",
@@ -2909,7 +3101,46 @@ class ShortSignalBot:
             state.state = EventStatus.SHORT_ZONE_ACTIVE
 
         await self._evaluate_and_send_trapped_longs(state, features, frame_1m)
-        evaluation = self._signal_engine.analyze(state, features, zone, now)
+        registered_evaluations = self._evaluate_registered_strategies(
+            state=state,
+            features=features,
+            frame_1m=frame_1m,
+            short_zone=zone,
+            decision_timestamp=now,
+        )
+        registered_baseline = self._registered_evaluation(
+            registered_evaluations, "BASELINE_PULLBACK"
+        )
+        if registered_baseline is None:
+            # Canonical registry authority is fail-closed: invalid or missing
+            # market context must never fall back to the legacy signal engine.
+            evaluation = CandidateEvaluation(
+                checked=False,
+                reject_reasons=["canonical_baseline_unavailable"],
+                blockers=["canonical_baseline_unavailable"],
+                data_quality_warnings=["canonical_baseline_unavailable"],
+            )
+        else:
+            canonical_decision = (
+                self._new_decision_from_registered_evaluation(
+                    state=state,
+                    features=features,
+                    zone=zone,
+                    signal_time=now,
+                    evaluation=registered_baseline,
+                )
+                if registered_baseline.actionable
+                else None
+            )
+            evaluation = CandidateEvaluation(
+                checked=True,
+                decision=canonical_decision,
+                score=registered_baseline.score,
+                grade=registered_baseline.grade,
+                reject_reasons=list(registered_baseline.vetoes),
+                blockers=list(registered_baseline.blockers),
+                risk_flags=list(registered_baseline.risk_flags),
+            )
         self._repository.record_reject_stat(
             symbol=symbol,
             timeframe=state.trigger_window or "15m",

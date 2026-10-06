@@ -1,17 +1,21 @@
 # Current Trading Contract
 
-Status: Phase 0 characterization baseline. This document describes the behavior at code SHA `261646f7e7653957438dee54b38a23104f35c4ea`; it is not a proposal to change the strategy.
+Status: current strategy contract; the strategy-parity evidence snapshot is code SHA `c78c8a4521c6d51285433eeb0a3a38da04d350e0`, while the current documentation checkout is `f79ff68fe797337f31888fe6617769825d6aaecd`. It describes the behavior and adapter boundary, not a proposal to change the strategy.
+
+The canonical adapter architecture is documented in [`strategy-adapter-registry.md`](strategy-adapter-registry.md). The registry contains exactly five identifiers: `BASELINE_PULLBACK`, `CLIMAX_EXHAUSTION`, `VOLUME_CLIMAX_UNWIND`, `LOW_VOLUME_EXTENSION_FAILURE`, and `TRAPPED_LONGS_REVERSAL`. Adapters translate existing evaluator results into immutable canonical evaluations; they do not change strategy formulas, thresholds, lifecycle, final recheck, persistence, delivery, or execution boundaries.
 
 ## Runtime version
 
-- **Code SHA:** `261646f7e7653957438dee54b38a23104f35c4ea`.
+- **Current documentation commit:** `f79ff68fe797337f31888fe6617769825d6aaecd` (the checkout containing this contract).
+- **Strategy-parity evidence snapshot:** `c78c8a4521c6d51285433eeb0a3a38da04d350e0` (retained evidence reference; not the current documentation checkout).
+- **Historical baseline code SHA:** `261646f7e7653957438dee54b38a23104f35c4ea` (pre-adapter baseline retained for historical comparison; not the current runtime SHA).
 - **Config contract:** `AppConfig` in `app/config.py` is Pydantic with `ConfigDict(extra="ignore", validate_assignment=True, hide_input_in_errors=True)`. Unknown mapping keys are silently ignored. `config.yaml` is merged with selected `.env` overrides; environment values win. The strategy fingerprint is the SHA-256 of canonical JSON containing `climax_`, `volume_climax_`, `low_volume_`, derivatives, liquidity, and squeeze settings. The public runtime fingerprint excludes secrets, database URL, and chat IDs.
 - **Dataset epoch:** no dataset epoch is currently a runtime field. For replay or comparison, the epoch must be supplied externally as the exact closed-candle/derivatives/liquidity snapshot interval and source snapshot identity. `features.asof` is part of the frozen input; wall-clock time is not a strategy input.
 - **Config example:** `config.yaml` contains `climax_block_price_oi_accelerating_together`, which is not an `AppConfig` field and is therefore silently ignored under `extra="ignore"`.
 
 ## Strategies
 
-Exactly three trading strategies exist. `ROOT_DETECTOR_SHADOW_V2` is documented separately as research telemetry, not a trading strategy.
+The registry exposes five canonical strategy identifiers. `ROOT_DETECTOR_SHADOW_V2` remains documented separately as research telemetry, not a registry strategy. `CLIMAX_EXHAUSTION` is the climax bundle umbrella, with `VOLUME_CLIMAX_UNWIND` and `LOW_VOLUME_EXTENSION_FAILURE` as its registered branch identifiers. `TRAPPED_LONGS_REVERSAL` is the canonical identifier for the trapped-longs reversal adapter.
 
 ### BASELINE_PULLBACK
 
@@ -152,6 +156,7 @@ Method version: `ROOT_DETECTOR_SHADOW_V2_CONTRACT_V1`. It reuses the broad V1 ob
 ## Global safety invariants
 
 - **AUTOEXECUTION OFF:** no exchange order placement path exists; signal evaluation only creates decisions and persisted delivery work.
+- **Adapter boundary:** registry adapters are pure translation components. They do not call repositories, Telegram clients, exchange clients, order methods, or execution components; `SignalDecision` does not place an order.
 - **WATCH OFF for Telegram:** `send_watch_to_telegram` is false in the checked-in production config; WATCH decisions remain non-actionable.
 - **Grade C non-public:** current public minimum is B; C is not an actionable/public signal.
 - **Explicit bad liquidity remains protected:** missing or hard-bad liquidity vetoes all three admission paths.

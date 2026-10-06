@@ -1,10 +1,6 @@
 # Short Telegram Bot
 
-> Documentation status: versioned public baseline with explicitly separated production and historical release overlays.
-
-## Source of truth
-
-Start with [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md). The public checkout is baseline commit `ce77d744`; the operator-reported production release is Lane A `bf47d2b1` from 2026-09-14, and Lane B `dfcdb9df` from 2026-09-17 is historical/experimental. The latter two release artifacts are not Git objects in this shallow public clone.
+> Documentation status: sanitized public mirror of the signal and research runtime; operational deployment state is excluded.
 
 ## Documentation map
 
@@ -14,12 +10,11 @@ Start with [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md). The public chec
 - [Market-data contract](docs/MARKET_DATA.md)
 - [Signal and delivery contract](docs/DELIVERY.md)
 - [Data model](docs/DATA_MODEL.md)
-- [Release matrix](docs/RELEASES.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Testing and reproducibility](docs/TESTING.md)
 - [Sanitized examples](docs/examples/README.md)
 
-The repository is a signal and research system. It does not place live orders, enable copy-trading, or provide autoexecution. Ordinary short notifications are manual-entry only. The current operator-verified topology runs Lane A and Lane B simultaneously in isolated release/config/database contours. `EARLY_DROP_WARNING` and `WATCH` are non-actionable and never enter ordinary short admission.
+The repository is a sanitized signal and research system. It does not place live orders, enable copy-trading, or provide autoexecution. Ordinary short notifications are manual-entry only. `EARLY_DROP_WARNING` and `WATCH` are non-actionable and never enter ordinary short admission.
 
 A Bybit USDT-perpetual market-monitoring bot that detects short-side reversal and exhaustion setups, persists decisions in SQLite, and delivers human-readable Telegram alerts. **It is a signal and research system, not an order-execution engine.**
 
@@ -98,10 +93,6 @@ Run the service loop only after reviewing configuration and delivery policy:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, runtime flow and boundaries
 - [`docs/STRATEGIES.md`](docs/STRATEGIES.md) — strategy contracts and state machines
 - [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — persistence, outbox and outcome semantics
-- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deployment, health checks and incident runbook
-- [`docs/SHADOW_VALIDATION.md`](docs/SHADOW_VALIDATION.md) — forward cohort and promotion rules
-- [`docs/current_bot_signal_pipeline.md`](docs/current_bot_signal_pipeline.md) — detailed signal pipeline
-- [`docs/current_bot_score_tier_map.md`](docs/current_bot_score_tier_map.md) — score and grade map
 - [`SECURITY.md`](SECURITY.md) — secret handling and operational security
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — development workflow
 
@@ -114,4 +105,4 @@ Run the service loop only after reviewing configuration and delivery policy:
 
 ## License
 
-Add the project license before public distribution. This repository is intended for private operational development unless explicitly sanitized for publication.
+Operational deployment files, credentials, databases, and host-specific state are intentionally excluded from this public mirror.

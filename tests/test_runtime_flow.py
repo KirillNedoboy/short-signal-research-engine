@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.config import AppConfig
 from app.domain import EventStatus, ShortZone, SignalType
+from app.strategies.registry import REQUIRED_STRATEGY_TYPES
 from app.infra.disk_capacity import DiskCapacitySnapshot
 from app.main import ShortSignalBot
 from app.observability.strategy_observations import (
@@ -16,6 +17,7 @@ from app.observability.strategy_observations import (
     ObservationWriteStatus,
 )
 from app.signals.climax import ClimaxEvaluation, ClimaxEvaluationBundle
+from app.strategies.contracts import StrategyEvaluation
 from app.storage.db import Database
 from app.storage.models import (
     RejectStatModel,
@@ -104,6 +106,58 @@ class _FakeNotifier:
 class _ExplodingNotifier(_FakeNotifier):
     async def send_signal(self, _message: str) -> bool:
         raise RuntimeError("telegram transport down")
+
+
+def _canonical_climax_evaluation(
+    state, features, *, subtype: str, actionable: bool, score: int, grade: str,
+    vetoes: list[str] | None = None,
+) -> StrategyEvaluation:
+    metadata = {
+        "strategy_subtype": subtype,
+        "model_version": "climax-v1",
+        "event_high": state.event_high,
+        "entry_distance_below_high_pct": (
+            (state.event_high - features.price) / state.event_high * 100
+        ),
+    }
+    if subtype == "VOLUME_CLIMAX_UNWIND":
+        metadata["volume_climax_observed"] = False
+    return StrategyEvaluation(
+        strategy_type="CLIMAX_EXHAUSTION",
+        strategy_subtype=subtype,
+        model_version="climax-v1",
+        actionable=actionable,
+        score=score,
+        grade=grade,
+        reasons=[],
+        blockers=[],
+        vetoes=vetoes or [],
+        risk_flags=[],
+        strategy_metadata=metadata,
+        symbol=features.symbol,
+        event_id=state.event_id,
+        decision_timestamp=features.asof,
+    )
+
+
+def _canonical_baseline_evaluation(state, features) -> StrategyEvaluation:
+    is_watch = features.ret_15m < 10.0 or features.ret_4h < 25.0
+    return StrategyEvaluation(
+        strategy_type="BASELINE_PULLBACK",
+        strategy_subtype="BASELINE_PULLBACK",
+        model_version="baseline-v1",
+        actionable=True,
+        score=50 if is_watch else 82,
+        grade="C" if is_watch else "A",
+        reasons=[],
+        blockers=[],
+        vetoes=[],
+        risk_flags=[],
+        strategy_metadata={"signal_type": "Watch"} if is_watch else {},
+        symbol=features.symbol,
+        event_id=state.event_id,
+        decision_timestamp=features.asof,
+    )
 
 
 def test_notifier_failure_leaves_signal_retryable_in_outbox(
@@ -230,7 +284,7 @@ def test_disabled_watch_delivery_is_not_drained(
 
 class _FailingRepository:
     def __init__(self) -> None:
-        self.db_url = "sqlite:///<APP_ROOT>/data/bot.sqlite"
+        self.db_url = "sqlite:////opt/krntrade/data/bot.sqlite"
 
     def check_storage_health(self):
         raise RuntimeError("readonly database")
@@ -258,10 +312,13 @@ def test_process_symbol_persists_signal_and_suppresses_duplicates(
 
         state = make_event_state(state=EventStatus.PULLBACK_OBSERVED)
         repository.upsert_event_state(state)
-        features = make_features(asof=state.updated_at)
+        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
+        )
 
         decision, updated_state = await bot._process_symbol("ONTUSDT", object(), state)
         duplicate_decision, duplicate_state = await bot._process_symbol(
@@ -391,7 +448,7 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
-        features = make_features(asof=state.updated_at)
+        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
         selected = ClimaxEvaluation(
             subtype="VOLUME_CLIMAX_UNWIND",
             score=70,
@@ -429,6 +486,16 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
             repository=repository,
             scanner=_FakeScanner(),
             notifier=_FakeNotifier(),
+        )
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_climax_evaluation(
+                state,
+                features,
+                subtype="VOLUME_CLIMAX_UNWIND",
+                actionable=True,
+                score=70,
+                grade="B",
+            ),
         )
 
         decision = await bot._evaluate_and_send_climax(
@@ -489,9 +556,13 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
-        initial_features = make_features(asof=state.updated_at)
+        initial_features = make_features(
+            asof=state.updated_at, market_asof=state.updated_at
+        )
         fresh_features = make_features(
-            asof=state.updated_at + timedelta(minutes=1), price=111.0
+            asof=state.updated_at + timedelta(minutes=1),
+            market_asof=state.updated_at + timedelta(minutes=1),
+            price=111.0,
         )
         fresh_frame = make_frame(
             [110.0, 111.0], start=datetime.now(timezone.utc) - timedelta(minutes=2)
@@ -585,6 +656,28 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
 
         repository.save_signal = save_signal_once
         bot._feature_builder.build = lambda *_args, **_kwargs: fresh_features
+        canonical_evaluations = iter(
+            (
+                _canonical_climax_evaluation(
+                    state,
+                    initial_features,
+                    subtype="LOW_VOLUME_EXTENSION_FAILURE",
+                    actionable=True,
+                    score=75,
+                    grade="B",
+                ),
+                _canonical_climax_evaluation(
+                    state,
+                    fresh_features,
+                    subtype="LOW_VOLUME_EXTENSION_FAILURE",
+                    actionable=final_actionable,
+                    score=75 if final_actionable else 55,
+                    grade="B" if final_actionable else "C",
+                    vetoes=[] if final_actionable else ["microstructure_break_missing"],
+                ),
+            )
+        )
+        bot._evaluate_registered_strategies = lambda **_kwargs: (next(canonical_evaluations),)
         if not final_snapshot_available:
             async def _missing_final_snapshot(*_args, **_kwargs):
                 return None
@@ -680,7 +773,7 @@ def test_failed_observation_write_alerts_without_changing_signal_delivery(
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
-        features = make_features(asof=state.updated_at)
+        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
         selected = ClimaxEvaluation(
             subtype="VOLUME_CLIMAX_UNWIND",
             score=70,
@@ -715,6 +808,16 @@ def test_failed_observation_write_alerts_without_changing_signal_delivery(
             repository=repository,
             scanner=_FakeScanner(),
             notifier=notifier,
+        )
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_climax_evaluation(
+                state,
+                features,
+                subtype="VOLUME_CLIMAX_UNWIND",
+                actionable=True,
+                score=70,
+                grade="B",
+            ),
         )
 
         await bot._evaluate_and_send_climax(
@@ -790,7 +893,7 @@ def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
             notifier=notifier,
         )
         state = repository.upsert_event_state(make_event_state())
-        features = make_features(asof=state.updated_at)
+        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
         evaluation = ClimaxEvaluation(
             subtype=subtype,
             score=70,
@@ -812,6 +915,16 @@ def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
             lambda *_args, **_kwargs: ClimaxEvaluationBundle(
                 selected=evaluation,
                 branch_evaluations={subtype: evaluation},
+            ),
+        )
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_climax_evaluation(
+                state,
+                features,
+                subtype=subtype,
+                actionable=True,
+                score=70,
+                grade="B",
             ),
         )
 
@@ -1217,6 +1330,55 @@ def test_confirmed_new_high_after_short_zone_resets_without_delivery(
     assert outbox_count == 0
 
 
+def test_missing_market_asof_blocks_baseline_without_legacy_signal_engine(
+    tmp_path, make_event_state, make_features, monkeypatch
+) -> None:
+    async def _run():
+        database = Database(f"sqlite:///{tmp_path / 'runtime-missing-market-asof.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        notifier = _FakeNotifier()
+        bot = ShortSignalBot(
+            config=AppConfig(),
+            repository=repository,
+            scanner=_FakeScanner(),
+            notifier=notifier,
+        )
+        state = make_event_state(
+            state=EventStatus.PULLBACK_OBSERVED,
+            zone_low=110.5,
+            zone_high=113.8,
+        )
+        features = make_features(
+            market_asof=None,
+            price=112.0,
+            inside_short_zone_flag=True,
+        )
+
+        def fail_legacy_analyze(*_args, **_kwargs):
+            raise AssertionError("legacy SignalEngine.analyze must not run without canonical baseline")
+
+        monkeypatch.setattr(bot._signal_engine, "analyze", fail_legacy_analyze)
+        bot._pump_detector.build_event = lambda *_args, **_kwargs: None
+        bot._feature_builder.build = lambda *_args, **_kwargs: features
+
+        result = await bot._process_symbol("ONTUSDT", object(), state)
+        with database.session() as session:
+            signal_count = len(session.scalars(select(SignalModel)).all())
+            outbox_count = len(
+                session.scalars(select(TelegramDeliveryOutboxModel)).all()
+            )
+        return result, notifier, signal_count, outbox_count
+
+    (decision, updated_state), notifier, signal_count, outbox_count = asyncio.run(_run())
+
+    assert decision is None
+    assert updated_state is not None
+    assert notifier.messages == []
+    assert signal_count == 0
+    assert outbox_count == 0
+
+
 def test_unconfirmed_new_high_does_not_reset_active_pullback(
     tmp_path,
     make_event_state,
@@ -1333,6 +1495,7 @@ def test_grade_c_watch_is_stored_but_not_sent_when_watch_delivery_disabled(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
+            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_15m=7.0,
@@ -1354,6 +1517,9 @@ def test_grade_c_watch_is_stored_but_not_sent_when_watch_delivery_disabled(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
+        )
         bot._zone_builder.build = lambda *_args, **_kwargs: ShortZone(
             low=110.5, high=113.8, mode="event_range"
         )
@@ -1399,6 +1565,7 @@ def test_watch_signal_is_sent_without_short_wording(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
+            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_1h=10.0,
@@ -1410,6 +1577,9 @@ def test_watch_signal_is_sent_without_short_wording(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
+        )
 
         return await bot._process_symbol("ONTUSDT", object(), state), notifier, database
 
@@ -1451,6 +1621,7 @@ def test_watch_signal_is_not_sent_when_telegram_watch_disabled(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
+            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_1h=10.0,
@@ -1462,6 +1633,9 @@ def test_watch_signal_is_not_sent_when_telegram_watch_disabled(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
+        )
 
         return await bot._process_symbol("ONTUSDT", object(), state), notifier, database
 
@@ -1507,6 +1681,7 @@ def test_warn_only_derivatives_diagnostics_are_persisted_without_sending_watch(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
+            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_1h=10.0,
@@ -1526,6 +1701,9 @@ def test_warn_only_derivatives_diagnostics_are_persisted_without_sending_watch(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
+        bot._evaluate_registered_strategies = lambda **_kwargs: (
+            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
+        )
 
         return await bot._process_symbol("ONTUSDT", object(), state), notifier, database
 
@@ -1541,3 +1719,31 @@ def test_warn_only_derivatives_diagnostics_are_persisted_without_sending_watch(
         assert stored_watch.telegram_sent is False
         assert stored_watch.context_json["derivatives_status"] == "OK"
         assert stored_watch.context_json["open_interest"] == 1200.0
+
+
+def test_runtime_evaluation_constructs_complete_canonical_registry(
+    tmp_path, make_event_state, make_features
+) -> None:
+    from tests.conftest import _make_frame
+
+    database = Database(f"sqlite:///{tmp_path / 'registry-runtime.db'}")
+    database.create_all()
+    bot = ShortSignalBot(
+        config=AppConfig(),
+        repository=BotRepository(database),
+        scanner=_FakeScanner(),
+        notifier=_FakeNotifier(),
+    )
+    now = datetime(2026, 4, 13, 12, 5, tzinfo=timezone.utc)
+    state = make_event_state(state=EventStatus.PULLBACK_OBSERVED)
+    features = make_features(market_asof=now)
+    evaluations = bot._evaluate_registered_strategies(
+        state=state,
+        features=features,
+        frame_1m=_make_frame([100.0 + index * 0.1 for index in range(40)]),
+        short_zone=ShortZone(110.0, 114.0, "event_range"),
+        decision_timestamp=now,
+    )
+
+    assert tuple(item.strategy_type for item in evaluations) == REQUIRED_STRATEGY_TYPES
+    assert bot._strategy_registry is not None
