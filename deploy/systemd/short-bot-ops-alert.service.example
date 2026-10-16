@@ -1,0 +1,14 @@
+[Unit]
+Description=Short Bot operator alert notifier (alert channel only)
+After=network-online.target short-bot-release-drift.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@ADMIN_ROOT@/tools/short_bot_ops_alert.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=@ADMIN_ROOT@ @LANE_A_ROOT@ @LANE_B_ROOT@ @LANE_C_ROOT@

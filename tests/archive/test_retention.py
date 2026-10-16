@@ -254,22 +254,21 @@ def test_database_source_is_read_only_and_cli_output_is_machine_readable(tmp_pat
     assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before_hash
 
 
-def test_policy_classifies_all_31_known_tables() -> None:
-    policy = _policy()
-
-    assert len(policy.table_specs) == 31
-    assert set(policy.table_specs) == {
-        "__db_heartbeat", "event_states", "signals", "signal_provenance", "signal_outcomes",
-        "telegram_delivery_outbox", "watch_candidates", "climax_root_events", "climax_entry_attempts",
-        "runtime_heartbeats", "runtime_heartbeat_history", "climax_evaluations", "volume_climax_observations",
-        "strategy_observations", "climax_entry_attempt_events", "climax_monitor_events", "market_coverage_ledger",
-        "market_scan_cycles", "market_scan_rotations", "market_scan_symbol_results", "reject_stats",
-        "root_detector_shadow_candidates", "root_detector_shadow_episodes", "root_detector_shadow_observations",
-        "root_detector_shadow_episode_outcomes", "root_detector_shadow_episode_root_links",
-        "root_detector_shadow_legacy_mappings", "root_detector_shadow_v2_roots", "root_detector_shadow_v2_outcomes",
-        "current_root_outcomes", "current_root_predicate_snapshots",
-    }
-    assert all(spec.policy_version == "phase1c-v1" for spec in policy.table_specs.values())
+def test_policy_protects_deferred_outcome_fetch_retries(tmp_path: Path) -> None:
+    db_path = tmp_path / "deferred.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE outcome_fetch_retries ("
+            "task_key TEXT PRIMARY KEY, next_attempt_at DATETIME, updated_at DATETIME)"
+        )
+        connection.execute(
+            "INSERT INTO outcome_fetch_retries VALUES (?, ?, ?)",
+            ("signal:42", "2026-08-28 14:00:00", "2026-08-28 12:00:00"),
+        )
+    result = evaluate_database(db_path, _policy(), as_of_utc=AS_OF)
+    table = next(item for item in result.tables if item["table_name"] == "outcome_fetch_retries")
+    assert table["keep"] == 1
+    assert table["delete_eligible"] == 0
 
 
 def test_unknown_source_table_is_reported_as_unknown_and_kept(tmp_path: Path) -> None:

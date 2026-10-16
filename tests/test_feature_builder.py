@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from app.features.builder import FeatureBuilder
 
 
@@ -49,3 +51,22 @@ def test_feature_builder_extracts_derivatives_diagnostics(make_frame) -> None:
     assert features.derivatives_status == "OK"
     assert features.derivatives_reasons == []
     assert features.data_quality_warnings == []
+
+
+def test_feature_builder_highest_closed_candle_with_duplicate_index(make_frame) -> None:
+    start = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    frame = make_frame([100.0] * 20, start=start)
+    frame.iloc[5, frame.columns.get_loc("high")] = 150.0
+    frame.iloc[6, frame.columns.get_loc("high")] = 110.0
+    frame.iloc[18, frame.columns.get_loc("high")] = 150.0
+    frame.iloc[19, frame.columns.get_loc("high")] = 200.0
+    index = frame.index.to_list()
+    index[6] = index[5]
+    frame.index = index
+
+    features = FeatureBuilder().build(
+        "TESTUSDT", frame, market_asof=start + timedelta(minutes=19, seconds=30)
+    )
+
+    assert features.last_high == 150.0
+    assert features.last_high_time == start + timedelta(minutes=6)

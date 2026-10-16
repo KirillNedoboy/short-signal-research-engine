@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import asyncio
+import pandas as pd
 
 from app.observability.outcome_scheduler import ShadowOutcomeScheduler
 from app.storage.db import Database
@@ -11,7 +12,7 @@ UTC = timezone.utc
 
 
 class _Client:
-    async def fetch_klines(self, symbol, interval, limit, start_ms, end_ms):
+    async def fetch_klines(self, symbol, interval, limit, start_ms, end_ms, **_kwargs):
         start = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
         return [
             {

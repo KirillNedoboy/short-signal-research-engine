@@ -28,7 +28,7 @@ from app.infra.disk_capacity import (
     read_capacity,
     require_capacity,
 )
-from app.infra.request_scheduler import RequestScheduler
+from app.infra.request_scheduler import RequestPriority, RequestScheduler, request_class
 from app.infra.runtime_metadata import resolve_code_version
 from app.market.bybit_client import BybitClient, BybitResponseError
 from app.market.scanner import MarketScanner
@@ -234,6 +234,7 @@ class ProbeCollector:
 
 
 async def observe(config: AppConfig, *, min_duration: int, max_duration: int) -> dict[str, Any]:
+    request_class.set(RequestPriority.RESEARCH)
     scheduler = RequestScheduler(
         max_concurrency=config.max_request_concurrency,
         min_delay_ms=config.request_min_delay_ms,

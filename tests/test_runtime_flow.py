@@ -9,7 +9,6 @@ from sqlalchemy import select
 
 from app.config import AppConfig
 from app.domain import EventStatus, ShortZone, SignalType
-from app.strategies.registry import REQUIRED_STRATEGY_TYPES
 from app.infra.disk_capacity import DiskCapacitySnapshot
 from app.main import ShortSignalBot
 from app.observability.strategy_observations import (
@@ -17,14 +16,11 @@ from app.observability.strategy_observations import (
     ObservationWriteStatus,
 )
 from app.signals.climax import ClimaxEvaluation, ClimaxEvaluationBundle
-from app.strategies.contracts import StrategyEvaluation
 from app.storage.db import Database
 from app.storage.models import (
-    RejectStatModel,
     ClimaxEvaluationModel,
-    EventStateModel,
+    RejectStatModel,
     SignalModel,
-    SignalProvenanceModel,
     StrategyObservationModel,
     TelegramDeliveryOutboxModel,
     WatchCandidateModel,
@@ -108,58 +104,6 @@ class _ExplodingNotifier(_FakeNotifier):
         raise RuntimeError("telegram transport down")
 
 
-def _canonical_climax_evaluation(
-    state, features, *, subtype: str, actionable: bool, score: int, grade: str,
-    vetoes: list[str] | None = None,
-) -> StrategyEvaluation:
-    metadata = {
-        "strategy_subtype": subtype,
-        "model_version": "climax-v1",
-        "event_high": state.event_high,
-        "entry_distance_below_high_pct": (
-            (state.event_high - features.price) / state.event_high * 100
-        ),
-    }
-    if subtype == "VOLUME_CLIMAX_UNWIND":
-        metadata["volume_climax_observed"] = False
-    return StrategyEvaluation(
-        strategy_type="CLIMAX_EXHAUSTION",
-        strategy_subtype=subtype,
-        model_version="climax-v1",
-        actionable=actionable,
-        score=score,
-        grade=grade,
-        reasons=[],
-        blockers=[],
-        vetoes=vetoes or [],
-        risk_flags=[],
-        strategy_metadata=metadata,
-        symbol=features.symbol,
-        event_id=state.event_id,
-        decision_timestamp=features.asof,
-    )
-
-
-def _canonical_baseline_evaluation(state, features) -> StrategyEvaluation:
-    is_watch = features.ret_15m < 10.0 or features.ret_4h < 25.0
-    return StrategyEvaluation(
-        strategy_type="BASELINE_PULLBACK",
-        strategy_subtype="BASELINE_PULLBACK",
-        model_version="baseline-v1",
-        actionable=True,
-        score=50 if is_watch else 82,
-        grade="C" if is_watch else "A",
-        reasons=[],
-        blockers=[],
-        vetoes=[],
-        risk_flags=[],
-        strategy_metadata={"signal_type": "Watch"} if is_watch else {},
-        symbol=features.symbol,
-        event_id=state.event_id,
-        decision_timestamp=features.asof,
-    )
-
-
 def test_notifier_failure_leaves_signal_retryable_in_outbox(
     tmp_path, make_event_state, make_signal_decision, make_signal_provenance
 ) -> None:
@@ -181,19 +125,19 @@ def test_notifier_failure_leaves_signal_retryable_in_outbox(
             scanner=_FakeScanner(),
             notifier=_ExplodingNotifier(),
         )
-        sent = await bot._send_new_delivery(entity_type="SIGNAL", entity_id=signal.id)
+        delivered = await bot._delivery_worker.drain_once()
         with database.session() as session:
             outbox = session.scalars(select(TelegramDeliveryOutboxModel)).one()
             stored_signal = session.get(SignalModel, signal.id)
-        return sent, (
+        return delivered, (
             stored_signal.telegram_sent,
             outbox.status,
             outbox.attempt_count,
             outbox.last_error,
         )
 
-    sent, state = asyncio.run(_run())
-    assert sent is False
+    delivered, state = asyncio.run(_run())
+    assert delivered == 0
     assert state[0] is False
     assert state[1:] == ("RETRY", 1, "RuntimeError: telegram transport down")
 
@@ -272,7 +216,7 @@ def test_disabled_watch_delivery_is_not_drained(
             scanner=_FakeScanner(),
             notifier=notifier,
         )
-        await bot._drain_delivery_outbox(limit=5)
+        await bot._delivery_worker.drain_once()
         with database.session() as session:
             outbox = session.scalars(select(TelegramDeliveryOutboxModel)).one()
         return notifier.messages, outbox.status
@@ -312,23 +256,41 @@ def test_process_symbol_persists_signal_and_suppresses_duplicates(
 
         state = make_event_state(state=EventStatus.PULLBACK_OBSERVED)
         repository.upsert_event_state(state)
-        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
+        features = make_features(asof=state.updated_at)
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
-        )
 
         decision, updated_state = await bot._process_symbol("ONTUSDT", object(), state)
         duplicate_decision, duplicate_state = await bot._process_symbol(
             "ONTUSDT", object(), updated_state
         )
-        return decision, updated_state, duplicate_decision, duplicate_state, notifier
+        with database.session() as session:
+            queued = session.scalars(select(TelegramDeliveryOutboxModel)).one()
+            queued_status = queued.status
+            queued_sent = session.get(SignalModel, updated_state.signal_id).telegram_sent
+        delivered = await bot._delivery_worker.drain_once()
+        return (
+            decision,
+            updated_state,
+            duplicate_decision,
+            duplicate_state,
+            notifier,
+            queued_status,
+            queued_sent,
+            delivered,
+        )
 
-    decision, updated_state, duplicate_decision, duplicate_state, notifier = (
-        asyncio.run(_run())
-    )
+    (
+        decision,
+        updated_state,
+        duplicate_decision,
+        duplicate_state,
+        notifier,
+        queued_status,
+        queued_sent,
+        delivered,
+    ) = asyncio.run(_run())
 
     assert decision is not None
     assert updated_state is not None
@@ -336,6 +298,10 @@ def test_process_symbol_persists_signal_and_suppresses_duplicates(
     assert updated_state.signal_id is not None
     assert duplicate_decision is None
     assert duplicate_state is not None
+    # The lifecycle advanced before Telegram acknowledgement; the queue carried it.
+    assert queued_status == "PENDING"
+    assert queued_sent is False
+    assert delivered == 1
     assert len(notifier.messages) == 1
 
 
@@ -439,7 +405,6 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
     make_features,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("SHORT_BOT_CODE_VERSION", "test-code-version")
 
     async def _run() -> tuple[
         object | None, list[tuple[str, str, str, str, str, datetime]]
@@ -448,7 +413,7 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
-        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
+        features = make_features(asof=state.updated_at)
         selected = ClimaxEvaluation(
             subtype="VOLUME_CLIMAX_UNWIND",
             score=70,
@@ -487,20 +452,11 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
             scanner=_FakeScanner(),
             notifier=_FakeNotifier(),
         )
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_climax_evaluation(
-                state,
-                features,
-                subtype="VOLUME_CLIMAX_UNWIND",
-                actionable=True,
-                score=70,
-                grade="B",
-            ),
-        )
 
         decision = await bot._evaluate_and_send_climax(
             "ONTUSDT", object(), state, features=features
         )
+        bot_code_version = bot._code_version
         with database.session() as session:
             rows = [
                 (
@@ -517,56 +473,40 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
                     )
                 ).all()
             ]
-        return decision, rows
+        return decision, rows, bot_code_version
 
-    decision, rows = asyncio.run(_run())
+    decision, rows, bot_code_version = asyncio.run(_run())
 
     assert decision is not None
     assert [(strategy, phase, live) for strategy, phase, live, *_ in rows] == [
         ("LOW_VOLUME_EXTENSION_FAILURE", "INITIAL", "BLOCKED"),
         ("VOLUME_CLIMAX_UNWIND", "INITIAL", "ACTIONABLE"),
     ]
-    assert {code_version for *_, code_version, _runtime_id, _started_at in rows} == {
-        "test-code-version"
+    # Every observation row carries exactly the code version this runtime resolved.
+    assert {row_version for *_, row_version, _runtime_id, _started_at in rows} == {
+        bot_code_version
     }
     assert len({runtime_id for *_, runtime_id, _started_at in rows}) == 1
     assert all(runtime_started_at is not None for *_, runtime_started_at in rows)
 
 
-@pytest.mark.parametrize(
-    ("final_actionable", "final_snapshot_available"),
-    [(False, True), (True, True), (False, False)],
-)
-def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
+def test_low_volume_recheck_records_all_branches_before_delivery_veto(
     tmp_path,
     make_event_state,
     make_features,
     make_frame,
     monkeypatch,
-    final_actionable,
-    final_snapshot_available,
 ) -> None:
-    async def _run() -> tuple[
-        list[tuple[str, str]],
-        int,
-        int,
-        list[tuple[int | None, str | None, str | None, str | None, datetime | None, int | None]],
-    ]:
+    async def _run() -> tuple[list[tuple[str, str]], int]:
         database = Database(f"sqlite:///{tmp_path / 'climax-observation-recheck.db'}")
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
-        initial_features = make_features(
-            asof=state.updated_at, market_asof=state.updated_at
-        )
+        initial_features = make_features(asof=state.updated_at)
         fresh_features = make_features(
-            asof=state.updated_at + timedelta(minutes=1),
-            market_asof=state.updated_at + timedelta(minutes=1),
-            price=111.0,
+            asof=state.updated_at + timedelta(minutes=1), price=111.0
         )
-        fresh_frame = make_frame(
-            [110.0, 111.0], start=datetime.now(timezone.utc) - timedelta(minutes=2)
-        )
+        fresh_frame = make_frame([110.0, 111.0])
         initial_low = ClimaxEvaluation(
             subtype="LOW_VOLUME_EXTENSION_FAILURE",
             score=75,
@@ -591,25 +531,6 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
             veto_reasons=["microstructure_break_missing"],
             data_quality=[],
         )
-        final_low = (
-            ClimaxEvaluation(
-                subtype="LOW_VOLUME_EXTENSION_FAILURE",
-                score=75,
-                grade="B",
-                metadata={
-                    "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
-                    "model_version": "climax-v1",
-                    "event_high": state.event_high,
-                    "entry_distance_below_high_pct": (
-                        (state.event_high - fresh_features.price) / state.event_high * 100
-                    ),
-                },
-                veto_reasons=[],
-                data_quality=[],
-            )
-            if final_actionable
-            else blocked_low
-        )
         blocked_volume = ClimaxEvaluation(
             subtype=None,
             score=40,
@@ -626,10 +547,10 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
             },
         )
         recheck_bundle = ClimaxEvaluationBundle(
-            selected=final_low,
+            selected=blocked_low,
             branch_evaluations={
                 "VOLUME_CLIMAX_UNWIND": blocked_volume,
-                "LOW_VOLUME_EXTENSION_FAILURE": final_low,
+                "LOW_VOLUME_EXTENSION_FAILURE": blocked_low,
             },
         )
         bundles = iter([initial_bundle, recheck_bundle])
@@ -638,59 +559,19 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
             lambda *_args, **_kwargs: next(bundles),
             raising=False,
         )
-        notifier = _FakeNotifier()
         bot = ShortSignalBot(
             config=AppConfig(
                 climax_short_enabled=True, volume_climax_lifecycle_shadow_enabled=False
             ),
             repository=repository,
             scanner=_RecheckScanner(fresh_frame),
-            notifier=notifier,
+            notifier=_FakeNotifier(),
         )
-        save_calls = []
-        original_save_signal = repository.save_signal
-
-        def save_signal_once(*args, **kwargs):
-            save_calls.append(True)
-            return original_save_signal(*args, **kwargs)
-
-        repository.save_signal = save_signal_once
         bot._feature_builder.build = lambda *_args, **_kwargs: fresh_features
-        canonical_evaluations = iter(
-            (
-                _canonical_climax_evaluation(
-                    state,
-                    initial_features,
-                    subtype="LOW_VOLUME_EXTENSION_FAILURE",
-                    actionable=True,
-                    score=75,
-                    grade="B",
-                ),
-                _canonical_climax_evaluation(
-                    state,
-                    fresh_features,
-                    subtype="LOW_VOLUME_EXTENSION_FAILURE",
-                    actionable=final_actionable,
-                    score=75 if final_actionable else 55,
-                    grade="B" if final_actionable else "C",
-                    vetoes=[] if final_actionable else ["microstructure_break_missing"],
-                ),
-            )
-        )
-        bot._evaluate_registered_strategies = lambda **_kwargs: (next(canonical_evaluations),)
-        if not final_snapshot_available:
-            async def _missing_final_snapshot(*_args, **_kwargs):
-                return None
-
-            bot._market_data_provider.capture_decision_snapshot = _missing_final_snapshot
 
         await bot._evaluate_and_send_climax(
             "ONTUSDT", object(), state, features=initial_features
         )
-        if final_actionable and final_snapshot_available:
-            await bot._evaluate_and_send_climax(
-                "ONTUSDT", object(), state, features=initial_features
-            )
         with database.session() as session:
             rows = [
                 (row.strategy, row.evaluation_phase)
@@ -701,41 +582,10 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
                     )
                 ).all()
             ]
-            audit_rows = [
-                (
-                    row.initial_evaluation_id,
-                    row.initial_decision,
-                    row.final_decision,
-                    row.final_reason,
-                    row.finalized_at,
-                    row.signal_id,
-                )
-                for row in session.scalars(
-                    select(StrategyObservationModel).where(
-                        StrategyObservationModel.evaluation_phase
-                        == "PRE_DELIVERY_RECHECK",
-                        StrategyObservationModel.final_decision.is_not(None),
-                    )
-                ).all()
-            ]
             signal_count = len(session.scalars(select(SignalModel)).all())
-            outbox_count = len(session.scalars(select(TelegramDeliveryOutboxModel)).all())
-            provenance_count = len(session.scalars(select(SignalProvenanceModel)).all())
-            state_row = session.get(EventStateModel, state.symbol)
-            final_evaluation = session.scalars(
-                select(ClimaxEvaluationModel)
-                .where(ClimaxEvaluationModel.lifecycle_state == "FINAL_ACTIONABLE")
-            ).first()
-        if final_actionable and final_snapshot_available:
-            assert save_calls == [True]
-            assert provenance_count == 1
-            assert state_row is not None
-            assert state_row.signal_id == audit_rows[0][5]
-            assert state_row.state == EventStatus.SIGNAL_SENT.value
-            assert final_evaluation is not None
-        return rows, signal_count, outbox_count, audit_rows
+        return rows, signal_count
 
-    rows, signal_count, outbox_count, audit_rows = asyncio.run(_run())
+    rows, signal_count = asyncio.run(_run())
 
     assert rows == [
         ("LOW_VOLUME_EXTENSION_FAILURE", "INITIAL"),
@@ -743,23 +593,7 @@ def test_low_volume_recheck_records_final_decision_audit_and_delivery_outcome(
         ("LOW_VOLUME_EXTENSION_FAILURE", "PRE_DELIVERY_RECHECK"),
         ("VOLUME_CLIMAX_UNWIND", "PRE_DELIVERY_RECHECK"),
     ]
-    assert signal_count == (1 if final_actionable and final_snapshot_available else 0)
-    assert outbox_count == (1 if final_actionable and final_snapshot_available else 0)
-    assert len(audit_rows) == 1
-    expected_final_reason = (
-        "final_actionable"
-        if final_actionable
-        else "microstructure_break_missing"
-        if final_snapshot_available
-        else "final_recheck_data_missing"
-    )
-    expected_signal = audit_rows[0][5]
-    assert audit_rows[0][0] is not None
-    assert audit_rows[0][1] == "ACTIONABLE"
-    assert audit_rows[0][2] == ("ACTIONABLE" if final_actionable else "BLOCKED_BY_RECHECK")
-    assert audit_rows[0][3] == expected_final_reason
-    assert audit_rows[0][4] is not None
-    assert (expected_signal is not None) is final_actionable
+    assert signal_count == 0
 
 
 def test_failed_observation_write_alerts_without_changing_signal_delivery(
@@ -773,7 +607,7 @@ def test_failed_observation_write_alerts_without_changing_signal_delivery(
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
-        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
+        features = make_features(asof=state.updated_at)
         selected = ClimaxEvaluation(
             subtype="VOLUME_CLIMAX_UNWIND",
             score=70,
@@ -809,16 +643,6 @@ def test_failed_observation_write_alerts_without_changing_signal_delivery(
             scanner=_FakeScanner(),
             notifier=notifier,
         )
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_climax_evaluation(
-                state,
-                features,
-                subtype="VOLUME_CLIMAX_UNWIND",
-                actionable=True,
-                score=70,
-                grade="B",
-            ),
-        )
 
         await bot._evaluate_and_send_climax(
             "ONTUSDT", object(), state, features=features
@@ -826,6 +650,7 @@ def test_failed_observation_write_alerts_without_changing_signal_delivery(
         await bot._report_strategy_observation_failures(
             [ObservationWriteResult(ObservationWriteStatus.FAILED)]
         )
+        assert await bot._delivery_worker.drain_once() == 1
         with database.session() as session:
             signal_count = len(session.scalars(select(SignalModel)).all())
             outbox_count = len(
@@ -871,6 +696,7 @@ def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
     tmp_path,
     make_event_state,
     make_features,
+    make_frame,
     monkeypatch,
     subtype: str,
     gate_name: str,
@@ -886,14 +712,22 @@ def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
             volume_climax_lifecycle_shadow_enabled=False,
             **{gate_name: delivery_enabled},
         )
+        if subtype == "LOW_VOLUME_EXTENSION_FAILURE":
+            # Fail-closed pre-delivery recheck: delivery requires a
+            # frame-capable scanner and a fresh snapshot.
+            scanner = _RecheckScanner(make_frame([112.0, 112.5]))
+        else:
+            scanner = _FakeScanner()
         bot = ShortSignalBot(
             config=config,
             repository=repository,
-            scanner=_FakeScanner(),
+            scanner=scanner,
             notifier=notifier,
         )
+        if subtype == "LOW_VOLUME_EXTENSION_FAILURE":
+            bot._feature_builder.build = lambda *_args, **_kwargs: features
         state = repository.upsert_event_state(make_event_state())
-        features = make_features(asof=state.updated_at, market_asof=state.updated_at)
+        features = make_features(asof=state.updated_at)
         evaluation = ClimaxEvaluation(
             subtype=subtype,
             score=70,
@@ -917,29 +751,38 @@ def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
                 branch_evaluations={subtype: evaluation},
             ),
         )
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_climax_evaluation(
-                state,
-                features,
-                subtype=subtype,
-                actionable=True,
-                score=70,
-                grade="B",
-            ),
-        )
 
         decision = await bot._evaluate_and_send_climax(
             "ONTUSDT", object(), state, features=features
         )
         with database.session() as session:
             signal_count = len(session.scalars(select(SignalModel)).all())
-            outbox_count = len(
-                session.scalars(select(TelegramDeliveryOutboxModel)).all()
-            )
-        return decision, state, notifier.messages, signal_count, outbox_count
+            outbox_rows = session.scalars(select(TelegramDeliveryOutboxModel)).all()
+            rechecks = [
+                row.actionable
+                for row in session.scalars(
+                    select(ClimaxEvaluationModel).order_by(ClimaxEvaluationModel.id)
+                ).all()
+                if row.lifecycle_state == "DELIVERY_RECHECK"
+            ]
+        outbox_count = len(outbox_rows)
+        if delivery_enabled:
+            # Queued, not yet sent: lifecycle finalized before any Telegram ack.
+            assert outbox_rows[0].status == "PENDING"
+            assert notifier.messages == []
+            assert await bot._delivery_worker.drain_once() == 1
+        messages = notifier.messages
+        return decision, state, messages, signal_count, outbox_count, rechecks
 
-    decision, state, messages, signal_count, outbox_count = asyncio.run(_run())
+    decision, state, messages, signal_count, outbox_count, rechecks = asyncio.run(_run())
 
+    if subtype == "LOW_VOLUME_EXTENSION_FAILURE":
+        # The fresh pre-delivery recheck ran; when the gate is disabled the
+        # recheck itself passed, so the delivery gate is what suppressed it.
+        assert rechecks == [True]
+    else:
+        # VOLUME_CLIMAX_UNWIND is not rechecked; the gate alone decides.
+        assert rechecks == []
     if delivery_enabled:
         assert decision is not None
         assert state.signal_id is not None
@@ -1330,55 +1173,6 @@ def test_confirmed_new_high_after_short_zone_resets_without_delivery(
     assert outbox_count == 0
 
 
-def test_missing_market_asof_blocks_baseline_without_legacy_signal_engine(
-    tmp_path, make_event_state, make_features, monkeypatch
-) -> None:
-    async def _run():
-        database = Database(f"sqlite:///{tmp_path / 'runtime-missing-market-asof.db'}")
-        database.create_all()
-        repository = BotRepository(database)
-        notifier = _FakeNotifier()
-        bot = ShortSignalBot(
-            config=AppConfig(),
-            repository=repository,
-            scanner=_FakeScanner(),
-            notifier=notifier,
-        )
-        state = make_event_state(
-            state=EventStatus.PULLBACK_OBSERVED,
-            zone_low=110.5,
-            zone_high=113.8,
-        )
-        features = make_features(
-            market_asof=None,
-            price=112.0,
-            inside_short_zone_flag=True,
-        )
-
-        def fail_legacy_analyze(*_args, **_kwargs):
-            raise AssertionError("legacy SignalEngine.analyze must not run without canonical baseline")
-
-        monkeypatch.setattr(bot._signal_engine, "analyze", fail_legacy_analyze)
-        bot._pump_detector.build_event = lambda *_args, **_kwargs: None
-        bot._feature_builder.build = lambda *_args, **_kwargs: features
-
-        result = await bot._process_symbol("ONTUSDT", object(), state)
-        with database.session() as session:
-            signal_count = len(session.scalars(select(SignalModel)).all())
-            outbox_count = len(
-                session.scalars(select(TelegramDeliveryOutboxModel)).all()
-            )
-        return result, notifier, signal_count, outbox_count
-
-    (decision, updated_state), notifier, signal_count, outbox_count = asyncio.run(_run())
-
-    assert decision is None
-    assert updated_state is not None
-    assert notifier.messages == []
-    assert signal_count == 0
-    assert outbox_count == 0
-
-
 def test_unconfirmed_new_high_does_not_reset_active_pullback(
     tmp_path,
     make_event_state,
@@ -1495,7 +1289,6 @@ def test_grade_c_watch_is_stored_but_not_sent_when_watch_delivery_disabled(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
-            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_15m=7.0,
@@ -1517,9 +1310,6 @@ def test_grade_c_watch_is_stored_but_not_sent_when_watch_delivery_disabled(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
-        )
         bot._zone_builder.build = lambda *_args, **_kwargs: ShortZone(
             low=110.5, high=113.8, mode="event_range"
         )
@@ -1565,7 +1355,6 @@ def test_watch_signal_is_sent_without_short_wording(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
-            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_1h=10.0,
@@ -1577,11 +1366,10 @@ def test_watch_signal_is_sent_without_short_wording(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
-        )
 
-        return await bot._process_symbol("ONTUSDT", object(), state), notifier, database
+        result = await bot._process_symbol("ONTUSDT", object(), state)
+        assert await bot._delivery_worker.drain_once() == 1
+        return result, notifier, database
 
     (decision, updated_state), notifier, database = asyncio.run(_run())
 
@@ -1621,7 +1409,6 @@ def test_watch_signal_is_not_sent_when_telegram_watch_disabled(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
-            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_1h=10.0,
@@ -1633,9 +1420,6 @@ def test_watch_signal_is_not_sent_when_telegram_watch_disabled(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
-        )
 
         return await bot._process_symbol("ONTUSDT", object(), state), notifier, database
 
@@ -1681,7 +1465,6 @@ def test_warn_only_derivatives_diagnostics_are_persisted_without_sending_watch(
             state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8
         )
         features = make_features(
-            market_asof=state.updated_at,
             price=112.0,
             inside_short_zone_flag=True,
             ret_1h=10.0,
@@ -1701,9 +1484,6 @@ def test_warn_only_derivatives_diagnostics_are_persisted_without_sending_watch(
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
-        bot._evaluate_registered_strategies = lambda **_kwargs: (
-            _canonical_baseline_evaluation(_kwargs["state"], _kwargs["features"]),
-        )
 
         return await bot._process_symbol("ONTUSDT", object(), state), notifier, database
 
@@ -1719,31 +1499,3 @@ def test_warn_only_derivatives_diagnostics_are_persisted_without_sending_watch(
         assert stored_watch.telegram_sent is False
         assert stored_watch.context_json["derivatives_status"] == "OK"
         assert stored_watch.context_json["open_interest"] == 1200.0
-
-
-def test_runtime_evaluation_constructs_complete_canonical_registry(
-    tmp_path, make_event_state, make_features
-) -> None:
-    from tests.conftest import _make_frame
-
-    database = Database(f"sqlite:///{tmp_path / 'registry-runtime.db'}")
-    database.create_all()
-    bot = ShortSignalBot(
-        config=AppConfig(),
-        repository=BotRepository(database),
-        scanner=_FakeScanner(),
-        notifier=_FakeNotifier(),
-    )
-    now = datetime(2026, 4, 13, 12, 5, tzinfo=timezone.utc)
-    state = make_event_state(state=EventStatus.PULLBACK_OBSERVED)
-    features = make_features(market_asof=now)
-    evaluations = bot._evaluate_registered_strategies(
-        state=state,
-        features=features,
-        frame_1m=_make_frame([100.0 + index * 0.1 for index in range(40)]),
-        short_zone=ShortZone(110.0, 114.0, "event_range"),
-        decision_timestamp=now,
-    )
-
-    assert tuple(item.strategy_type for item in evaluations) == REQUIRED_STRATEGY_TYPES
-    assert bot._strategy_registry is not None

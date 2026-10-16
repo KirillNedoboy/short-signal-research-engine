@@ -11,13 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from app.infra.atomic_json import atomic_write_json
 from app.infra.disk_capacity import DiskCapacitySnapshot, DiskHealthState
 
 
@@ -370,30 +370,3 @@ def build_complete_manifest(
     }
     manifest["manifest_id"] = canonical_sha256(manifest)
     return manifest
-
-
-def atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
-    """Write a deterministic JSON artifact using same-directory replace."""
-
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    data = _json_bytes(payload) + b"\n"
-    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        try:
-            directory_fd = os.open(target.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            pass
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    return target

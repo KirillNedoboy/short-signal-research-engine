@@ -1,4 +1,3 @@
-AUTOEXECUTION: OFF
 scan_interval_sec: 60
 shortlist_size: 100
 min_24h_volume: 5000000
@@ -7,6 +6,9 @@ exclude_btc_eth: true
 event_ret_15m_min: 6.0
 event_ret_1h_min: 8.0
 event_ret_4h_min: 20.0
+causal_pump_v2_shadow_enabled: false
+causal_pump_v2_lookback_candles: 30
+causal_pump_v2_expiry_minutes: 90
 pullback_min_pct: 2.7
 pullback_max_pct: 8.0
 pullback_hold_vwap_min: 5.5
@@ -59,8 +61,32 @@ watch_max_per_cycle: 5
 baseline_live_delivery_enabled: true
 volume_climax_live_delivery_enabled: true
 low_volume_live_delivery_enabled: true
+low_volume_extension_v2_enabled: false
+low_volume_extension_v2_live_delivery_enabled: false
+low_volume_v2_min_closed_candles_after_retest: 2
+low_volume_v2_max_episode_lifetime_minutes: 45
+low_volume_v2_max_entry_distance_below_high_pct: 15.0
+low_volume_v2_new_high_tolerance_pct: 0.30
+low_volume_v2_require_breakout_close: true
+low_volume_v2_require_lower_high_or_swing_break: true
+low_volume_v2_block_oi_acceleration_pct: 1.0
+low_volume_v2_block_price_acceleration_resumed: true
+low_volume_v2_recheck_interval_sec: 60
+# Backward-safe: this condition is metadata-only after V2 confirmation.
+low_volume_v2_extension_below_threshold_policy: metadata_only_after_confirmation
 trapped_longs_reversal_enabled: false
+trapped_longs_reversal_v2_enabled: false
+trapped_longs_require_oi_sequence: true
+trapped_longs_require_breakout_oi_expansion: true
+trapped_longs_require_oi_sequence_points: 4
+trapped_longs_min_closed_5m_candles_after_breakout: 2
+trapped_longs_block_price_oi_acceleration_together: true
+trapped_longs_price_acceleration_veto_pct: 0.0
+trapped_longs_oi_acceleration_veto_pct: 0.0
+trapped_longs_v2_min_oi_retained_increase_pct: 1.0
 trapped_longs_live_delivery_enabled: false
+trapped_longs_v2_live_delivery_enabled: false
+trapped_longs_max_oi_age_minutes: 60.0
 trapped_longs_min_oi_change_15m_pct: 1.0
 trapped_longs_min_closed_candles: 2
 trapped_longs_max_lifetime_minutes: 15
@@ -89,3 +115,44 @@ research_spool_max_bytes: 1073741824
 research_spool_record_max_bytes: 65536
 research_spool_shadow_headroom_bytes: 1073741824
 research_storage_health_path: <PRIVATE_ADMIN_ROOT>/shared/runtime/research-storage-health.json
+runtime_timing_evidence_path: /opt/short-telegram-bot-lite-admin/shared/runtime/runtime-cycle-timing.json
+
+# Event-driven live scan: canonical decision frame store.
+market_frame_store_mode: OFF  # OFF | SHADOW | PREFERRED
+market_frame_stale_after_sec: 90
+market_frame_singleflight_enabled: true
+market_frame_snapshot_path: data/market-frame-store.json.gz
+market_frame_snapshot_max_age_sec: 600
+market_frame_checkpoint_sec: 300
+
+# Event-driven scan coordinator.
+market_data_validation_mode: OFF  # OFF | SHADOW | ENFORCED
+event_driven_scan_enabled: false
+scan_window_grace_sec: 2
+p0_scan_deadline_sec: 15
+p1_scan_deadline_sec: 30
+scan_evaluation_consumers: 1
+
+# Background outcome worker. Set false to disable automatic outcome processing.
+background_outcomes_enabled: true
+outcome_worker_signal_batch_size: 25
+outcome_worker_observation_batch_size: 25
+outcome_worker_idle_poll_sec: 5
+outcome_max_concurrency: 1
+outcome_max_requests_per_cycle: 10
+background_max_requests_per_minute: 10
+outcome_rate_limit_backoff_sec: 2
+outcome_rate_limit_max_backoff_sec: 120
+outcome_rate_limit_retry_windows_sec: [[2, 4], [8, 12], [30, 45], [90, 120]]
+outcome_rate_limit_max_attempts: 5
+outcome_max_total_attempts: 8
+outcome_deferred_retry_minutes: 5
+outcome_deferred_max_retry_minutes: 60
+outcome_cache_ttl_sec: 60
+outcome_cache_max_entries: 128
+outcome_max_inflight_keys: 16
+
+# Research retention dry-run (read-only; never deletes).
+research_retention_dry_run_enabled: false
+research_retention_report_path: /opt/short-telegram-bot-lite-admin/shared/runtime/research-retention-dry-run.json
+research_retention_interval_sec: 21600

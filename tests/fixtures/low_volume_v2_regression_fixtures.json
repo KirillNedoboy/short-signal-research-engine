@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "extension_below_threshold": "metadata_only_after_final_confirmation",
+    "v1_metadata_contract": "unchanged"
+  },
+  "cases": [
+    {
+      "name": "canonical_root_and_revision_cache_identity",
+      "root_event_id": "ROOT-CANONICAL",
+      "event_revision": 3,
+      "state_event_id": "STATE-ALIAS",
+      "expected_cache_key": ["ROOT-CANONICAL", 3]
+    },
+    {
+      "name": "below_threshold_is_continuation_risk_metadata",
+      "extension_below_threshold": true,
+      "final_confirmation": true,
+      "expected_actionable": true
+    }
+  ]
+}

@@ -130,14 +130,15 @@ def test_tracker_keeps_bounded_recent_candle_identities() -> None:
     ]
 
 
-def test_bounded_eviction_never_silently_forgets_an_unrepaired_gap() -> None:
+def test_eviction_retires_gap_outside_decision_window() -> None:
     tracker = GapTracker(max_candles_per_symbol=4)
     for minute in (0, 2, 3, 4, 5, 6):
         tracker.observe_closed_candle(candle(minute))
 
     assert len(tracker.get_candles("BTCUSDT")) == 4
-    assert tracker.active_gaps[0].expected_start == BASE + timedelta(minutes=1)
-    assert tracker.get_symbol_state("BTCUSDT") is GapState.GAP_DETECTED
+    assert tracker.active_gaps == ()
+    assert tracker.get_symbol_state("BTCUSDT") is GapState.CONTIGUOUS
+    assert tracker.get_health().gaps_backfilled == 0
 
 
 def test_partial_late_fill_does_not_split_or_duplicate_active_gap() -> None:

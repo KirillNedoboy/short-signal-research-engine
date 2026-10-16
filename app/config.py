@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
+from math import isfinite
 from pathlib import Path
 from enum import StrEnum
 from typing import Any
@@ -22,14 +22,22 @@ from pydantic import (
 logger = logging.getLogger(__name__)
 
 
-class ManualOnlyConfigurationError(RuntimeError):
-    """Raised when a runtime config is not explicitly manual-only."""
-
-
 class CanonicalMarketDataProviderMode(StrEnum):
     REST_ONLY = "REST_ONLY"
     HUB_SHADOW = "HUB_SHADOW"
     HUB_PREFERRED = "HUB_PREFERRED"
+
+
+class MarketDataValidationMode(StrEnum):
+    OFF = "OFF"
+    SHADOW = "SHADOW"
+    ENFORCED = "ENFORCED"
+
+
+class MarketFrameStoreMode(StrEnum):
+    OFF = "OFF"
+    SHADOW = "SHADOW"
+    PREFERRED = "PREFERRED"
 
 
 class ResearchTelemetryStorageMode(StrEnum):
@@ -49,10 +57,8 @@ class AppConfig(BaseModel):
     """Validated runtime configuration."""
 
     model_config = ConfigDict(
-        extra="forbid", validate_assignment=True, hide_input_in_errors=True
+        extra="ignore", validate_assignment=True, hide_input_in_errors=True
     )
-
-    autoexecution: str | None = None
 
     scan_interval_sec: int = 60
     shortlist_size: int = 100
@@ -109,6 +115,13 @@ class AppConfig(BaseModel):
 
     enable_watch_candidates: bool = False
     send_watch_to_telegram: bool = False
+
+    # Separate non-actionable observation stream; never enters short admission.
+    early_drop_warning_enabled: bool = False
+    early_drop_warning_send_to_telegram: bool = False
+    early_drop_warning_cooldown_minutes: int = Field(default=30, ge=1)
+    early_drop_warning_max_candle_age_sec: int = Field(default=120, ge=1)
+
     watch_min_score: int = 45
     watch_max_per_cycle: int = 5
     min_public_signal_grade: str = "B"
@@ -119,7 +132,18 @@ class AppConfig(BaseModel):
     low_volume_live_delivery_enabled: bool = True
 
     trapped_longs_reversal_enabled: bool = False
+    trapped_longs_reversal_v2_enabled: bool = False
+    trapped_longs_require_oi_sequence: bool = True
+    trapped_longs_require_breakout_oi_expansion: bool = True
+    trapped_longs_require_oi_sequence_points: int = 4
+    trapped_longs_min_closed_5m_candles_after_breakout: int = 2
+    trapped_longs_block_price_oi_acceleration_together: bool = True
+    trapped_longs_price_acceleration_veto_pct: float = 0.0
+    trapped_longs_oi_acceleration_veto_pct: float = 0.0
+    trapped_longs_v2_min_oi_retained_increase_pct: float = 1.0
+    trapped_longs_max_oi_age_minutes: float = 60.0
     trapped_longs_live_delivery_enabled: bool = False
+    trapped_longs_v2_live_delivery_enabled: bool = False
     trapped_longs_min_oi_change_15m_pct: float = 1.0
     trapped_longs_min_closed_candles: int = 2
     trapped_longs_max_lifetime_minutes: int = 15
@@ -160,8 +184,6 @@ class AppConfig(BaseModel):
     volume_climax_max_entry_distance_below_high_pct: float = 20.0
     volume_climax_lifecycle_shadow_enabled: bool = True
     volume_climax_confirmation_window_minutes: int = 3
-    climax_fresh_recheck_attempts: int = 2
-    climax_fresh_recheck_retry_delay_sec: float = 3.0
     volume_climax_min_closed_candles_after_high: int = 2
     volume_climax_max_lifetime_minutes: int = 15
     low_volume_extension_enabled: bool = False
@@ -187,8 +209,24 @@ class AppConfig(BaseModel):
     low_volume_frozen_initial_extension_enabled: bool = False
     low_volume_frozen_initial_extension_shadow_only: bool = True
     low_volume_current_ret5_gate_enabled: bool = True
+    # V2 is deliberately disabled until replay and production promotion.
+    low_volume_extension_v2_enabled: bool = False
+    low_volume_extension_v2_live_delivery_enabled: bool = False
+    low_volume_v2_min_closed_candles_after_retest: int = 2
+    low_volume_v2_max_episode_lifetime_minutes: int = 45
+    low_volume_v2_max_entry_distance_below_high_pct: float = 15.0
+    low_volume_v2_new_high_tolerance_pct: float = 0.30
+    low_volume_v2_require_breakout_close: bool = True
+    low_volume_v2_require_lower_high_or_swing_break: bool = True
+    low_volume_v2_block_oi_acceleration_pct: float = 1.0
+    low_volume_v2_block_price_acceleration_resumed: bool = True
+    low_volume_v2_recheck_interval_sec: int = 60
+    low_volume_v2_extension_below_threshold_policy: str = "metadata_only_after_confirmation"
     climax_root_event_tracking_enabled: bool = False
     root_detector_shadow_v2_enabled: bool = False
+    causal_pump_v2_shadow_enabled: bool = False
+    causal_pump_v2_lookback_candles: int = Field(default=30, ge=2)
+    causal_pump_v2_expiry_minutes: int = Field(default=90, ge=1)
     climax_root_event_shadow_only: bool = True
     climax_root_event_ttl_minutes: int = 90
     climax_entry_attempt_ttl_minutes: int = 15
@@ -217,15 +255,81 @@ class AppConfig(BaseModel):
     research_telemetry_storage_mode: ResearchTelemetryStorageMode = (
         ResearchTelemetryStorageMode.SQLITE_ONLY
     )
-    research_spool_root: str = "<APP_ROOT>/shared/research_spool"
+    research_spool_root: str = "/opt/short-telegram-bot-lite-admin/shared/research_spool"
     research_spool_max_bytes: int = Field(default=1_073_741_824, ge=1)
     research_spool_record_max_bytes: int = Field(default=65_536, ge=1024)
     research_spool_shadow_headroom_bytes: int = Field(
         default=1_073_741_824, ge=1
     )
     research_storage_health_path: str = (
-        "<APP_ROOT>/shared/runtime/research-storage-health.json"
+        "/opt/short-telegram-bot-lite-admin/shared/runtime/research-storage-health.json"
     )
+    runtime_timing_evidence_path: str = (
+        "/opt/short-telegram-bot-lite-admin/shared/runtime/runtime-cycle-timing.json"
+    )
+
+    # Event-driven decision-frame correctness gate.
+    market_data_validation_mode: MarketDataValidationMode = MarketDataValidationMode.OFF
+
+    # Event-driven live scan: canonical decision frame store.
+    market_frame_store_mode: MarketFrameStoreMode = MarketFrameStoreMode.OFF
+    market_frame_stale_after_sec: int = Field(default=90, ge=1)
+    market_frame_singleflight_enabled: bool = True
+    market_frame_snapshot_path: str = "data/market-frame-store.json.gz"
+    market_frame_snapshot_max_age_sec: int = Field(default=600, ge=1)
+    market_frame_checkpoint_sec: int = Field(default=300, ge=10)
+
+    # Event-driven scan coordinator.
+    event_driven_scan_enabled: bool = False
+    scan_window_grace_sec: int = Field(default=2, ge=0)
+    p0_scan_deadline_sec: int = Field(default=15, ge=1)
+    p1_scan_deadline_sec: int = Field(default=30, ge=1)
+    scan_evaluation_consumers: int = Field(default=1, ge=1, le=2)
+
+    # Research retention dry-run (read-only projection; never deletes).
+    research_retention_dry_run_enabled: bool = False
+    research_retention_report_path: str = (
+        "/opt/short-telegram-bot-lite-admin/shared/runtime/research-retention-dry-run.json"
+    )
+    research_retention_interval_sec: int = Field(default=21600, ge=60)
+
+    # Background outcome worker.
+    background_outcomes_enabled: bool = True
+    outcome_worker_signal_batch_size: int = Field(default=25, ge=1)
+    outcome_worker_observation_batch_size: int = Field(default=25, ge=1)
+    outcome_worker_idle_poll_sec: int = Field(default=5, ge=1)
+    outcome_max_concurrency: int = Field(default=1, ge=1, le=4)
+    outcome_max_requests_per_cycle: int = Field(default=10, ge=1)
+    background_max_requests_per_minute: int = Field(default=10, ge=1)
+    outcome_rate_limit_backoff_sec: float = Field(default=2, gt=0)
+    outcome_rate_limit_max_backoff_sec: float = Field(default=120, gt=0)
+    outcome_rate_limit_retry_windows_sec: tuple[tuple[float, float], ...] = (
+        (2, 4), (8, 12), (30, 45), (90, 120),
+    )
+    outcome_rate_limit_max_attempts: int = Field(default=5, ge=1)
+    outcome_max_total_attempts: int = Field(default=8, ge=1)
+    outcome_deferred_retry_minutes: float = Field(default=5, gt=0)
+    outcome_deferred_max_retry_minutes: float = Field(default=60, gt=0)
+    outcome_cache_ttl_sec: float = Field(default=60, gt=0)
+    outcome_cache_max_entries: int = Field(default=128, ge=1)
+    outcome_max_inflight_keys: int = Field(default=16, ge=1)
+
+    @model_validator(mode="after")
+    def validate_outcome_budgets(self) -> "AppConfig":
+        if self.outcome_max_total_attempts < self.outcome_rate_limit_max_attempts:
+            raise ValueError("outcome total attempts must cover request attempts")
+        windows = self.outcome_rate_limit_retry_windows_sec
+        if len(windows) != self.outcome_rate_limit_max_attempts - 1:
+            raise ValueError("outcome retry windows must match retry count")
+        previous = self.outcome_rate_limit_backoff_sec
+        for low, high in windows:
+            if not previous <= low <= high <= self.outcome_rate_limit_max_backoff_sec:
+                raise ValueError("outcome retry windows must be ordered within backoff bounds")
+            previous = high
+        if self.outcome_deferred_retry_minutes > self.outcome_deferred_max_retry_minutes:
+            raise ValueError("outcome deferred retry exceeds maximum")
+        return self
+
 
     @field_validator(
         "event_ret_15m_min",
@@ -254,10 +358,18 @@ class AppConfig(BaseModel):
         "max_slippage_pct",
         "min_orderbook_depth_usdt_1pct",
         "min_orderbook_depth_usdt_2pct",
+        "trapped_longs_price_acceleration_veto_pct",
+        "trapped_longs_oi_acceleration_veto_pct",
+        "trapped_longs_v2_min_oi_retained_increase_pct",
+        "trapped_longs_new_high_tolerance_pct",
+        "low_volume_v2_max_entry_distance_below_high_pct",
+        "low_volume_v2_new_high_tolerance_pct",
+        "low_volume_v2_block_oi_acceleration_pct",
+        "trapped_longs_max_oi_age_minutes",
     )
     @classmethod
     def _non_negative_float(cls, value: float) -> float:
-        if value < 0:
+        if not isfinite(value) or value < 0:
             raise ValueError("value must be non-negative")
         return value
 
@@ -271,6 +383,10 @@ class AppConfig(BaseModel):
         "shallow_pullback_penalty",
         "weak_rejection_penalty",
         "combined_early_short_risk_penalty",
+        "trapped_longs_min_closed_5m_candles_after_breakout",
+        "low_volume_v2_min_closed_candles_after_retest",
+        "low_volume_v2_max_episode_lifetime_minutes",
+        "low_volume_v2_recheck_interval_sec",
     )
     @classmethod
     def _non_negative_int(cls, value: int) -> int:
@@ -320,12 +436,24 @@ class AppConfig(BaseModel):
             raise ValueError(
                 "low_volume_high_liquidity_risk_mode must be block or warn"
             )
+        if self.low_volume_v2_extension_below_threshold_policy != "metadata_only_after_confirmation":
+            raise ValueError("low_volume_v2_extension_below_threshold_policy must be metadata_only_after_confirmation")
+        if self.low_volume_v2_min_closed_candles_after_retest < 1:
+            raise ValueError("low_volume_v2_min_closed_candles_after_retest must be positive")
+        if self.low_volume_v2_max_episode_lifetime_minutes < 1:
+            raise ValueError("low_volume_v2_max_episode_lifetime_minutes must be positive")
+        if self.low_volume_v2_recheck_interval_sec < 1:
+            raise ValueError("low_volume_v2_recheck_interval_sec must be positive")
+        if self.low_volume_v2_new_high_tolerance_pct < 0 or self.low_volume_v2_block_oi_acceleration_pct < 0:
+            raise ValueError("low-volume V2 thresholds must be non-negative")
         if self.climax_min_public_grade not in {"A", "B"}:
             raise ValueError("climax_min_public_grade must be A or B")
         if self.climax_grade_a_score < self.climax_min_signal_score:
             raise ValueError("climax_grade_a_score must be >= climax_min_signal_score")
         if self.trapped_longs_min_public_grade not in {"A", "B"}:
             raise ValueError("trapped_longs_min_public_grade must be A or B")
+        if self.trapped_longs_require_oi_sequence_points != 4:
+            raise ValueError("trapped_longs_require_oi_sequence_points must be exactly 4")
         if self.trapped_longs_min_signal_score < 0 or self.trapped_longs_min_closed_candles < 1:
             raise ValueError("trapped longs thresholds must be non-negative and candle count positive")
         if self.climax_fast_poll_sec < 1 or self.climax_max_active_symbols < 1:
@@ -338,6 +466,25 @@ class AppConfig(BaseModel):
             raise ValueError("shadow root-event lifecycle bounds must be positive")
         if self.grade_c_mode not in {"watch_only", "suppress"}:
             raise ValueError("grade_c_mode must be one of watch_only, suppress")
+        if (
+            self.market_frame_store_mode is not MarketFrameStoreMode.OFF
+            and self.canonical_market_data_provider_mode
+            is CanonicalMarketDataProviderMode.REST_ONLY
+        ):
+            raise ValueError(
+                "market_frame_store_mode requires "
+                "canonical_market_data_provider_mode != REST_ONLY"
+            )
+        if self.event_driven_scan_enabled and not (
+            self.market_frame_store_mode is MarketFrameStoreMode.PREFERRED
+            and self.canonical_market_data_provider_mode
+            is CanonicalMarketDataProviderMode.HUB_PREFERRED
+        ):
+            raise ValueError(
+                "event_driven_scan_enabled requires market_frame_store_mode="
+                "PREFERRED and canonical_market_data_provider_mode="
+                "HUB_PREFERRED"
+            )
         return self
 
     @model_validator(mode="before")
@@ -390,13 +537,37 @@ def _config_values_equal(left: Any, right: Any) -> bool:
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
+
+    class _UniqueKeysSafeLoader(yaml.SafeLoader):
+        """SafeLoader that rejects duplicate mapping keys instead of last-wins."""
+
+    def _construct_mapping(loader, node, deep=False):
+        loader.flatten_mapping(node)
+        pairs = loader.construct_pairs(node)
+        seen: set = set()
+        for key, _value in pairs:
+            try:
+                duplicate = key in seen
+            except TypeError:
+                duplicate = False
+            if duplicate:
+                raise ValueError(
+                    f"duplicate key '{key}' in {path}: YAML silently keeps only "
+                    "the last occurrence; remove one"
+                )
+            seen.add(key)
+        return dict(pairs)
+
+    _UniqueKeysSafeLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
+    )
+
     with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+        return yaml.load(handle, Loader=_UniqueKeysSafeLoader) or {}
 
 
 def _coerce_env_values(values: dict[str, Any]) -> dict[str, Any]:
     env_map = {
-        "AUTOEXECUTION": "autoexecution",
         "TELEGRAM_TOKEN": "telegram_token",
         "SIGNAL_CHAT_ID": "signal_chat_id",
         "ALERTS_CHAT_ID": "alerts_chat_id",
@@ -433,31 +604,26 @@ def load_config(
     config_file = Path(config_path)
     env_file = Path(env_path)
 
-    raw_config = _read_yaml(config_file)
-    if "AUTOEXECUTION" in raw_config:
-        raw_value = raw_config["AUTOEXECUTION"]
-        if raw_value is True:
-            raw_value = "ON"
-        elif raw_value is False:
-            raw_value = "OFF"
-        raw_config = {**raw_config, "autoexecution": raw_value}
-        del raw_config["AUTOEXECUTION"]
+    try:
+        raw_config = _read_yaml(config_file)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid configuration: {exc}") from exc
     raw_env = dotenv_values(env_file) if env_file.exists() else {}
-    if "AUTOEXECUTION" in os.environ:
-        raw_env = {**raw_env, "AUTOEXECUTION": os.environ["AUTOEXECUTION"]}
     merged = {**raw_config, **_coerce_env_values(raw_env)}
 
     try:
-        return AppConfig.model_validate(merged)
+        config = AppConfig.model_validate(merged)
     except ValidationError as exc:
         raise RuntimeError(f"Invalid configuration: {exc}") from exc
-
-
-def require_manual_only(config: AppConfig) -> AppConfig:
-    """Fail closed unless the runtime explicitly declares AUTOEXECUTION=OFF."""
-
-    if config.autoexecution != "OFF":
-        raise ManualOnlyConfigurationError(
-            "AUTOEXECUTION must be explicitly set to OFF for this manual-only runtime"
+    # Loud but non-fatal: unknown keys stay ignored (extra="ignore") so a typo
+    # can never brick startup, but it must not stay silent either.
+    unknown = sorted(
+        key for key in raw_config if key not in AppConfig.model_fields
+    )
+    if unknown:
+        logger.warning(
+            "config contains %d unknown key(s) ignored by AppConfig: %s",
+            len(unknown),
+            ", ".join(unknown),
         )
     return config

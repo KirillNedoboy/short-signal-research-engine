@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-DEFAULT_CONNECTION_TOPIC_BUDGET = 18_000
+DEFAULT_CONNECTION_TOPIC_BUDGET = 1_500
 DEFAULT_REQUEST_BATCH_BUDGET = 8_000
-DEFAULT_MAX_CONNECTIONS = 4
+DEFAULT_MAX_CONNECTIONS = 8
 
 
 @dataclass(frozen=True, slots=True)

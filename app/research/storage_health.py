@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.research.spool import atomic_write_json
+from app.infra.atomic_json import atomic_write_json
 
 logger = logging.getLogger(__name__)
 MAX_HEALTH_BYTES = 64 * 1024

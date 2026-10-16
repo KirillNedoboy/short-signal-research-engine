@@ -19,35 +19,18 @@ class EventStatus(StrEnum):
     EXPIRED = "expired"
 
 
-class ManualDeliveryLifecycleState(StrEnum):
-    """Explicit bookkeeping states for the manual signal delivery path."""
-
-    INITIAL_ACTIONABLE = "INITIAL_ACTIONABLE"
-    DELIVERY_RECHECK = "DELIVERY_RECHECK"
-    FINAL_ACTIONABLE = "FINAL_ACTIONABLE"
-    BLOCKED_BY_RECHECK = "BLOCKED_BY_RECHECK"
-    DEDUPLICATED = "DEDUPLICATED"
-    PERSISTENCE_FAILED = "PERSISTENCE_FAILED"
-    SIGNAL_PERSISTED = "SIGNAL_PERSISTED"
-    OUTBOX_ENQUEUED = "OUTBOX_ENQUEUED"
-    SENT = "SENT"
-
-
-class ManualDeliveryTerminalOutcome(StrEnum):
-    """Terminal outcomes recorded by manual delivery bookkeeping."""
-
-    BLOCKED_BY_RECHECK = "BLOCKED_BY_RECHECK"
-    DEDUPLICATED = "DEDUPLICATED"
-    PERSISTENCE_FAILED = "PERSISTENCE_FAILED"
-    SENT = "SENT"
-
-
 class SignalType(StrEnum):
     """Supported signal classifications."""
 
     AGGRESSIVE = "Aggressive"
     CONFIRM = "Confirm"
     WATCH = "Watch"
+
+
+# Strategy branch identifiers are intentionally strings for SQLite/API
+# compatibility.  V2 is additive; historical V1 rows keep their identifier.
+LOW_VOLUME_EXTENSION_FAILURE = "LOW_VOLUME_EXTENSION_FAILURE"
+LOW_VOLUME_EXTENSION_FAILURE_V2 = "LOW_VOLUME_EXTENSION_FAILURE_V2"
 
 
 @dataclass(slots=True)
@@ -80,7 +63,6 @@ class EventState:
     symbol: str
     event_id: str
     state: EventStatus = EventStatus.IDLE
-    lifecycle_state: str | None = None
     event_start_time: datetime | None = None
     event_high: float | None = None
     event_high_time: datetime | None = None
@@ -224,6 +206,8 @@ class SignalProvenanceInput:
     decision_event_high: float | None = None
     decision_distance_from_high: float | None = None
     provenance_anomaly: str | None = None
+    event_revision: int | None = None
+    entry_trigger_time: datetime | None = None
 
 
 @dataclass(slots=True)

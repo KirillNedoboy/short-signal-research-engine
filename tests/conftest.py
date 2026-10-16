@@ -211,6 +211,18 @@ def _make_signal_record(**overrides: object) -> SignalRecord:
     return SignalRecord(**base)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _redirect_timing_evidence(tmp_path_factory) -> None:
+    """Keep unit-test evidence out of the deployed shared runtime directory."""
+    from app.config import AppConfig
+
+    field = AppConfig.model_fields["runtime_timing_evidence_path"]
+    original = field.default
+    field.default = str(tmp_path_factory.mktemp("timing") / "runtime-cycle-timing.json")
+    yield
+    field.default = original
+
+
 @pytest.fixture
 def make_frame():
     return _make_frame

@@ -11,8 +11,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.domain import ManualDeliveryLifecycleState, SignalProvenanceInput
-from app.observability.strategy_observations import serialize_lifecycle_state
+from app.domain import SignalProvenanceInput
 from app.storage.db import Database
 from app.storage.models import ClimaxEvaluationModel, SignalProvenanceModel, TelegramDeliveryOutboxModel
 from app.storage.repository import BotRepository
@@ -33,11 +32,6 @@ def _baseline_provenance(*, when: datetime | None = None) -> SignalProvenanceInp
         runtime_started_at=decision_at - timedelta(minutes=5),
         decision_at=decision_at,
     )
-
-
-def test_manual_delivery_lifecycle_state_serializes_as_stable_string() -> None:
-    assert serialize_lifecycle_state(ManualDeliveryLifecycleState.OUTBOX_ENQUEUED) == "OUTBOX_ENQUEUED"
-    assert serialize_lifecycle_state("SENT") == "SENT"
 
 
 def test_save_signal_persists_complete_baseline_provenance_atomically(tmp_path, make_event_state, make_signal_decision) -> None:

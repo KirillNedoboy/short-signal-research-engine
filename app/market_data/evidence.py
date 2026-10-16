@@ -20,7 +20,7 @@ from typing import Any, Mapping
 
 PROVIDER_EVIDENCE_SCHEMA_VERSION = 1
 DEFAULT_PROVIDER_EVIDENCE_PATH = (
-    "<APP_ROOT>/shared/runtime/"
+    "/opt/short-telegram-bot-lite-admin/shared/runtime/"
     "canonical-marketdata-provider-evidence.json"
 )
 PROVIDER_EVIDENCE_PATH_ENV = "CANONICAL_MARKET_DATA_PROVIDER_EVIDENCE_PATH"

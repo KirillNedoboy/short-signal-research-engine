@@ -6,7 +6,9 @@ hub may replace only a complete, acknowledged, fresh ticker group in preferred m
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
 from copy import deepcopy
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
@@ -16,18 +18,27 @@ from typing import Any, Callable, Mapping
 
 import pandas as pd
 
-from app.config import AppConfig, CanonicalMarketDataProviderMode
-from app.market.candles import validate_closed_1m_frame
+from app.config import AppConfig, CanonicalMarketDataProviderMode, MarketFrameStoreMode
 from app.domain import MarketSnapshot
+from app.infra.request_scheduler import RequestPriority, request_class, request_deadline
 
 from .continuity import GapState
 from .evidence import normalize_provider_evidence
 from .models import HealthStatus, MarketTickerSnapshot
 from .parity import KlineClassification, compare_closed_kline
-from .planning import normalize_symbols
+from .planning import DEFAULT_MAX_CONNECTIONS, normalize_symbols, plan_topics
+from .store import (
+    STALE_MISSING_DECISION_CANDLE,
+    STALE_NO_TICKER,
+    STALE_TICKER_STALE,
+    CanonicalMarketStore,
+    DecisionMarketFrame,
+)
 
 _HUB_TICKER_FRESHNESS = timedelta(seconds=45)
+_MAX_TICKER_REST_FALLBACKS_PER_MINUTE = 10
 _MAX_DETAILS = 2048
+LOGGER = logging.getLogger(__name__)
 
 
 class MarketDataSource(StrEnum):
@@ -36,6 +47,7 @@ class MarketDataSource(StrEnum):
     HUB = "HUB"
     REST = "REST"
     REST_FALLBACK = "REST_FALLBACK"
+    FRAME_STORE = "FRAME_STORE"
 
 
 class FallbackReason(StrEnum):
@@ -204,6 +216,22 @@ class CanonicalMarketDataProvider:
         self._last_universe: tuple[str, ...] | None = None
         self._candidate_sources: dict[str, str | None] = {}
         self._candidate_source_differences: dict[str, bool] = {}
+        self._frame_store: CanonicalMarketStore | None = None
+        self._frame_store_mode = MarketFrameStoreMode(
+            getattr(config, "market_frame_store_mode", MarketFrameStoreMode.OFF)
+        )
+        self._frame_store_singleflight: dict[tuple[str, RequestPriority], asyncio.Future[bool]] = {}
+        self._ticker_rest_recent: deque[datetime] = deque()
+        if self._frame_store_mode is not MarketFrameStoreMode.OFF:
+            self.attach_frame_store(
+                CanonicalMarketStore(
+                    ring_size=config.deep_scan_kline_limit,
+                    stale_after_sec=getattr(config, "market_frame_stale_after_sec", 90),
+                    continuity=continuity,
+                    clock=self._clock,
+                    hub=hub,
+                )
+            )
 
     @property
     def client(self) -> Any:
@@ -219,7 +247,58 @@ class CanonicalMarketDataProvider:
 
     def set_continuity(self, continuity: Any | None) -> None:
         """Attach the runtime continuity observer for an injected Hub seam."""
+        if self._frame_store is not None:
+            self._frame_store.set_continuity(continuity)
         self._continuity = continuity
+
+    @property
+    def frame_store(self) -> CanonicalMarketStore | None:
+        return self._frame_store
+
+    @property
+    def frame_store_mode(self) -> MarketFrameStoreMode:
+        return self._frame_store_mode
+
+    def attach_frame_store(self, store: CanonicalMarketStore | None) -> None:
+        """Attach the decision frame store (also subscribes it to the Hub)."""
+        self._frame_store = store
+        if store is None or self._hub is None:
+            return
+        add_observer = getattr(self._hub, "add_observer", None)
+        if callable(add_observer) and store not in getattr(
+            self._hub, "_observers", ()
+        ):
+            add_observer(store)
+
+    async def checkpoint_frame_store(
+        self,
+        *,
+        generation: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        """Best-effort bounded snapshot of complete rings."""
+        if self._frame_store is None:
+            return None
+        path = self._config.market_frame_snapshot_path
+        try:
+            return await asyncio.to_thread(
+                self._frame_store.checkpoint,
+                path,
+                generation=generation,
+                metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 - checkpointing never gates runtime
+            self._evidence.record("frame_store_checkpoint_failed")
+            LOGGER.warning("frame store checkpoint failed | error=%s", type(exc).__name__)
+            return None
+
+    def restore_frame_store(self) -> dict[str, int] | None:
+        if self._frame_store is None:
+            return None
+        return self._frame_store.restore(
+            self._config.market_frame_snapshot_path,
+            max_age_sec=self._config.market_frame_snapshot_max_age_sec,
+        )
 
     @property
     def last_universe_telemetry(self) -> Any:
@@ -250,10 +329,69 @@ class CanonicalMarketDataProvider:
         if self._hub is None or self.mode is CanonicalMarketDataProviderMode.REST_ONLY:
             return
         normalized = normalize_symbols(symbols)
+        # Validate the whole replacement before mutating the frame store or
+        # publishing it to the Hub.  This keeps the previous universe live if
+        # the lane's connection capacity cannot cover the candidate set.
+        plan_topics(
+            normalized,
+            max_connections=getattr(
+                self._hub, "_max_connections", DEFAULT_MAX_CONNECTIONS
+            ),
+        )
+        if self._frame_store is not None:
+            known = set(self._frame_store.symbols())
+            self._frame_store.update_symbols(normalized)
+            new_symbols = [
+                symbol for symbol in normalized if symbol not in known
+            ]
+            if (
+                new_symbols
+                and self._frame_store_mode is MarketFrameStoreMode.SHADOW
+            ):
+                # SHADOW must leave the legacy scanner authoritative, so the
+                # bounded candle/OI warmup runs as a background task at P1
+                # instead of extending a live cycle.
+                self._schedule_shadow_warmup(new_symbols)
         if self._last_universe == normalized:
             return
         self._last_universe = normalized
         self._hub.update_universe(normalized)
+
+    def _schedule_shadow_warmup(self, symbols: list[str]) -> None:
+        queue = getattr(self, "_shadow_warmup_pending", None)
+        if queue is None:
+            queue = set()
+            self._shadow_warmup_pending = queue
+        queue.update(symbols)
+        task = getattr(self, "_shadow_warmup_task", None)
+        if task is not None and not task.done():
+            return  # the running task drains the pending queue
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _warm() -> None:
+            from app.infra.request_scheduler import RequestPriority
+
+            while self._shadow_warmup_pending:
+                batch = sorted(self._shadow_warmup_pending)
+                self._shadow_warmup_pending.clear()
+                try:
+                    result = await self._frame_store.warm_symbols(
+                        self.client, batch, priority=RequestPriority.RESEARCH
+                    )
+                    self._evidence.record(
+                        "frame_store_shadow_warmup",
+                        **{key: value for key, value in result.items()},
+                    )
+                except Exception as exc:  # noqa: BLE001 - best effort only
+                    LOGGER.warning(
+                        "shadow frame-store warmup failed | error=%s",
+                        type(exc).__name__,
+                    )
+
+        self._shadow_warmup_task = loop.create_task(_warm(), name="frame-store-shadow-warmup")
 
     async def build_scan_snapshot(self) -> CanonicalScanSnapshot:
         rest = await self._scanner.fetch_market_snapshots()
@@ -281,13 +419,32 @@ class CanonicalMarketDataProvider:
     def shortlist(self, snapshots: list[MarketSnapshot]) -> list[MarketSnapshot]:
         return self._scanner.shortlist(snapshots)
 
-    @property
-    def last_scan_failures(self) -> dict[str, dict[str, object]]:
-        return dict(getattr(self._scanner, "last_scan_failures", {}))
-
-    async def prefetch_historical_frames(self, symbols: list[str]) -> dict[str, FrozenCandleFrame]:
-        frames = await self._scanner.fetch_symbol_frames(symbols)
+    async def prefetch_historical_frames(
+        self,
+        symbols: list[str],
+        *,
+        priority: Any = None,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, FrozenCandleFrame]:
         captured = _utc(self._clock())
+        if self._frame_store_mode is MarketFrameStoreMode.PREFERRED:
+            return await self._prefetch_from_store(
+                symbols,
+                captured,
+                priority=priority,
+                deadline_monotonic=deadline_monotonic,
+            )
+        token = request_class.set(priority if priority is not None else request_class.get())
+        deadline_token = request_deadline.set(
+            deadline_monotonic if deadline_monotonic is not None else request_deadline.get()
+        )
+        try:
+            frames = await self._scanner.fetch_symbol_frames(symbols)
+        finally:
+            request_deadline.reset(deadline_token)
+            request_class.reset(token)
+        if self._frame_store_mode is MarketFrameStoreMode.SHADOW:
+            self._record_store_parity(symbols, frames, captured)
         output: dict[str, FrozenCandleFrame] = {}
         for symbol, frame in frames.items():
             output[symbol] = FrozenCandleFrame(
@@ -295,6 +452,226 @@ class CanonicalMarketDataProvider:
                 max_input_availability_time_utc=captured,
             )
         return output
+
+    async def _prefetch_from_store(
+        self,
+        symbols: list[str],
+        captured: datetime,
+        *,
+        priority: Any,
+        deadline_monotonic: float | None,
+    ) -> dict[str, FrozenCandleFrame]:
+        assert self._frame_store is not None
+        output: dict[str, FrozenCandleFrame] = {}
+        for symbol in symbols:
+            frame = await self.decision_market_frame(
+                symbol, priority=priority, deadline_monotonic=deadline_monotonic
+            )
+            if frame is None or not frame.actionable:
+                continue
+            output[symbol] = FrozenCandleFrame(
+                symbol=symbol,
+                frame=frame.frame_1m,
+                source=MarketDataSource.FRAME_STORE.value,
+                captured_at_utc=captured,
+                # A close boundary can straddle the local clock; never expose
+                # it as input that became available after this capture.
+                max_input_availability_time_utc=min(
+                    frame.last_closed_at_utc,
+                    captured,
+                ),
+            )
+        return output
+
+    async def decision_market_frame(
+        self,
+        symbol: str,
+        *,
+        priority: Any = None,
+        deadline_monotonic: float | None = None,
+    ) -> DecisionMarketFrame | None:
+        """Resolve one decision frame: store first, bounded REST fallback."""
+        if self._frame_store is None or self._frame_store_mode is (
+            MarketFrameStoreMode.OFF
+        ):
+            return None
+        captured = _utc(self._clock())
+        frame = self._frame_store.peek_snapshot(symbol, captured)
+        if frame is not None and frame.actionable:
+            self._evidence.record("frame_store_hit", symbol=symbol)
+            return frame
+        if self._frame_store_mode is MarketFrameStoreMode.SHADOW:
+            self._evidence.record("frame_store_shadow_miss", symbol=symbol)
+            return frame
+        if frame is not None and frame.stale_reason in {
+            STALE_NO_TICKER, STALE_TICKER_STALE,
+        }:
+            window_start = captured - timedelta(minutes=1)
+            while self._ticker_rest_recent and self._ticker_rest_recent[0] <= window_start:
+                self._ticker_rest_recent.popleft()
+            if len(self._ticker_rest_recent) >= _MAX_TICKER_REST_FALLBACKS_PER_MINUTE:
+                self._evidence.record("frame_store_ticker_budget_skipped", symbol=symbol)
+                return frame
+            self._ticker_rest_recent.append(captured)
+            self._evidence.record("frame_store_ticker_fallback", symbol=symbol)
+            try:
+                response = await self.client.fetch_symbol_ticker_with_metadata(
+                    symbol, priority=priority, deadline_monotonic=deadline_monotonic
+                )
+                self._frame_store.observe_rest_ticker(
+                    symbol, response.data, server_time=response.server_time,
+                    captured=_utc(self._clock()),
+                )
+            except Exception as exc:  # noqa: BLE001 - stale data remains gated
+                LOGGER.warning(
+                    "frame store REST ticker fallback failed | symbol=%s error=%s",
+                    symbol, type(exc).__name__,
+                )
+            frame = self._frame_store.peek_snapshot(symbol, _utc(self._clock()))
+            if frame is not None and frame.actionable:
+                self._evidence.record("frame_store_ticker_recovered", symbol=symbol)
+                return frame
+            if frame is not None and frame.stale_reason in {
+                STALE_NO_TICKER, STALE_TICKER_STALE,
+            }:
+                self._evidence.record(
+                    "frame_store_incomplete", symbol=symbol, reason=frame.stale_reason
+                )
+                return frame
+        self._evidence.record("frame_store_fallback", symbol=symbol)
+        backfill_started_minute = captured.astimezone(UTC).replace(
+            second=0, microsecond=0
+        )
+        await self._single_flight_backfill(
+            symbol, priority=priority, deadline_monotonic=deadline_monotonic
+        )
+        captured = _utc(self._clock())
+        frame = self._frame_store.peek_snapshot(symbol, captured)
+        if (
+            frame is not None
+            and captured.astimezone(UTC).replace(second=0, microsecond=0)
+            != backfill_started_minute
+        ):
+            frame = replace(frame, stale_reason=STALE_MISSING_DECISION_CANDLE)
+            self._evidence.record(
+                "frame_store_backfill_crossed_decision_minute", symbol=symbol
+            )
+        if frame is None or not frame.actionable:
+            self._evidence.record(
+                "frame_store_incomplete",
+                symbol=symbol,
+                reason=frame.stale_reason if frame else "NO_FRAME",
+            )
+        return frame
+
+    def recheck_after_backfill(
+        self, symbol: str, *, backfill_started_at: datetime
+    ) -> DecisionMarketFrame | None:
+        """Re-evaluate a repaired frame against the causal minute gate."""
+        if self._frame_store is None:
+            return None
+        captured = _utc(self._clock())
+        frame = self._frame_store.peek_snapshot(symbol, captured)
+        if (
+            frame is not None
+            and captured.astimezone(UTC).replace(second=0, microsecond=0)
+            != _utc(backfill_started_at).replace(second=0, microsecond=0)
+        ):
+            frame = replace(frame, stale_reason=STALE_MISSING_DECISION_CANDLE)
+            self._evidence.record(
+                "frame_store_backfill_crossed_decision_minute", symbol=symbol
+            )
+        return frame
+
+    def _default_frame_priority(self) -> RequestPriority:
+        return request_class.get()
+
+    async def _single_flight_backfill(
+        self,
+        symbol: str,
+        *,
+        priority: Any,
+        deadline_monotonic: float | None,
+    ) -> bool:
+        assert self._frame_store is not None
+        effective_priority = self._default_frame_priority() if priority is None else priority
+        if not getattr(self._config, "market_frame_singleflight_enabled", True):
+            return await self._frame_store.backfill_missing(
+                self.client,
+                symbol,
+                priority=effective_priority,
+                deadline_monotonic=deadline_monotonic,
+            )
+        key = (symbol.upper(), effective_priority)
+        pending = self._frame_store_singleflight.get(key)
+        if pending is not None:
+            return await asyncio.shield(pending)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._frame_store_singleflight[key] = future
+        try:
+            result = await self._frame_store.backfill_missing(
+                self.client,
+                symbol,
+                priority=effective_priority,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception:  # noqa: BLE001 - callers observe stale status
+            result = False
+        if not future.done():
+            future.set_result(result)
+        self._frame_store_singleflight.pop(key, None)
+        return result
+
+    def _record_store_parity(
+        self, symbols: list[str], rest_frames: Mapping[str, pd.DataFrame], captured: datetime
+    ) -> None:
+        assert self._frame_store is not None
+        minute = _utc(captured).replace(second=0, microsecond=0)
+
+        def _closed_by_minute(frame: pd.DataFrame) -> dict[datetime, tuple[float, ...]]:
+            rows: dict[datetime, tuple[float, ...]] = {}
+            for _, row in frame.iterrows():
+                stamp = _utc(row["timestamp"]).replace(second=0, microsecond=0)
+                if stamp >= minute:
+                    continue  # the forming minute is excluded on both sides
+                rows[stamp] = tuple(
+                    float(row[name]) for name in ("open", "high", "low", "close", "volume")
+                )
+            return rows
+
+        for symbol in symbols:
+            frame = self._frame_store.peek_snapshot(symbol, captured)
+            rest = rest_frames.get(symbol)
+            if frame is None or rest is None or rest.empty or frame.frame_1m.empty:
+                self._evidence.record("frame_store_parity_missing", symbol=symbol)
+                continue
+            store_rows = _closed_by_minute(frame.frame_1m)
+            rest_rows = _closed_by_minute(rest)
+            common = set(store_rows) & set(rest_rows)
+            if len(common) < min(len(store_rows), len(rest_rows)) - 1:
+                self._evidence.record(
+                    "frame_store_parity_misaligned",
+                    symbol=symbol,
+                    store=len(store_rows),
+                    rest=len(rest_rows),
+                    common=len(common),
+                )
+                continue
+            mismatches: list[str] = []
+            for stamp in common:
+                for index, column in enumerate(("open", "high", "low", "close", "volume")):
+                    left, right = store_rows[stamp][index], rest_rows[stamp][index]
+                    if left != right and abs(left - right) > abs(left) * 1e-9:
+                        mismatches.append(column)
+            if mismatches:
+                self._evidence.record(
+                    "frame_store_parity_mismatch",
+                    symbol=symbol,
+                    fields=tuple(sorted(set(mismatches))),
+                )
+            else:
+                self._evidence.record("frame_store_parity_match", symbol=symbol)
 
     async def fetch_symbol_frames(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
         frames = await self.prefetch_historical_frames(symbols)
@@ -309,6 +686,16 @@ class CanonicalMarketDataProvider:
         include_liquidity: bool = True,
         derivatives: Mapping[str, Any] | None = None,
     ) -> DecisionMarketSnapshot | None:
+        store_frame: DecisionMarketFrame | None = None
+        if (
+            frame_1m is None
+            and self._frame_store is not None
+            and self._frame_store_mode is MarketFrameStoreMode.PREFERRED
+        ):
+            store_frame = await self.decision_market_frame(symbol)
+            if store_frame is None or not store_frame.actionable:
+                return None
+            frame_1m = store_frame.frame_1m
         if frame_1m is None:
             frames = await self.prefetch_historical_frames([symbol])
             frozen = frames.get(symbol)
@@ -316,40 +703,35 @@ class CanonicalMarketDataProvider:
                 return None
         else:
             frame_available = _utc(self._clock())
-            frozen = FrozenCandleFrame(symbol, frame_1m, "REST", frame_available, frame_available)
-        frame = frozen.frame
-        admission_failure = validate_closed_1m_frame(
-            frame, frozen.captured_at_utc,
-            max_age=timedelta(
-                seconds=max(120, self._config.scan_interval_sec * 2)
-            ),
-        )
-        if admission_failure is not None:
-            self._evidence.record(
-                "decision_snapshot_rejected", symbol=symbol, reason=admission_failure
+            # A store close boundary may be a few seconds ahead of the local
+            # clock; it is not future input, so freeze availability at capture.
+            max_input_availability_time = (
+                min(store_frame.last_closed_at_utc, frame_available)
+                if store_frame is not None
+                else frame_available
             )
-            return None
-        effective_price = price if price is not None else float(frame["close"].iloc[-1])
+            frozen = FrozenCandleFrame(
+                symbol,
+                frame_1m,
+                MarketDataSource.FRAME_STORE.value if store_frame is not None else "REST",
+                frame_available,
+                max_input_availability_time,
+            )
+        effective_price = price if price is not None else float(frozen.frame["close"].iloc[-1])
+        if (
+            derivatives is None
+            and self._frame_store is not None
+            and self._frame_store_mode is MarketFrameStoreMode.PREFERRED
+        ):
+            # PREFERRED mode: OI/funding always come from the decision frame
+            # store; the recurring REST derivatives fetch is removed from
+            # every live evaluation path (scan, fast monitor, P0 fallback).
+            derivatives = self._frame_store.derivatives_payload(symbol)
         resolved_derivatives = (
             deepcopy(dict(derivatives))
             if derivatives is not None
             else await self.fetch_optional_derivatives(symbol)
         )
-        if (
-            isinstance(resolved_derivatives.get("scan_failure"), Mapping)
-            or (
-                self._config.derivatives_enabled
-                and (
-                    not resolved_derivatives.get("open_interest")
-                    or not resolved_derivatives.get("funding")
-                )
-            )
-        ):
-            self._evidence.record(
-                "decision_snapshot_rejected",
-                symbol=symbol, reason="MARKET_DATA_INCOMPLETE",
-            )
-            return None
         liquidity = (
             await self.fetch_optional_liquidity(symbol, effective_price)
             if include_liquidity
@@ -598,13 +980,19 @@ class CanonicalMarketDataProvider:
         if self._hub is None:
             return None, "HUB_UNAVAILABLE"
         health = self._hub.get_health()
-        if health.state is not HealthStatus.HEALTHY:
+        if health.state not in (HealthStatus.HEALTHY, HealthStatus.RECONNECTING):
             return None, "HUB_NOT_HEALTHY"
         state = self._hub.get_subscription_state()
         topic = f"tickers.{symbol.upper()}"
+        if topic in state.failed_topics or topic in state.pending_topics:
+            return None, "HUB_UNACKNOWLEDGED"
         if topic not in state.acknowledged_topics:
             return None, "HUB_UNACKNOWLEDGED"
         value = self._hub.get_snapshot(symbol)
+        if health.state is HealthStatus.RECONNECTING:
+            available = getattr(self._hub, "is_shard_available", None)
+            if value is None or value.connection_epoch is None or available is None or not available(value.connection_epoch.shard_id):
+                return None, "HUB_NOT_HEALTHY"
         if value is None:
             return None, "HUB_MISSING"
         if value.connection_epoch is None:

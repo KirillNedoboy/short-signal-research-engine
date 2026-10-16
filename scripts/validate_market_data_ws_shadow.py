@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import AppConfig, load_config
-from app.infra.request_scheduler import RequestScheduler
+from app.infra.request_scheduler import RequestPriority, RequestScheduler, request_class
 from app.market.bybit_client import BybitClient
 from app.market.scanner import MarketScanner
 from app.market_data.hub import MarketDataHub
@@ -55,6 +55,7 @@ def build_report(
 
 
 async def observe(duration_sec: int) -> dict[str, Any]:
+    request_class.set(RequestPriority.RESEARCH)
     config: AppConfig = load_config()
     scheduler = RequestScheduler(
         max_concurrency=config.max_request_concurrency,

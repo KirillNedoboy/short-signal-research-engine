@@ -40,26 +40,32 @@ def test_repository_round_trip(tmp_path, make_event_state, make_signal_decision,
     assert outcome.price_after_4h == 99.0
 
 
-def test_repository_reads_immutable_shadow_attempt_window(tmp_path) -> None:
-    database = Database(f"sqlite:///{tmp_path / 'attempt.db'}")
+def test_fast_monitor_heartbeat_records_event_loop_lag_without_extra_rows(tmp_path) -> None:
+    from datetime import datetime, timezone
+
+    from sqlalchemy import func, select
+
+    from app.storage.db import Database
+    from app.storage.models import RuntimeHeartbeatHistoryModel
+    from app.storage.repository import BotRepository
+
+    database = Database(f"sqlite:///{tmp_path / 'lag-heartbeat.db'}")
     database.create_all()
     repository = BotRepository(database)
-    created = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
-    expires = created + timedelta(minutes=15)
-    assert repository.upsert_shadow_entry_attempt(
-        attempt_id="trapped_longs:attempt:ABCUSDT:root:r1",
-        root_event_id="trapped_longs:ABCUSDT:root",
-        observed_at=created,
-        local_retest_high=105.0,
-        breakdown_level=100.0,
-        attempt_state="RETEST_IN_PROGRESS",
-        confirmation_expires_at=expires,
-        event_revision=1,
-        max_attempts_per_root_event=1,
+    now = datetime.now(timezone.utc)
+    repository.update_fast_monitor_heartbeat(
+        checked_at=now,
+        pool_size=1,
+        poll_sequence=1,
+        event_loop_lag_ms=12.5,
     )
-    row = repository.get_shadow_entry_attempt(
-        attempt_id="trapped_longs:attempt:ABCUSDT:root:r1"
+    repository.update_fast_monitor_heartbeat(
+        checked_at=now,
+        pool_size=1,
+        poll_sequence=2,
     )
-    assert row is not None
-    assert row["attempt_created_at"] == created
-    assert row["confirmation_expires_at"] == expires
+    with database.session() as session:
+        rows = session.scalars(select(RuntimeHeartbeatHistoryModel)).all()
+    assert len(rows) == 2
+    assert rows[0].event_loop_lag_ms == 12.5
+    assert rows[1].event_loop_lag_ms is None

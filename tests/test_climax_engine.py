@@ -5,7 +5,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.signals.climax import _low_volume, evaluate_climax, evaluate_climax_bundle, evaluate_climax_shadow
+from app.signals.climax import (
+    _low_volume,
+    climax_branch_attempt_id,
+    climax_branch_candidate_id,
+    evaluate_climax,
+    evaluate_climax_bundle,
+    evaluate_climax_shadow,
+)
 
 
 def _config(**overrides):
@@ -278,6 +285,72 @@ def test_bundle_selected_evaluation_preserves_legacy_result(make_features, make_
     assert bundle.selected.veto_reasons == legacy.veto_reasons
 
 
+def test_bundle_evaluates_both_branches_from_one_snapshot(make_features, make_event_state, make_frame):
+    state, features, frame = _ready_low_volume_inputs(
+        make_features,
+        make_event_state,
+        make_frame,
+        ret_5m=10.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=-4.0,
+    )
+
+    bundle = evaluate_climax_bundle(state, features, frame, _config())
+    volume = bundle.branch_evaluations["VOLUME_CLIMAX_UNWIND"]
+    low_volume = bundle.branch_evaluations["LOW_VOLUME_EXTENSION_FAILURE"]
+
+    assert volume.actionable
+    assert low_volume.actionable
+    for field in ("event_high", "price_change_5m", "price_change_15m", "current_close"):
+        assert volume.metadata[field] == low_volume.metadata[field]
+
+
+def test_volume_branch_blocker_does_not_change_low_volume_branch(
+    make_features, make_event_state, make_frame
+):
+    state, features, frame = _ready_low_volume_inputs(
+        make_features,
+        make_event_state,
+        make_frame,
+        ret_5m=10.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=None,
+        derivatives_status="MISSING",
+    )
+
+    bundle = evaluate_climax_bundle(state, features, frame, _config())
+
+    assert "oi_missing_for_volume_climax" in bundle.branch_evaluations["VOLUME_CLIMAX_UNWIND"].veto_reasons
+    low_volume = bundle.branch_evaluations["LOW_VOLUME_EXTENSION_FAILURE"]
+    assert low_volume.actionable
+    assert "oi_missing_for_volume_climax" not in low_volume.veto_reasons
+
+
+def test_low_volume_branch_blocker_does_not_change_volume_branch(
+    make_features, make_event_state, make_frame
+):
+    state, features, frame = _ready_low_volume_inputs(
+        make_features,
+        make_event_state,
+        make_frame,
+        frame_prices=[110.0, 111.0, 112.0, 113.0, 114.0, 115.0, 115.0, 115.0, 115.0, 115.0, 115.0],
+        ret_5m=10.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=-4.0,
+    )
+
+    bundle = evaluate_climax_bundle(state, features, frame, _config())
+
+    low_volume = bundle.branch_evaluations["LOW_VOLUME_EXTENSION_FAILURE"]
+    volume = bundle.branch_evaluations["VOLUME_CLIMAX_UNWIND"]
+    assert "close_not_below_breakout_reference" in low_volume.veto_reasons
+    assert volume.actionable
+    assert "close_not_below_breakout_reference" not in volume.veto_reasons
+
+
 def test_low_score_volume_observation_is_retained(make_features, make_event_state, make_frame):
     state = make_event_state(event_features_snapshot={"previous_leg_volume": 1000.0})
     features = make_features(
@@ -398,3 +471,16 @@ def test_low_volume_confirmed_second_leg_is_veto(make_features, make_event_state
     result = evaluate_climax(state, features, make_frame([100 + i * 0.1 for i in range(30)]), _config(volume_climax_unwind_enabled=False))
     assert not result.actionable
     assert "second_leg_volume_confirmed" in result.veto_reasons or "oi_accelerating_up" in result.veto_reasons
+
+
+def test_climax_branch_ids_are_isolated_and_revision_stable():
+    root = "root-123"
+    volume_candidate = climax_branch_candidate_id(root, "VOLUME_CLIMAX_UNWIND", 1)
+    low_candidate = climax_branch_candidate_id(root, "LOW_VOLUME_EXTENSION_FAILURE", 1)
+    assert volume_candidate == "root-123:VOLUME_CLIMAX_UNWIND:r1"
+    assert low_candidate == "root-123:LOW_VOLUME_EXTENSION_FAILURE:r1"
+    assert volume_candidate != low_candidate
+    assert climax_branch_attempt_id(root, "VOLUME_CLIMAX_UNWIND", 1) == (
+        "root-123:VOLUME_CLIMAX_UNWIND:r1:a1"
+    )
+    assert climax_branch_candidate_id(root, "VOLUME_CLIMAX_UNWIND", 2) != volume_candidate

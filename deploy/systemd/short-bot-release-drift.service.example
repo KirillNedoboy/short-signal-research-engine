@@ -1,0 +1,12 @@
+[Unit]
+Description=Short Bot release drift check (read-only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=@ADMIN_ROOT@/tools/release_drift_alarm.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=@ADMIN_ROOT@ @LANE_A_ROOT@ @LANE_B_ROOT@ @LANE_C_ROOT@

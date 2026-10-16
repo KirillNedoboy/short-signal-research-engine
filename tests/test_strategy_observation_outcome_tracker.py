@@ -13,13 +13,13 @@ class _Client:
         self.raw_klines = raw_klines
         self.calls = []
 
-    async def fetch_klines(self, symbol, interval, *, limit, start_ms, end_ms):
+    async def fetch_klines(self, symbol, interval, *, limit, start_ms, end_ms, **_kwargs):
         self.calls.append((symbol, interval, start_ms, end_ms))
         return self.raw_klines
 
 
 class _WindowedClient(_Client):
-    async def fetch_klines(self, symbol, interval, *, limit, start_ms, end_ms):
+    async def fetch_klines(self, symbol, interval, *, limit, start_ms, end_ms, **_kwargs):
         self.calls.append((symbol, interval, start_ms, end_ms))
         return [row for row in self.raw_klines if start_ms <= int(row[0]) <= end_ms]
 
@@ -28,13 +28,21 @@ class _Repository:
     def __init__(self, rows):
         self.rows = rows
         self.updated = []
+        self.transitions = []
 
-    def list_signals_missing_outcomes(self, *, now):
+    def list_signals_missing_outcomes(self, *, now, limit=25):
         return []
+
+    def recover_outcome_fetch(self, task_key):
+        return False
 
     def list_strategy_observations_due_outcomes(self, *, limit, now=None, exclude_observation_ids=()):
         excluded = set(exclude_observation_ids)
         return [row for row in self.rows if row["observation_id"] not in excluded][:limit]
+
+    def transition_strategy_candidate(self, *, candidate_id, state, observed_at, reason):
+        self.transitions.append((candidate_id, state, reason))
+        return True
 
     def update_strategy_observation_outcome(self, observation_id, outcome, *, updated_at, next_attempt_at=None):
         self.updated.append((observation_id, outcome, updated_at))
@@ -54,6 +62,7 @@ def test_outcome_tracker_updates_strategy_observations_without_signal_side_effec
         [
             {
                 "observation_id": "obs-1",
+                "candidate_id": "candidate-1",
                 "symbol": "TESTUSDT",
                 "observed_at": start,
                 "market_price": 100.0,
@@ -68,6 +77,31 @@ def test_outcome_tracker_updates_strategy_observations_without_signal_side_effec
     assert len(client.calls) == 1
     assert repository.updated[0][0] == "obs-1"
     assert repository.updated[0][1]["data_status"] == "complete"
+    assert repository.transitions == [("candidate-1", "COMPLETE", "OUTCOME_COMPLETE")]
+
+
+def test_outcome_tracker_closes_v2_candidate_only_after_complete_outcome(make_frame) -> None:
+    start = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+    frame = make_frame([100.0] * 16, start=start)
+    raw = [
+        [str(int(row["start_ms"])), str(row["open"]), str(row["high"]), str(row["low"]), str(row["close"]), str(row["volume"]), str(row["turnover"])]
+        for _, row in frame.iterrows()
+    ]
+    repository = _Repository([
+        {
+            "observation_id": "obs-v2",
+            "candidate_id": "candidate-1",
+            "attempt_id": "candidate-1:a1",
+            "symbol": "TESTUSDT",
+            "observed_at": start,
+            "market_price": 100.0,
+            "event_high": 110.0,
+        }
+    ])
+
+    asyncio.run(OutcomeTracker(_Client(raw), repository).update_due_outcomes(now=start.replace(hour=13)))
+
+    assert repository.transitions == [("candidate-1", "COMPLETE", "OUTCOME_COMPLETE")]
 
 
 def test_outcome_tracker_fetches_the_closed_candle_after_fractional_15m_target(make_frame) -> None:
@@ -117,7 +151,11 @@ def test_outcome_tracker_processes_multiple_bounded_batches(make_frame) -> None:
         ]
     )
 
-    updated = asyncio.run(OutcomeTracker(_Client(raw), repository).update_due_outcomes(now=start + timedelta(hours=1)))
+    updated = asyncio.run(
+        OutcomeTracker(_Client(raw), repository).update_due_outcomes(
+            now=start + timedelta(hours=1), observation_limit=30
+        )
+    )
 
     assert updated == 30
     assert repository.rows == []

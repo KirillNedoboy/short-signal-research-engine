@@ -22,7 +22,7 @@ class FakeClient:
         self.frame = frame
         self.calls: list[tuple[str, str, int, int, int]] = []
 
-    async def fetch_klines(self, symbol, interval, limit, start_ms, end_ms):
+    async def fetch_klines(self, symbol, interval, limit, start_ms, end_ms, **_kwargs):
         self.calls.append((symbol, interval, limit, start_ms, end_ms))
         return self.frame.to_dict("records")
 

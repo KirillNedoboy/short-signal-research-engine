@@ -1,0 +1,56 @@
+# Copy this file to config.toml on the collector host and set only paths.
+# There are no exchange or Telegram credentials in this service.
+
+[collector]
+max_active_symbols = 10
+signal_poll_sec = 5.0
+# Only deliveries after this process starts and no older than this TTL can
+# create a collecting event.
+candidate_freshness_sec = 900
+feature_interval_sec = 1.0
+merge_window_sec = 600
+outcome_horizon_sec = [900, 3600, 14400]
+outcome_grace_sec = 90
+report_interval_sec = 3600
+reconnect_initial_sec = 1.0
+reconnect_max_sec = 30.0
+
+[[collector.lanes]]
+name = "A"
+db_path = "@LANE_A_DB@"
+service_name = "short-telegram-bot-lite.service"
+# Optional explicit override. The service working directory is resolved when
+# this is omitted.
+# config_path = "@ACTIVE_CONFIG@"
+
+[[collector.lanes]]
+name = "B"
+db_path = "@LANE_B_DB@"
+service_name = "short-telegram-bot-lite-b.service"
+
+[[collector.lanes]]
+name = "C"
+db_path = "@LANE_C_DB@"
+service_name = "short-telegram-bot-lite-c.service"
+
+[collector.storage]
+db_path = "@COLLECTOR_DATA@/research-collector.sqlite3"
+max_bytes = 5368709120
+reserve_free_bytes = 10737418240
+raw_retention_sec = 900
+raw_max_rows = 2000000
+prune_interval_sec = 30.0
+
+[collector.bybit]
+linear_ws_url = "wss://stream.bybit.com/v5/public/linear"
+spot_ws_url = "wss://stream.bybit.com/v5/public/spot"
+rest_url = "https://api.bybit.com"
+orderbook_depth = 50
+stale_after_sec = 5.0
+rest_poll_sec = 60.0
+
+[collector.binance]
+ws_url = "wss://stream.binance.com:9443/stream"
+rest_url = "https://api.binance.com"
+depth_levels = 20
+stale_after_sec = 5.0

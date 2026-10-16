@@ -11,6 +11,8 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.infra.runtime_timing import storage_scope
+
 DEFAULT_SQLITE_JOURNAL_MODE = "WAL"
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5_000
 
@@ -54,15 +56,18 @@ class Database:
 
     @contextmanager
     def session(self) -> Iterator[Session]:
-        session = self.session_factory()
-        try:
-            yield session
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+        # Attribute the scope to the cycle timing carried by the current task;
+        # worker and monitor tasks hold no timing token and measure nothing.
+        with storage_scope():
+            session = self.session_factory()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
 
     def get_sqlite_pragmas(self) -> dict[str, int | str] | None:
         """Return the effective SQLite pragma values for the current engine."""

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 BYBIT_PUBLIC_LINEAR_ENDPOINT = "wss://stream.bybit.com/v5/public/linear"
-DEFAULT_MAX_QUEUE = 128
+DEFAULT_MAX_QUEUE = 1_024
 
 
 async def connect_public_linear(

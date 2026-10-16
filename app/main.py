@@ -9,8 +9,9 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Self, cast
 
@@ -18,14 +19,19 @@ import pandas as pd
 
 from app.baseline.lifecycle import BaselineLifecycle
 from app.config import AppConfig, load_config
+from app.promotions import validate_promotion_registry
+from app.early_drop_warning import (
+    EarlyDropSnapshot,
+    evaluate_early_drop_warning,
+    format_early_drop_warning,
+)
 from app.domain import (
     EventState,
     EventStatus,
-    CandidateEvaluation,
+    MarketSnapshot,
     SignalDecision,
     SignalProvenanceInput,
     SignalType,
-    ShortZone,
     SymbolFeatures,
 )
 from app.events.pullback_tracker import PullbackTracker
@@ -42,14 +48,42 @@ from app.infra.disk_capacity import (
     read_capacity,
 )
 from app.infra.health import ServiceHealth
-from app.infra.request_scheduler import RequestScheduler
+from app.infra.request_scheduler import (
+    RequestDeadlineExceeded,
+    RequestPriority,
+    RequestScheduler,
+    request_class,
+)
 from app.infra.runtime_metadata import resolve_code_version
-from app.logger import configure_logging, safe_exception_summary
+from app.infra.provider_errors import RateLimitPolicy
+from app.outcomes.fetch import OutcomeCandleFetcher
+from app.infra.runtime_timing import (
+    METRIC_KEYS,
+    CycleTiming,
+    EventLoopLagMonitor,
+    attach_cycle_timing,
+    build_evidence_document,
+    detach_cycle_timing,
+    measure,
+    measure_sync,
+    publish_evidence,
+)
+from app.logger import configure_logging
 from app.market.bybit_client import BybitClient
-from app.market.coverage import normalize_scan_failure, select_rotation_batch
+from app.market.coverage import select_rotation_batch
 from app.market.scanner import MarketScanner
 from app.market_data.provider import CanonicalMarketDataProvider
+from app.market_data.repair_queue import RepairQueue, RecoveryBudget
 from app.market_data.provider import ComparisonClassification
+from app.market_data.store import (
+    STALE_CANDLE_STALE,
+    STALE_EPOCH_INVALIDATED,
+    STALE_NO_TICKER,
+    STALE_OI_HISTORY,
+    STALE_TICKER_STALE,
+    STALE_WAITING_FOR_WS,
+)
+from app.market_data.validation import MarketDataQuality, MarketDataValidator
 from app.market_data.evidence import ProviderEvidencePublisher
 from app.research.spool import ResearchSpool
 from app.research.storage_health import ResearchStorageHealthPublisher
@@ -57,6 +91,13 @@ from app.research.storage_router import ResearchStorageRouter
 from app.notifications.telegram import TelegramNotifier
 from app.notifications.throttling import ErrorThrottler
 from app.observability.outcome_scheduler import ShadowOutcomeScheduler
+from app.observability.causal_pump_v2 import (
+    CausalPumpV2Comparator,
+    CausalPumpV2Config,
+    CausalPumpV2Detector,
+    CausalPumpV2Tracker,
+    CausalV2RootDecision,
+)
 from app.observability.root_detector_shadow import (
     ShadowCandidateInput,
     should_create_shadow_candidate,
@@ -79,16 +120,37 @@ from app.outcomes.tracker import OutcomeTracker
 from app.replay.config import strategy_config_fingerprint
 from app.replay.canonical import sha256_canonical
 from app.replay.market import CandleObservationKind, NormalizedMarketObservation
+from app.runtime.delivery_worker import DeliveryWorker
+from app.runtime.outcome_worker import OutcomeWorker
+from app.runtime.research_queue import ResearchQueue
+from app.runtime.scheduling import next_scan_deadline
+from app.runtime.shutdown_checkpoint import ShutdownCheckpointBarrier
+from app.runtime.scan_coordinator import (
+    ScanCoordinator,
+    ScanTask,
+    ScanTerminalStatus,
+)
 from app.runtime.symbol_mutation import SymbolMutationCoordinator
+from app.runtime.warmup import WarmupCoverage
 from app.signals.climax import (
     ClimaxEvaluation,
     ClimaxEvaluationBundle,
     advance_volume_climax_lifecycle,
+    climax_branch_attempt_id,
+    climax_branch_candidate_id,
     evaluate_climax_bundle,
     evaluate_climax_shadow,
     volume_climax_attempt_id,
 )
 from app.signals.delivery_policy import live_delivery_enabled
+from app.signals.low_volume_v2 import LowVolumeV2State
+from app.signals.trapped_longs_v2 import (
+    FrozenBreakout,
+    OiObservation,
+    TRAPPED_LONGS_REVERSAL_V2,
+    TRAPPED_LONGS_V2_MODEL_VERSION,
+    evaluate_trapped_longs_reversal_v2,
+)
 from app.signals.trapped_longs import (
     TRAPPED_LONGS_MODEL_VERSION,
     TRAPPED_LONGS_REVERSAL,
@@ -101,16 +163,19 @@ from app.signals.engine import SignalEngine
 from app.signals.formatter import format_signal_message
 from app.storage.db import Database
 from app.storage.repository import BotRepository
-from app.strategies.baseline import BaselineAdapter
-from app.strategies.climax import (
-    ClimaxAdapter,
-    LowVolumeExtensionFailureAdapter,
-    VolumeClimaxUnwindAdapter,
-)
-from app.strategies.contracts import StrategyContext, StrategyEvaluation, StrategyEvaluationError
-from app.strategies.registry import StrategyRegistry
-from app.strategies.trapped_longs import TrappedLongsAdapter
 
+
+
+FRAME_STORE_WARMUP_ATTEMPT_TIMEOUT_SEC = 90.0
+FRAME_STORE_WARMUP_RETRY_BACKOFF_SEC = 1.0
+_FRAME_STORE_WS_WAITING_REASONS = frozenset({
+    STALE_CANDLE_STALE,
+    STALE_EPOCH_INVALIDATED,
+    STALE_NO_TICKER,
+    STALE_OI_HISTORY,
+    STALE_TICKER_STALE,
+    STALE_WAITING_FOR_WS,
+})
 
 def _attach_market_data_observer(hub: object, observer: object) -> None:
     """Attach continuity to injected Hub implementations without widening their API."""
@@ -129,15 +194,64 @@ def _attach_market_data_observer(hub: object, observer: object) -> None:
         return
 
 
+def _actionable_canonical_symbols(
+    store: object,
+    symbols: tuple[str, ...] | list[str],
+    decision_at: datetime,
+    *,
+    diagnostics: dict | None = None,
+    continuity_blocked: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Return only symbols with an existing actionable canonical frame."""
+    peek = getattr(store, "peek_snapshot", None)
+    if diagnostics is not None:
+        diagnostics.update(original_top100=len(symbols), ready=0, reasons={})
+    if not callable(peek):
+        if diagnostics is not None:
+            unique = len({str(s).upper() for s in symbols})
+            diagnostics["reasons"]["NO_FRAME"] = unique
+            if len(symbols) != unique:
+                diagnostics["reasons"]["DUPLICATE"] = len(symbols) - unique
+        return ()
+    ready: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol).upper()
+        if symbol in seen:
+            if diagnostics is not None:
+                reasons = diagnostics["reasons"]
+                reasons["DUPLICATE"] = reasons.get("DUPLICATE", 0) + 1
+            continue
+        seen.add(symbol)
+        frame = peek(symbol, decision_at)
+        if frame is not None and frame.actionable:
+            ready.append(symbol)
+        elif diagnostics is not None:
+            reason = "NO_FRAME" if frame is None else (getattr(frame, "stale_reason", None) or "NON_ACTIONABLE")
+            reasons = diagnostics["reasons"]
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if reason in {"CONTINUITY_UNHEALTHY", "INCOMPLETE_RING", "MISSING_DECISION_CANDLE", "CANDLE_STALE"} and continuity_blocked is not None:
+                continuity_blocked.append(symbol)
+    if diagnostics is not None:
+        diagnostics["ready"] = len(ready)
+    return tuple(ready)
+
+
 def _provenance_anomaly(decision: SignalDecision) -> str | None:
     """Validate the decision-time snapshot without vetoing live delivery."""
     if decision.strategy_subtype not in {
         "VOLUME_CLIMAX_UNWIND",
         "LOW_VOLUME_EXTENSION_FAILURE",
+        "LOW_VOLUME_EXTENSION_FAILURE_V2",
         "TRAPPED_LONGS_REVERSAL",
     }:
         return None
-    high = decision.strategy_metadata.get("event_high")
+    high_key = (
+        "current_anchor_high"
+        if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2"
+        else "event_high"
+    )
+    high = decision.strategy_metadata.get(high_key)
     if (
         high is None
         or decision.market_price <= 0
@@ -259,6 +373,22 @@ def _decision_fingerprint(decision: SignalDecision | None) -> str:
     )
 
 
+def _causal_pump_v2_config(config: AppConfig) -> CausalPumpV2Config:
+    """Build V2 thresholds from the existing event and pullback contract."""
+    return CausalPumpV2Config(
+        pump_min_ret_5m=config.event_ret_15m_min,
+        pump_min_ret_15m=config.event_ret_15m_min,
+        pump_min_ret_1h=config.event_ret_1h_min,
+        pump_min_ret_4h=config.event_ret_4h_min,
+        drawup_lookback_candles=config.causal_pump_v2_lookback_candles,
+        pullback_min_pct=config.pullback_min_pct,
+        pullback_max_pct=config.pullback_max_pct,
+        zone_fraction_of_range_low=config.short_zone_range_low_pct,
+        zone_fraction_of_range_high=config.short_zone_range_high_pct,
+        expiry_minutes=config.causal_pump_v2_expiry_minutes,
+    )
+
+
 @dataclass(slots=True)
 class _ClimaxCandidate:
     symbol: str
@@ -288,8 +418,11 @@ class ShortSignalBot:
         self._config_fingerprint = _public_config_fingerprint(config)
         self._strategy_config_hash = _strategy_config_fingerprint(config)
         self._logger = logging.getLogger(self.__class__.__name__)
-        self._watch_sent_in_cycle = 0
+        self._watch_enqueued_in_cycle = 0
+        self._cycle_sequence = 0
+        self._lag_monitor: EventLoopLagMonitor | None = None
         self._active_climax_pool: dict[tuple[str, str], _ClimaxCandidate] = {}
+        self._low_volume_v2_episodes: dict[tuple[str, int], LowVolumeV2State] = {}
         self._fast_monitor_cursor = 0
         self._fast_monitor_poll_sequence = 0
         self._fast_monitor_task: asyncio.Task[None] | None = None
@@ -298,8 +431,42 @@ class ShortSignalBot:
         self._symbol_mutations = SymbolMutationCoordinator(self._logger)
         self._lifecycle = "STARTING"
         self._ready = False
+        self._warmup_coverage = WarmupCoverage()
+        self._shutdown_checkpoint_barrier = ShutdownCheckpointBarrier(
+            checkpoint=self._checkpoint_for_shutdown
+        )
+        self._last_shutdown_checkpoint_ack = None
         self._startup_cleanup_required = False
         self._market_data_gap_tracker: object | None = None
+        self._request_scheduler: RequestScheduler | None = None
+        self._market_frame_store: object | None = None
+        self._scan_coordinator: ScanCoordinator | None = None
+        self._scan_consumers: list[asyncio.Task[None]] = []
+        self._outcome_worker: OutcomeWorker | None = None
+        self._research_queue: ResearchQueue | None = None
+        self._universe_refreshed_at_monotonic = 0.0
+        self._event_universe_snapshots: list[MarketSnapshot] = []
+        self._event_eligible_symbols: tuple[str, ...] = ()
+        self._window_records: dict[str, dict[str, Any]] = {}
+        self._window_decision_counts: dict[str, int] = {}
+        self._scan_busy_ns_total = 0
+        self._last_window_busy_ratio = 0.0
+        self._frame_store_last_checkpoint_monotonic = 0.0
+        self._frame_store_warm_pending: set[str] = set()
+        self._frame_store_warm_waiting_ws: set[str] = set()
+        self._frame_store_warm_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._continuity_repair_queue = RepairQueue()
+        # Startup recovery may use measured spare capacity faster than the
+        # steady-state lane.  Any provider pressure contracts it to 8/min.
+        self._continuity_repair_budget = RecoveryBudget(bootstrap_limit=16)
+        self._continuity_repair_metrics: Counter[str] = Counter()
+        self._continuity_repair_ready: set[str] = set()
+        self._continuity_repair_epochs: dict[str, object] = {}
+        self._continuity_repair_task: asyncio.Task[None] | None = None
+        self._continuity_repair_inflight: str | None = None
+        self._continuity_repair_last_attempt: dict[str, float] = {}
+        self._continuity_repair_request_times: list[float] = []
+        self._last_data_gate_reasons: dict[str, str] = {}
         provider_mode_enabled = str(config.canonical_market_data_provider_mode) != "REST_ONLY"
         if provider_mode_enabled:
             from app.market_data.continuity import GapTracker
@@ -382,7 +549,11 @@ class ShortSignalBot:
                     min_delay_ms=config.request_min_delay_ms,
                     jitter_min_ms=config.request_jitter_min_ms,
                     jitter_max_ms=config.request_jitter_max_ms,
+                    outcome_max_concurrency=config.outcome_max_concurrency,
+                    background_max_requests_per_minute=config.background_max_requests_per_minute,
+                    rate_limit_policy=RateLimitPolicy.from_config(config),
                 )
+                self._request_scheduler = scheduler
                 client = BybitClient(
                     scheduler=scheduler,
                     timeout=config.request_timeout_sec,
@@ -421,9 +592,14 @@ class ShortSignalBot:
         # source selection has exactly one owner.
         self._scanner = self._market_data_provider
         self._client = self._market_data_provider
+        self._market_frame_store = getattr(
+            self._market_data_provider, "frame_store", None
+        )
+        self._outcome_fetcher = OutcomeCandleFetcher(self._client, repository, config)
         self._shadow_outcome_scheduler = ShadowOutcomeScheduler(
             client=self._client,
             repository=self._repository,
+            fetcher=self._outcome_fetcher,
             runtime_batch_size=config.shadow_outcome_runtime_batch_size,
             legacy_batch_size=config.shadow_outcome_legacy_batch_size,
             data_gap_retry_minutes=config.shadow_outcome_data_gap_retry_minutes,
@@ -455,11 +631,15 @@ class ShortSignalBot:
             zone_builder=self._zone_builder,
         )
         self._signal_engine = SignalEngine(config)
-        # Adapters are pure and frame-bound, so build the complete registry at
-        # the validated evaluation seam rather than mutating runtime state.
-        self._strategy_registry: StrategyRegistry | None = None
-        self._outcome_tracker = OutcomeTracker(self._market_data_provider, repository)
+        self._outcome_tracker = OutcomeTracker(self._market_data_provider, repository, fetcher=self._outcome_fetcher)
         self._error_throttler = ErrorThrottler(config.error_alert_ttl_sec)
+        self._delivery_worker = DeliveryWorker(
+            self._repository,
+            self._notifier,
+            self._error_throttler,
+            send_watch_to_telegram=config.send_watch_to_telegram,
+            send_early_drop_warning_to_telegram=config.early_drop_warning_send_to_telegram,
+        )
         self._storage_incident = StorageIncidentTracker(
             cooldown_seconds=config.disk_alert_cooldown_sec
         )
@@ -470,135 +650,6 @@ class ShortSignalBot:
             self._logger.warning(
                 "Derivatives confirmation unavailable; derivatives_enabled=false."
             )
-
-    def _evaluate_registered_strategies(
-        self,
-        *,
-        state: EventState,
-        features: SymbolFeatures,
-        frame_1m: pd.DataFrame,
-        short_zone: object | None,
-        decision_timestamp: datetime,
-        trapped_attempt_created_at: datetime | None = None,
-        trapped_confirmation_expires_at: datetime | None = None,
-    ) -> tuple[StrategyEvaluation, ...]:
-        """Run every canonical adapter after validated market data is built."""
-        # Characterization harnesses may inject pre-built legacy features that
-        # lack the canonical market timestamp; keep that compatibility seam
-        # fail-closed without bypassing validated production evaluations.
-        if features.market_asof is None:
-            self._strategy_registry = None
-            return ()
-        try:
-            context = StrategyContext(
-                symbol=features.symbol,
-                event_id=state.event_id,
-                event_state=state,
-                features=features,
-                short_zone=short_zone if isinstance(short_zone, ShortZone) else None,
-                decision_timestamp=decision_timestamp,
-                strategy_config_fingerprint=self._strategy_config_hash,
-                input_quality="VALID",
-            )
-        except StrategyEvaluationError:
-            self._strategy_registry = None
-            return ()
-        self._strategy_registry = StrategyRegistry(
-            [
-                BaselineAdapter(self._config),
-                ClimaxAdapter(self._config, frame_1m),
-                VolumeClimaxUnwindAdapter(self._config, frame_1m),
-                LowVolumeExtensionFailureAdapter(self._config, frame_1m),
-                TrappedLongsAdapter(
-                    self._config,
-                    frame_1m,
-                    attempt_created_at=trapped_attempt_created_at,
-                    confirmation_expires_at=trapped_confirmation_expires_at,
-                ),
-            ]
-        )
-        return self._strategy_registry.evaluate_all(context)
-
-    @staticmethod
-    def _registered_evaluation(
-        evaluations: tuple[StrategyEvaluation, ...], strategy_type: str
-    ) -> StrategyEvaluation | None:
-        """Select one canonical evaluation without changing runtime priority."""
-        return next(
-            (evaluation for evaluation in evaluations if evaluation.strategy_type == strategy_type),
-            None,
-        )
-
-    @staticmethod
-    def _decision_from_registered_evaluation(
-        decision: SignalDecision, evaluation: StrategyEvaluation
-    ) -> SignalDecision:
-        """Project canonical registry fields onto the established decision shape."""
-        return replace(
-            decision,
-            grade=evaluation.grade,
-            score=evaluation.score,
-            reasons=list(evaluation.reasons),
-            blockers=list(evaluation.blockers),
-            risk_flags=list(evaluation.risk_flags),
-            strategy_type=evaluation.strategy_type,
-            strategy_subtype=evaluation.strategy_subtype,
-            model_version=evaluation.model_version or "baseline-v1",
-            actionable=evaluation.actionable,
-            strategy_metadata=dict(evaluation.strategy_metadata),
-        )
-
-    @staticmethod
-    def _new_decision_from_registered_evaluation(
-        *,
-        state: EventState,
-        features: SymbolFeatures,
-        zone: ShortZone,
-        signal_time: datetime,
-        evaluation: StrategyEvaluation,
-    ) -> SignalDecision:
-        """Build the established baseline decision shape from canonical data."""
-        return SignalDecision(
-            symbol=features.symbol,
-            event_id=state.event_id,
-            signal_type=(
-                SignalType.WATCH
-                if evaluation.strategy_metadata.get("signal_type") == SignalType.WATCH.value
-                else SignalType.CONFIRM
-            ),
-            grade=evaluation.grade,
-            score=evaluation.score,
-            market_price=features.price,
-            short_zone_low=zone.low,
-            short_zone_high=zone.high,
-            signal_time=signal_time,
-            reasons=list(evaluation.reasons),
-            risk_flags=list(evaluation.risk_flags),
-            features_snapshot=asdict(features),
-            score_breakdown={"registry_score": float(evaluation.score)},
-            decision_type="SIGNAL",
-            actionable=evaluation.actionable,
-            lifecycle_state=state.state.value,
-            blockers=list(evaluation.blockers),
-            strategy_type=evaluation.strategy_type,
-            strategy_subtype=evaluation.strategy_subtype,
-            model_version=evaluation.model_version or "baseline-v1",
-            strategy_metadata=dict(evaluation.strategy_metadata),
-        )
-
-    @staticmethod
-    def _climax_evaluation_from_registry(
-        evaluation: StrategyEvaluation,
-    ) -> ClimaxEvaluation:
-        """Keep existing climax lifecycle consumers on canonical values."""
-        return ClimaxEvaluation(
-            evaluation.strategy_subtype,
-            evaluation.score,
-            evaluation.grade,
-            dict(evaluation.strategy_metadata),
-            list(evaluation.vetoes),
-            list(evaluation.risk_flags),
-        )
 
     async def _start_market_data_shadow(self) -> None:
         """Start the optional WS shadow without making it a readiness dependency."""
@@ -623,6 +674,89 @@ class ShortSignalBot:
             result = hub.stop()
             if inspect.isawaitable(result):
                 await result
+
+    def _install_shutdown_checkpoint_barrier(self) -> None:
+        if getattr(self._market_data_provider, "frame_store", None) is None:
+            return
+        try:
+            self._shutdown_checkpoint_barrier.install()
+        except (NotImplementedError, RuntimeError, ValueError) as exc:
+            self._logger.info(
+                "SIGUSR1 checkpoint barrier unavailable | error=%s",
+                type(exc).__name__,
+            )
+
+    async def _checkpoint_for_shutdown(self, *, generation: int, pid: int) -> int | None:
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        checkpoint = getattr(provider, "checkpoint_frame_store", None)
+        if store is None or checkpoint is None:
+            return None
+        written = await checkpoint(
+            generation=generation,
+            metadata={"pid": int(pid), "reason": "SIGUSR1_SHUTDOWN"},
+        )
+        if written is None:
+            return None
+        if int(getattr(store, "checkpoint_generation", 0)) != int(generation):
+            raise RuntimeError("checkpoint generation acknowledgement mismatch")
+        return int(written)
+
+    async def _request_shutdown_checkpoint(self) -> None:
+        if not self._shutdown_checkpoint_barrier.installed:
+            return
+        try:
+            ack = await self._shutdown_checkpoint_barrier.request(timeout_sec=10.0)
+        except (asyncio.TimeoutError, RuntimeError, OSError) as exc:
+            self._logger.warning(
+                "SIGUSR1 shutdown checkpoint failed | error=%s",
+                type(exc).__name__,
+            )
+            return
+        self._last_shutdown_checkpoint_ack = ack
+        self._logger.info(
+            "SIGUSR1 shutdown checkpoint acknowledged | generation=%s pid=%s symbols=%s",
+            ack.generation,
+            ack.pid,
+            ack.symbols,
+        )
+
+    async def _frame_store_cycle_maintenance(self) -> None:
+        """Checkpoint complete rings and surface SHADOW parity evidence.
+
+        Runs on every legacy cycle when a frame store exists, so canary-1
+        acceptance (ten completed scans at full store parity) is observable
+        without the event-driven window loop.
+        """
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        if store is None:
+            return
+        loop = asyncio.get_running_loop()
+        checkpoint = getattr(provider, "checkpoint_frame_store", None)
+        if (
+            checkpoint is not None
+            and loop.time() - self._frame_store_last_checkpoint_monotonic
+            >= self._config.market_frame_checkpoint_sec
+        ):
+            self._frame_store_last_checkpoint_monotonic = loop.time()
+            written = await checkpoint()
+            if written is not None:
+                self._logger.info("Frame store checkpoint | symbols=%s", written)
+        if str(self._config.market_frame_store_mode) != "SHADOW":
+            return
+        counters = provider.evidence_snapshot().get("counters", {})
+        completeness = store.completeness_counts()
+        self._logger.info(
+            "Frame store shadow parity | actionable=%s/%s match=%s mismatch=%s"
+            " missing=%s warmup=%s",
+            completeness["complete"],
+            completeness["symbols"],
+            counters.get("frame_store_parity_match", 0),
+            counters.get("frame_store_parity_mismatch", 0),
+            counters.get("frame_store_parity_missing", 0),
+            counters.get("frame_store_shadow_warmup", 0),
+        )
 
     def _publish_provider_evidence(self) -> None:
         """Best-effort publication boundary for one completed full scan."""
@@ -735,25 +869,6 @@ class ShortSignalBot:
                 "MarketDataHub universe update failed; REST remains canonical"
             )
 
-    def _persist_runtime_health(self) -> None:
-        writer = getattr(self._repository, "update_runtime_health", None)
-        if not callable(writer):
-            return
-        projection = self._health.snapshot()
-        writer(
-            checked_at=datetime.now(timezone.utc),
-            process_last_seen=self._health.process_last_seen,
-            full_scan_last_complete=self._health.full_scan_last_complete,
-            fast_monitor_last_complete=self._health.fast_monitor_last_complete,
-            market_data_last_healthy=self._health.market_data_last_healthy,
-            outbox_last_progress=self._health.outbox_last_progress,
-            outbox_last_observed=self._health.outbox_last_observed,
-            market_data_health=str(projection["market_data_health"]),
-            outbox_health=str(projection["outbox_health"]),
-            last_scan_duration_ms=self._health.last_scan_duration_ms,
-            last_event_loop_lag_ms=self._health.last_event_loop_lag_ms,
-        )
-
     @classmethod
     def from_files(
         cls,
@@ -775,9 +890,17 @@ class ShortSignalBot:
     async def __aexit__(self, *_: object) -> None:
         await self.shutdown()
 
+    def warmup_status(self) -> dict[str, int | str]:
+        """Return bounded partial-ready coverage for diagnostics and startup."""
+        return self._warmup_coverage.snapshot()
+
     async def startup(self) -> None:
         self._lifecycle = "STARTING"
         self._ready = False
+        # Code-enforced promotion registry: a live-delivery flag without a
+        # VALIDATED evidence entry in promotion_registry.json is a fatal
+        # misconfiguration, checked before any storage work.
+        validate_promotion_registry(self._config)
         validate_schema = getattr(self._repository, "validate_storage_schema", None)
         if validate_schema is not None:
             validate_schema(
@@ -788,6 +911,33 @@ class ShortSignalBot:
             raise RuntimeError("startup storage validation failed")
         self._lifecycle = "RECOVERING"
         self._state_store.load_active(now=datetime.now(timezone.utc))
+        cleanup_v2_states = getattr(
+            self._repository, "cleanup_low_volume_v2_episode_states", None
+        )
+        if cleanup_v2_states is not None:
+            cleanup_v2_states(now=datetime.now(timezone.utc))
+        load_v2_states = getattr(self._repository, "list_low_volume_v2_episode_states", None)
+        if load_v2_states is not None:
+            for snapshot in load_v2_states():
+                anchor_time = snapshot["current_anchor_high_time"]
+                restored = LowVolumeV2State(
+                    root_event_id=str(snapshot["root_event_id"]),
+                    event_revision=int(snapshot["event_revision"]),
+                    first_event_high=float(snapshot["first_event_high"] or snapshot["current_anchor_high"]),
+                    current_anchor_high=float(snapshot["current_anchor_high"]),
+                    current_anchor_high_time=anchor_time,
+                    last_retest_high=snapshot["last_retest_high"],
+                    last_closed_candle_time=snapshot["last_closed_candle_time"],
+                    episode_started_at=snapshot["episode_started_at"] or anchor_time,
+                    entry_trigger_time=snapshot["entry_trigger_time"],
+                    reset_count=int(snapshot["reset_count"]),
+                    invalidated_reason=snapshot["invalidated_reason"],
+                    v2_state=str(snapshot["v2_state"]),
+                    emitted=bool(snapshot["emitted"]),
+                )
+                self._low_volume_v2_episodes[
+                    (restored.root_event_id, restored.event_revision)
+                ] = restored
         reconcile_leases = getattr(self._repository, "reconcile_delivery_leases", None)
         if reconcile_leases is not None:
             reconcile_leases(datetime.now(timezone.utc))
@@ -806,7 +956,11 @@ class ShortSignalBot:
                 )
         await self._minimum_market_readiness()
         await self._notifier.start()
+        self._lag_monitor = EventLoopLagMonitor()
+        await self._lag_monitor.start()
+        self._delivery_worker.start()
         await self._start_market_data_shadow()
+        self._install_shutdown_checkpoint_barrier()
         if (
             self._config.climax_short_enabled
             and self._config.climax_fast_monitor_enabled
@@ -820,9 +974,18 @@ class ShortSignalBot:
                 self._config.climax_fast_poll_sec,
                 self._config.climax_max_active_symbols,
             )
-        self._lifecycle = "READY"
+        if self._config.background_outcomes_enabled:
+            await self._start_outcome_worker()
+        if self._config.event_driven_scan_enabled:
+            await self._prepare_event_driven_runtime()
+        self._lifecycle = (
+            "WARMING_UP"
+            if self._config.event_driven_scan_enabled
+            and self._warmup_coverage.snapshot()["state"] == "WARMING_UP"
+            else "READY"
+        )
         self._ready = True
-        self._logger.info("Runtime READY")
+        self._logger.info("Runtime %s | warmup=%s", self._lifecycle, self.warmup_status())
 
     async def _minimum_market_readiness(self) -> None:
         """Probe a bounded REST response before exposing scan/evaluation work."""
@@ -840,143 +1003,60 @@ class ShortSignalBot:
         ):
             raise RuntimeError("minimum market-data readiness returned no data")
 
-    async def _audit_delivery_funnel(self) -> None:
-        """Alert on durable delivery-chain gaps without writing telemetry rows."""
-        audit = getattr(self._repository, "audit_delivery_funnel", None)
-        if audit is None:
-            return
-        try:
-            findings = audit(now=datetime.now(timezone.utc))
-        except Exception as exc:  # noqa: BLE001 - watchdog must not stop scanning
-            self._logger.warning(
-                "Delivery funnel watchdog failed | error=%s", type(exc).__name__
-            )
-            return
-        if not findings:
-            return
-        kinds: dict[str, int] = {}
-        for finding in findings:
-            kind = str(finding.get("kind", "unknown"))
-            kinds[kind] = kinds.get(kind, 0) + 1
-        self._logger.error("Delivery funnel invariant violations | kinds=%s", kinds)
-        alert_key = "delivery_funnel_dead" if "dead_delivery" in kinds else "delivery_funnel_violation"
-        if not self._error_throttler.should_send(alert_key):
-            return
-        try:
-            await self._notifier.send_alert(
-                "Delivery funnel invariant violation: "
-                + ", ".join(f"{key}={value}" for key, value in sorted(kinds.items()))
-            )
-        except Exception:
-            self._logger.exception("Delivery funnel operator alert failed")
-
-    async def _deliver_outbox_item(self, delivery: dict[str, object]) -> bool:
-        delivery_id = int(delivery["id"])
-        try:
-            sent = await self._notifier.send_signal(str(delivery["payload"]))
-        except Exception as exc:  # noqa: BLE001 - delivery failures are converted to retry state
-            self._repository.mark_delivery_retry(
-                delivery_id,
-                error=safe_exception_summary(exc),
-                next_attempt_at=datetime.now(timezone.utc) + timedelta(minutes=1),
-            )
-            self._logger.warning(
-                "Telegram delivery retry scheduled | outbox_id=%s error=%s",
-                delivery_id,
-                type(exc).__name__,
-            )
-            return False
-        if sent:
-            self._repository.mark_delivery_sent(delivery_id)
-            self._health.mark_outbox()
-            self._persist_runtime_health()
-            return True
-        self._repository.mark_delivery_retry(
-            delivery_id,
-            error="telegram_send_returned_false",
-            next_attempt_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    async def flush_deliveries(self, *, timeout_sec: float = 30.0) -> int:
+        """Drain a bounded outbox batch for one-shot callers."""
+        return await asyncio.wait_for(
+            self._delivery_worker.drain_until_idle(max_batches=10), timeout=timeout_sec
         )
-        return False
-
-    async def _drain_delivery_outbox(self, *, limit: int = 5) -> int:
-        delivered = 0
-        watch_claims: list[dict[str, object]] = []
-        signal_claims = self._repository.claim_due_deliveries(
-            datetime.now(timezone.utc),
-            limit=limit,
-            lease_seconds=120,
-            entity_type="SIGNAL",
-        )
-        for delivery in signal_claims:
-            if await self._deliver_outbox_item(delivery):
-                delivered += 1
-        watch_budget = max(
-            0, self._config.watch_max_per_cycle - self._watch_sent_in_cycle
-        )
-        if self._config.send_watch_to_telegram and watch_budget:
-            watch_claims = self._repository.claim_due_deliveries(
-                datetime.now(timezone.utc),
-                limit=min(limit, watch_budget),
-                lease_seconds=120,
-                entity_type="WATCH",
-            )
-            for delivery in watch_claims:
-                if await self._deliver_outbox_item(delivery):
-                    self._watch_sent_in_cycle += 1
-                    delivered += 1
-        if not signal_claims and not (
-            self._config.send_watch_to_telegram and watch_budget and watch_claims
-        ):
-            self._health.mark_outbox_observed()
-        self._persist_runtime_health()
-        return delivered
-
-    async def _send_new_delivery(self, *, entity_type: str, entity_id: int) -> bool:
-        """Send a newly persisted item immediately while retaining durable retry state."""
-        claimed = self._repository.claim_due_deliveries(
-            datetime.now(timezone.utc),
-            limit=1,
-            lease_seconds=120,
-            entity_type=entity_type,
-            entity_id=entity_id,
-        )
-        for delivery in claimed:
-            return await self._deliver_outbox_item(delivery)
-        return False
 
     async def shutdown(self) -> None:
         self._lifecycle = "STOPPING"
         self._ready = False
+        await self._request_shutdown_checkpoint()
         self._fast_monitor_running = False
+        if self._outcome_worker is not None:
+            await self._outcome_worker.stop()
+            self._outcome_worker = None
+        await self._outcome_fetcher.close()
+        await self._stop_event_driven_runtime()
         await self._stop_market_data_shadow()
         if self._fast_monitor_task:
             self._fast_monitor_task.cancel()
             await asyncio.gather(self._fast_monitor_task, return_exceptions=True)
             self._fast_monitor_task = None
+        await self._delivery_worker.stop()
+        if self._lag_monitor is not None:
+            await self._lag_monitor.stop()
+            self._lag_monitor = None
         await self._notifier.close()
+        self._shutdown_checkpoint_barrier.uninstall()
 
-    async def run_cycle(self) -> list[SignalDecision]:
+    async def run_cycle(
+        self, *, timing: CycleTiming | None = None
+    ) -> list[SignalDecision]:
         if not self._ready:
             raise RuntimeError("runtime is not READY")
         self._health.on_cycle_start()
-        self._persist_runtime_health()
         cycle_started_at = datetime.now(timezone.utc)
-        cycle_started_monotonic = time.perf_counter()
         self._shadow_rotation_id = "unknown"
-        self._watch_sent_in_cycle = 0
+        self._watch_enqueued_in_cycle = 0
+        owned_timing = timing is None
+        if owned_timing:
+            self._cycle_sequence += 1
+            timing = CycleTiming.begin(cycle_sequence=self._cycle_sequence)
+        if self._lag_monitor is not None:
+            self._lag_monitor.begin_window()
+        timing_token = attach_cycle_timing(timing)
+        cycle_status = "FAILED"
         decisions: list[SignalDecision] = []
         symbol_results: list[dict[str, object]] = []
         try:
             if not await self._ensure_storage_healthy("cycle"):
                 return []
-            await self._drain_delivery_outbox(limit=5)
-            await self._audit_delivery_funnel()
-            await self._shadow_outcome_scheduler.run_cycle(now=cycle_started_at)
             active_selection_at = datetime.now(timezone.utc)
             active_states = self._state_store.load_active(now=active_selection_at)
-            scan_snapshot = await self._market_data_provider.build_scan_snapshot()
-            self._health.mark_market_data()
-            self._persist_runtime_health()
+            async with measure("market_fetch"):
+                scan_snapshot = await self._market_data_provider.build_scan_snapshot()
             snapshots = list(scan_snapshot.snapshots)
             self._publish_market_data_universe(
                 getattr(self._scanner, "last_universe_telemetry", None)
@@ -1045,26 +1125,16 @@ class ShortSignalBot:
                     continue
                 symbols.append(active_symbol)
                 seen_symbols.add(active_symbol)
-            frozen_frames = await self._market_data_provider.prefetch_historical_frames(
-                symbols
-            )
+            async with measure("market_fetch"):
+                frozen_frames = (
+                    await self._market_data_provider.prefetch_historical_frames(symbols)
+                )
             frames = {
                 symbol: frozen.frame.copy(deep=True)
                 for symbol, frozen in frozen_frames.items()
             }
-            scan_failures = getattr(self._scanner, "last_scan_failures", {})
 
             for symbol in symbols:
-                scan_failure = scan_failures.get(symbol)
-                if scan_failure is not None:
-                    normalized_failure = normalize_scan_failure(
-                        scan_failure.get("reason_code", "PROVIDER_ERROR"),
-                        exception=None,
-                    )
-                    if isinstance(scan_failure.get("details"), dict):
-                        normalized_failure["details"] = dict(scan_failure["details"])
-                    symbol_results.append({"symbol": symbol, **normalized_failure})
-                    continue
                 frame = frames.get(symbol)
                 if frame is None or frame.empty:
                     symbol_results.append(
@@ -1075,39 +1145,19 @@ class ShortSignalBot:
                         }
                     )
                     continue
-                decision_market = await self._market_data_provider.capture_decision_snapshot(
-                    symbol,
-                    frame_1m=frame,
-                    include_liquidity=False,
-                )
+                async with measure("market_fetch"):
+                    decision_market = (
+                        await self._market_data_provider.capture_decision_snapshot(
+                            symbol,
+                            frame_1m=frame,
+                            include_liquidity=False,
+                        )
+                    )
                 if decision_market is None:
-                    symbol_results.append(
-                        {
-                            "symbol": symbol,
-                            **normalize_scan_failure("MARKET_DATA_INCOMPLETE"),
-                        }
-                    )
-                    continue
-                derivative_failure = (
-                    decision_market.derivatives.get("scan_failure")
-                    if isinstance(decision_market.derivatives, dict)
-                    else None
-                )
-                if isinstance(derivative_failure, dict):
-                    symbol_results.append(
-                        {
-                            "symbol": symbol,
-                            **normalize_scan_failure(
-                                derivative_failure.get(
-                                    "reason_code", "MARKET_DATA_INCOMPLETE"
-                                )
-                            ),
-                        }
-                    )
                     continue
                 frame = decision_market.frame_1m.frame
                 try:
-                    async with self._symbol_mutations.mutation(symbol):
+                    async with measure("strategy"), self._symbol_mutations.mutation(symbol):
                         load_active_symbol = getattr(
                             self._state_store, "load_active_symbol", None
                         )
@@ -1133,15 +1183,17 @@ class ShortSignalBot:
                         )
                         if updated_state is not None:
                             self._state_store.save(updated_state)
-                    self._record_provider_evaluation_evidence(
-                        symbol, decision_market, decision
-                    )
+                    with measure_sync("research"):
+                        self._record_provider_evaluation_evidence(
+                            symbol, decision_market, decision
+                        )
                 except Exception as exc:  # noqa: BLE001 - isolate one symbol from the cycle
                     symbol_results.append(
                         {
                             "symbol": symbol,
                             "terminal_status": "SCAN_FAILED",
-                            **normalize_scan_failure(str(exc), exception=exc),
+                            "reason_code": "SCAN_EXCEPTION",
+                            "details": {"error_code": type(exc).__name__},
                         }
                     )
                     await self._handle_error(f"symbol:{symbol}", exc)
@@ -1158,13 +1210,16 @@ class ShortSignalBot:
                     if decision.actionable:
                         self._health.on_signal()
 
-            updated_outcomes = await self.update_outcomes()
+            updated_outcomes = 0
+            if self._outcome_worker is not None:
+                self._outcome_worker.wake()
             universe = getattr(self._scanner, "last_universe_telemetry", None)
             record_coverage = getattr(
                 self._repository, "record_market_scan_cycle", None
             )
             if universe is not None and record_coverage is not None:
-                coverage_result = record_coverage(
+                with measure_sync("research"):
+                    coverage_result = record_coverage(
                     cycle_started_at=cycle_started_at,
                     cycle_completed_at=datetime.now(timezone.utc),
                     exchange_symbols=rotation_exchange_symbols,
@@ -1192,35 +1247,1188 @@ class ShortSignalBot:
                 len([d for d in decisions if d.actionable]),
                 updated_outcomes,
             )
-            self._publish_research_storage_health()
-            self._publish_provider_evidence()
-            self._health.mark_scan(
-                duration_ms=(time.perf_counter() - cycle_started_monotonic) * 1000.0
-            )
-            self._persist_runtime_health()
+            async with measure("research"):
+                self._publish_research_storage_health()
+                self._publish_provider_evidence()
+                await self._frame_store_cycle_maintenance()
+            cycle_status = "COMPLETED"
             return decisions
         except Exception as exc:  # noqa: BLE001 - cycle boundary must preserve runtime loop
             await self._handle_error("cycle", exc)
             return []
         finally:
             self._health.on_cycle_finish()
+            timing.finish(
+                status=cycle_status,
+                event_loop_lag_ms=(
+                    self._lag_monitor.latest_lag_ms()
+                    if self._lag_monitor is not None
+                    else 0.0
+                ),
+            )
+            detach_cycle_timing(timing_token)
+            if owned_timing:
+                self._finalize_cycle_timing(timing)
+
+    def _finalize_cycle_timing(
+        self,
+        timing: CycleTiming,
+        *,
+        cycle_overrun_ms: float = 0.0,
+        skipped_ticks: int = 0,
+    ) -> None:
+        """Emit one stable timing line and overwrite the bounded evidence doc."""
+        if not timing.completed_ns:
+            timing.finish(status="FAILED")
+        timing.cycle_overrun_ms = max(0.0, float(cycle_overrun_ms))
+        timing.skipped_ticks = max(0, int(skipped_ticks))
+        metrics = timing.metrics_ms()
+        self._logger.info(
+            "Runtime cycle timing | cycle_sequence=%s status=%s %s",
+            timing.cycle_sequence,
+            timing.status,
+            " ".join(f"{key}={metrics[key]:.3f}" for key in METRIC_KEYS),
+        )
+        try:
+            publish_evidence(
+                self._config.runtime_timing_evidence_path,
+                build_evidence_document(
+                    timing,
+                    runtime_instance_id=self._runtime_instance_id,
+                    code_version=self._code_version,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence never gates signal behavior
+            if self._error_throttler.should_send("runtime_timing_evidence"):
+                self._logger.warning(
+                    "Runtime timing evidence publication failed | error=%s",
+                    type(exc).__name__,
+                )
 
     async def run_forever(self) -> None:
+        if getattr(self._config, "event_driven_scan_enabled", False):
+            await self.run_event_driven_forever()
+            return
+        loop = asyncio.get_running_loop()
+        interval_sec = float(self._config.scan_interval_sec)
+        scheduled_deadline = loop.time()
+        cycle_sequence = 0
         while True:
-            await self.run_cycle()
-            await asyncio.sleep(self._config.scan_interval_sec)
+            cycle_sequence += 1
+            timing = CycleTiming.begin(cycle_sequence=cycle_sequence)
+            await self.run_cycle(timing=timing)
+            finished_at = loop.time()
+            schedule = next_scan_deadline(
+                scheduled_deadline=scheduled_deadline,
+                finished_at=finished_at,
+                interval_sec=interval_sec,
+            )
+            if schedule.cycle_overrun_ms > 0:
+                self._logger.warning(
+                    "Cycle overrun | cycle_sequence=%s cycle_overrun_ms=%.3f "
+                    "skipped_ticks=%s interval_ms=%.3f",
+                    cycle_sequence,
+                    schedule.cycle_overrun_ms,
+                    schedule.skipped_ticks,
+                    interval_sec * 1000,
+                )
+            scheduled_deadline = schedule.next_deadline
+            self._finalize_cycle_timing(
+                timing,
+                cycle_overrun_ms=schedule.cycle_overrun_ms,
+                skipped_ticks=schedule.skipped_ticks,
+            )
+            await asyncio.sleep(max(0.0, scheduled_deadline - loop.time()))
+
+    def _latest_event_loop_lag_ms(self) -> float | None:
+        if self._lag_monitor is None:
+            return None
+        return self._lag_monitor.latest_lag_ms()
+
+    # ------------------------------------------------- event-driven live scan
+
+    async def _start_outcome_worker(self) -> None:
+        if self._outcome_worker is not None:
+            return
+        self._outcome_worker = OutcomeWorker(
+            shadow_scheduler=self._shadow_outcome_scheduler,
+            outcome_tracker=self._outcome_tracker,
+            fetcher=self._outcome_fetcher,
+            signal_batch_size=self._config.outcome_worker_signal_batch_size,
+            observation_batch_size=self._config.outcome_worker_observation_batch_size,
+            idle_poll_sec=self._config.outcome_worker_idle_poll_sec,
+            include_shadow_v2=self._config.root_detector_shadow_v2_enabled,
+        )
+        await self._outcome_worker.start()
+        self._logger.info(
+            "Background outcome worker started | signal_batch=%s observation_batch=%s",
+            self._config.outcome_worker_signal_batch_size,
+            self._config.outcome_worker_observation_batch_size,
+        )
+
+    async def _prepare_event_driven_runtime(self) -> None:
+        """Build the coordinator, warm the frame store, and seed P0 state."""
+        if self._scan_coordinator is not None:
+            return
+        from app.market_data.planning import plan_topics
+
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        hub = getattr(provider, "hub", None)
+        if store is None or hub is None:
+            raise RuntimeError(
+                "event_driven_scan_enabled requires a frame store and WebSocket Hub"
+            )
+        # Restore technical seed data before the first universe publish.  The
+        # subsequent WS subscription then supplies the current epoch without
+        # attaching observers a second time.
+        restore = getattr(provider, "restore_frame_store", None)
+        if restore is not None:
+            restored = restore()
+            if restored:
+                self._logger.info("Frame store restore | %s", restored)
+        telemetry = await self._refresh_event_universe(startup=True)
+        # Fail readiness instead of silently dropping symbols when the topic
+        # planner cannot cover the eligible universe.
+        plan_topics(
+            telemetry.eligible_symbols,
+            max_connections=getattr(hub, "_max_connections", 4),
+        )
+        now = datetime.now(timezone.utc)
+        active = tuple(self._state_store.load_active(now=now))
+        if getattr(store, "warm_symbols", None) is not None:
+            warm_targets = sorted(
+                {str(symbol).upper() for symbol in telemetry.eligible_symbols}
+                | {str(symbol).upper() for symbol in active}
+            )
+            ready_targets = [
+                symbol for symbol in warm_targets if store.is_complete(symbol, now)
+            ]
+            self._warmup_coverage.begin(warm_targets, ready=ready_targets)
+            if self._warmup_coverage.snapshot()["state"] == "WARMING_UP":
+                self._lifecycle = "WARMING_UP"
+            # Warmup is bounded REST work (2 requests/scheduler slot per
+            # symbol). Runtime readiness exposes partial counts while every
+            # decision path remains gated on actionable frames.
+            self._schedule_frame_store_warmup(warm_targets)
+        self._research_queue = ResearchQueue(
+            maxsize=2000,
+            batch_size=50,
+            on_error=lambda exc, name: self._logger.warning(
+                "research queue write failed | name=%s error=%s", name, type(exc).__name__
+            ),
+        )
+        self._research_queue.start()
+        self._scan_coordinator = ScanCoordinator(
+            p0_deadline_sec=self._config.p0_scan_deadline_sec,
+            p1_deadline_sec=self._config.p1_scan_deadline_sec,
+        )
+        # Seed the P0 pool from persisted active states before READY returns.
+        if self._config.climax_short_enabled:
+            for symbol in active:
+                state = self._state_store.load(symbol)
+                if state is not None:
+                    self._track_climax_candidate(state, now)
+        for index in range(self._config.scan_evaluation_consumers):
+            self._scan_consumers.append(
+                asyncio.create_task(
+                    self._scan_consumer(), name=f"scan-evaluation-consumer-{index}"
+                )
+            )
+        self._logger.info(
+            "Event-driven scan runtime ready | consumers=%s store_symbols=%s",
+            self._config.scan_evaluation_consumers,
+            len(store.symbols()),
+        )
+
+    def _warmup_frame(self, store: object, symbol: str) -> object | None:
+        peek = getattr(store, "peek_snapshot", None)
+        if not callable(peek):
+            return None
+        try:
+            return peek(symbol, datetime.now(timezone.utc))
+        except Exception:  # noqa: BLE001 - readiness is best effort
+            return None
+
+    @staticmethod
+    def _warmup_result_has_rest_failure(result: object) -> bool:
+        if not isinstance(result, dict):
+            return True
+        return any(
+            bool(result.get(key))
+            for key in (
+                "error",
+                "failed",
+                "candle_failed",
+                "candle_timed_out",
+                "oi_failed",
+                "oi_timed_out",
+            )
+        )
+
+    @staticmethod
+    def _warmup_frame_waits_for_ws(frame: object | None) -> bool:
+        return (
+            frame is not None
+            and not bool(getattr(frame, "actionable", False))
+            and getattr(frame, "stale_reason", None) in _FRAME_STORE_WS_WAITING_REASONS
+        )
+
+    def _reconcile_frame_store_warmup(self) -> None:
+        """Promote symbols when WS makes a seeded frame actionable."""
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        if store is None:
+            return
+        for symbol in self._warmup_coverage.target_symbols:
+            frame = self._warmup_frame(store, symbol)
+            if frame is not None and bool(getattr(frame, "actionable", False)):
+                self._warmup_coverage.mark_ready(symbol)
+                self._frame_store_warm_waiting_ws.discard(symbol)
+            elif symbol in self._frame_store_warm_waiting_ws:
+                self._warmup_coverage.mark_waiting(symbol)
+        if (
+            self._ready
+            and self._lifecycle == "WARMING_UP"
+            and self._warmup_coverage.snapshot()["state"] == "READY"
+        ):
+            self._lifecycle = "READY"
+
+    def _schedule_frame_store_retry(self, symbol: str) -> None:
+        if (
+            symbol in self._frame_store_warm_waiting_ws
+            or symbol in self._frame_store_warm_retry_tasks
+        ):
+            return
+        loop = asyncio.get_running_loop()
+
+        async def _retry() -> None:
+            try:
+                await asyncio.sleep(FRAME_STORE_WARMUP_RETRY_BACKOFF_SEC)
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._frame_store_warm_retry_tasks.pop(symbol, None)
+            if symbol in self._frame_store_warm_waiting_ws:
+                return
+            self._frame_store_warm_pending.add(symbol)
+            self._ensure_frame_store_warm_task()
+
+        self._frame_store_warm_retry_tasks[symbol] = loop.create_task(
+            _retry(), name=f"frame-store-warmup-retry-{symbol}"
+        )
+
+    def _ensure_frame_store_warm_task(self) -> None:
+        task = getattr(self, "_frame_store_warm_task", None)
+        if task is not None and not task.done():
+            return
+        loop = asyncio.get_running_loop()
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        if store is None:
+            return
+
+        async def _drain() -> None:
+            while self._frame_store_warm_pending:
+                symbol = min(self._frame_store_warm_pending)
+                self._frame_store_warm_pending.discard(symbol)
+                try:
+                    warmup_priority = (
+                        RequestPriority.RECOVERY
+                        if hasattr(RequestPriority, "RECOVERY")
+                        else RequestPriority.P1
+                    )
+                    result = await store.warm_symbols(
+                        provider.client,
+                        [symbol],
+                        priority=warmup_priority,
+                        timeout_sec=FRAME_STORE_WARMUP_ATTEMPT_TIMEOUT_SEC,
+                    )
+                except Exception as exc:  # noqa: BLE001 - warmup is best effort
+                    result = {"error": type(exc).__name__}
+                    self._logger.warning(
+                        "frame store warmup failed | symbol=%s error=%s",
+                        symbol,
+                        type(exc).__name__,
+                    )
+                frame = self._warmup_frame(store, symbol)
+                if frame is not None and bool(getattr(frame, "actionable", False)):
+                    self._warmup_coverage.mark_ready(symbol)
+                    self._frame_store_warm_waiting_ws.discard(symbol)
+                elif self._warmup_result_has_rest_failure(result):
+                    self._warmup_coverage.mark_failed(symbol)
+                    self._frame_store_warm_waiting_ws.discard(symbol)
+                    self._schedule_frame_store_retry(symbol)
+                elif self._warmup_frame_waits_for_ws(frame):
+                    self._warmup_coverage.mark_waiting(symbol)
+                    self._frame_store_warm_waiting_ws.add(symbol)
+                else:
+                    self._warmup_coverage.mark_failed(symbol)
+                    self._frame_store_warm_waiting_ws.discard(symbol)
+                    self._schedule_frame_store_retry(symbol)
+                self._reconcile_frame_store_warmup()
+                self._logger.info(
+                    "Frame store warmup | symbol=%s result=%s coverage=%s",
+                    symbol,
+                    result,
+                    self.warmup_status(),
+                )
+
+        self._frame_store_warm_task = loop.create_task(
+            _drain(), name="frame-store-warmup"
+        )
+
+    def _schedule_frame_store_warmup(self, symbols: list[str]) -> None:
+        """Queue bounded, deduplicated per-symbol warmup."""
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        if store is None:
+            return
+        self._warmup_coverage.add_targets(symbols)
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).upper()
+            if (
+                symbol in self._frame_store_warm_waiting_ws
+                or symbol in self._frame_store_warm_retry_tasks
+            ):
+                continue
+            frame = self._warmup_frame(store, symbol)
+            if frame is not None and bool(getattr(frame, "actionable", False)):
+                self._warmup_coverage.mark_ready(symbol)
+                continue
+            try:
+                complete = bool(store.is_complete(symbol))
+            except Exception:  # noqa: BLE001 - readiness is best effort
+                complete = False
+            if not complete or not self._warmup_frame_waits_for_ws(frame):
+                self._frame_store_warm_pending.add(symbol)
+            else:
+                self._warmup_coverage.mark_waiting(symbol)
+                self._frame_store_warm_waiting_ws.add(symbol)
+        self._ensure_frame_store_warm_task()
+
+    def _schedule_continuity_repair(
+        self, symbols: list[str], *, ranked_symbols: list[str] | None = None,
+    ) -> None:
+        """Record all ranked blocked symbols without waiting for REST admission."""
+        store = getattr(self._market_data_provider, "frame_store", None)
+        if store is None or not callable(getattr(store, "backfill_missing", None)):
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        queue = self._continuity_repair_queue
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None and not hasattr(self, "_continuity_repair_rate_seen"):
+            self._continuity_repair_rate_seen = scheduler.stats_snapshot().get(
+                "metrics", {}).get("bybit_rate_limit_total:RECOVERY", 0)
+        if ranked_symbols is not None:
+            queue.reconcile(symbols)
+        added = queue.offer(symbols, ranked_symbols or symbols, now)
+        self._continuity_repair_metrics["queued"] += added
+        if queue.queued and (
+            self._continuity_repair_task is None or self._continuity_repair_task.done()
+        ):
+            self._continuity_repair_task = asyncio.create_task(
+                self._drain_continuity_repairs(), name="continuity-gap-repair"
+            )
+
+    async def _admit_event_window(
+        self,
+        coordinator: ScanCoordinator,
+        window_id: str,
+        boundary: datetime,
+        *,
+        store: object | None,
+        active_symbols: tuple[str, ...],
+        shortlist_symbols: tuple[str, ...],
+        interval_sec: float,
+    ) -> tuple[int, dict, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        """Retry canonical admission until fresh WS frames or the deadline."""
+        diagnostics: dict = {}
+        continuity_blocked: list[str] = []
+        deadline = boundary + timedelta(seconds=interval_sec)
+        active_ready: tuple[str, ...] = ()
+        shortlist_ready: tuple[str, ...] = ()
+        decision_at = datetime.now(timezone.utc)
+        while True:
+            continuity_blocked.clear()
+            diagnostics.clear()
+            if store is not None:
+                shortlist_ready = _actionable_canonical_symbols(
+                    store,
+                    shortlist_symbols,
+                    decision_at,
+                    diagnostics=diagnostics,
+                    continuity_blocked=continuity_blocked,
+                )
+                active_ready = _actionable_canonical_symbols(
+                    store, active_symbols, decision_at
+                )
+            else:
+                shortlist_ready = ()
+                active_ready = ()
+                diagnostics.update(
+                    original_top100=len(shortlist_symbols),
+                    ready=0,
+                    reasons={"NO_FRAME": len(shortlist_symbols)},
+                )
+            if (shortlist_ready or not shortlist_symbols) and (
+                active_ready or not active_symbols
+            ):
+                break
+            self._schedule_continuity_repair(
+                continuity_blocked,
+                ranked_symbols=list(shortlist_symbols),
+            )
+            now = datetime.now(timezone.utc)
+            remaining = (deadline - now).total_seconds()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.25, remaining))
+            decision_at = datetime.now(timezone.utc)
+        scheduled = coordinator.open_window(
+            window_id,
+            decision_at,
+            active_symbols=active_ready,
+            shortlist_symbols=shortlist_ready,
+        )
+        return scheduled, diagnostics, tuple(continuity_blocked), active_ready, shortlist_ready
+
+    async def _drain_continuity_repairs(self) -> None:
+        store = self._market_data_provider.frame_store
+        loop = asyncio.get_running_loop()
+        queue = self._continuity_repair_queue
+        budget = self._continuity_repair_budget
+        while queue.queued:
+            now = loop.time()
+            scheduler = getattr(self, "_request_scheduler", None)
+            stats = scheduler.stats_snapshot() if scheduler is not None else {}
+            rate_total = stats.get("metrics", {}).get("bybit_rate_limit_total:RECOVERY", 0)
+            rate_seen = getattr(self, "_continuity_repair_rate_seen", rate_total)
+            if rate_total > rate_seen:
+                budget.rate_limited(now)
+                self._continuity_repair_metrics["rate_limited"] += rate_total - rate_seen
+            self._continuity_repair_rate_seen = rate_total
+            if not budget.allowed(now, stats):
+                await asyncio.sleep(min(1.0, max(0.05, budget.next_due(now) - now)))
+                continue
+            symbol = queue.pop(now)
+            if symbol is None:
+                # A failed repair is retried on the next scan admission, not
+                # through an idle worker running indefinitely between windows.
+                return
+            self._continuity_repair_inflight = symbol
+            budget.record(now)
+            metrics = self._continuity_repair_metrics
+            metrics["attempted"] += 1
+            repaired = False
+            ready = False
+            gap_closed = False
+            repair_started_at = self._repair_snapshot_time(store)
+            try:
+                gap_before = (getattr(store.peek_snapshot(symbol, repair_started_at),
+                                      "stale_reason", None) == "CONTINUITY_UNHEALTHY"
+                              if callable(getattr(store, "peek_snapshot", None)) else False)
+                repaired = await asyncio.wait_for(
+                    store.backfill_missing(
+                        self._market_data_provider.client, symbol,
+                        priority=RequestPriority.RECOVERY,
+                    ),
+                    timeout=10.0,
+                )
+                metrics["rest_ok"] += bool(repaired)
+                if callable(getattr(store, "peek_snapshot", None)):
+                    recheck = getattr(self._market_data_provider, "recheck_after_backfill", None)
+                    frame = (
+                        recheck(symbol, backfill_started_at=repair_started_at)
+                        if callable(recheck)
+                        else store.peek_snapshot(symbol, self._repair_snapshot_time(store))
+                    )
+                    gap_closed = bool(frame is not None and gap_before and
+                                      frame.stale_reason != "CONTINUITY_UNHEALTHY")
+                    metrics["gap_closed"] += gap_closed
+                    ready = bool(frame is not None and frame.actionable and repaired)
+                    metrics["frame_ready"] += ready
+                    if ready:
+                        self._continuity_repair_ready.add(symbol)
+                        epoch = getattr(frame, "connection_epoch", None)
+                        if epoch is not None:
+                            self._continuity_repair_epochs[symbol] = epoch
+                metrics["not_readmitted"] += not ready
+                self._logger.info(
+                    "Continuity background repair | symbol=%s rest_ok=%s gap_closed=%s frame_ready=%s",
+                    symbol, repaired, gap_closed, ready,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - failed repair remains excluded
+                metrics["failed"] += 1
+                self._logger.warning(
+                    "Continuity background repair failed | symbol=%s error=%s",
+                    symbol, type(exc).__name__,
+                )
+            finally:
+                queue.finish(symbol, loop.time(), ready=ready)
+                self._continuity_repair_inflight = None
+            await asyncio.sleep(0.25)
+
+    @staticmethod
+    def _repair_snapshot_time(store: object) -> datetime:
+        clock = getattr(store, "snapshot_time", None)
+        return clock() if callable(clock) else datetime.now(timezone.utc)
+
+    def _record_repair_readmissions(
+        self, coordinator: ScanCoordinator, window_id: str, symbols: tuple[str, ...],
+    ) -> int:
+        """Count only terminal scans with an actionable frame at the repaired epoch."""
+        store = getattr(self._market_data_provider, "frame_store", None)
+        epochs = getattr(self, "_continuity_repair_epochs", {})
+        terminals = coordinator.terminal_statuses(window_id)
+        counted = 0
+        for symbol in set(symbols).intersection(self._continuity_repair_ready):
+            if symbol not in epochs or terminals.get(symbol) not in ("SCANNED_OK", "NO_SETUP"):
+                continue
+            try:
+                frame = store.peek_snapshot(symbol, self._repair_snapshot_time(store))
+            except Exception:  # noqa: BLE001 - telemetry cannot affect scan
+                continue
+            if frame is None or not frame.actionable or frame.connection_epoch != epochs[symbol]:
+                continue
+            self._logger.info(
+                "Continuity repair terminal readmission | window=%s symbol=%s epoch=%s terminal=%s",
+                window_id, symbol, epochs[symbol], terminals[symbol],
+            )
+            self._continuity_repair_ready.discard(symbol)
+            epochs.pop(symbol, None)
+            counted += 1
+        self._continuity_repair_metrics["readmitted"] += counted
+        return counted
+
+    async def _stop_event_driven_runtime(self) -> None:
+        repair_task = self._continuity_repair_task
+        if repair_task is not None:
+            repair_task.cancel()
+            await asyncio.gather(repair_task, return_exceptions=True)
+            self._continuity_repair_task = None
+        self._continuity_repair_queue.clear()
+        warm_task = getattr(self, "_frame_store_warm_task", None)
+        if warm_task is not None:
+            warm_task.cancel()
+            self._frame_store_warm_task = None
+        retry_tasks = tuple(self._frame_store_warm_retry_tasks.values())
+        for retry_task in retry_tasks:
+            retry_task.cancel()
+        if retry_tasks:
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
+        self._frame_store_warm_retry_tasks.clear()
+        self._frame_store_warm_pending.clear()
+        self._frame_store_warm_waiting_ws.clear()
+        if self._research_queue is not None:
+            await self._research_queue.stop()
+            self._research_queue = None
+        if self._scan_coordinator is not None:
+            await self._scan_coordinator.stop()
+        consumers, self._scan_consumers = self._scan_consumers, []
+        for consumer in consumers:
+            consumer.cancel()
+        if consumers:
+            await asyncio.gather(*consumers, return_exceptions=True)
+        self._scan_coordinator = None
+
+    async def _refresh_event_universe(self, *, startup: bool = False) -> Any:
+        """Refresh instruments + eligible universe (P1) and publish to the Hub."""
+        provider = self._market_data_provider
+        store = getattr(provider, "frame_store", None)
+        # fetch_market_snapshots() may publish the new universe and add its
+        # symbols to the store before the minute loop can detect them.
+        previously_retained = set(store.symbols()) if store is not None else set()
+        snapshots = await provider.fetch_market_snapshots()
+        telemetry = getattr(provider, "last_universe_telemetry", None)
+        if telemetry is None:
+            raise RuntimeError("universe refresh produced no telemetry")
+        self._universe_refreshed_at_monotonic = time.monotonic()
+        self._event_universe_snapshots = list(snapshots)
+        self._event_eligible_symbols = tuple(
+            str(symbol).upper() for symbol in telemetry.eligible_symbols
+        )
+        # The Hub/store subscription is eligible ∪ persisted active symbols:
+        # active events must keep streaming even after leaving the universe.
+        active = self._state_store.load_active(now=datetime.now(timezone.utc))
+        subscribed = sorted(
+            {str(symbol).upper() for symbol in telemetry.eligible_symbols}
+            | {str(symbol).upper() for symbol in active}
+        )
+        publish = getattr(provider, "update_universe", None)
+        if publish is not None:
+            publish(tuple(subscribed))
+        if not startup and store is not None:
+            newly_subscribed = sorted(set(subscribed) - previously_retained)
+            if newly_subscribed:
+                self._schedule_frame_store_warmup(newly_subscribed)
+        if startup:
+            self._logger.info(
+                "Event-driven universe ready | exchange=%s eligible=%s",
+                len(telemetry.exchange_symbols),
+                len(telemetry.eligible_symbols),
+            )
+        return telemetry
+
+    def _hub_market_snapshots(self) -> list[MarketSnapshot]:
+        """Current-minute shortlist input from hub ticker state, not REST."""
+        hub = getattr(self._market_data_provider, "hub", None)
+        if hub is None:
+            return []
+        by_symbol = {
+            snapshot.symbol: snapshot
+            for snapshot in self._event_universe_snapshots
+        }
+        snapshots: list[MarketSnapshot] = []
+        for symbol in self._event_eligible_symbols:
+            hub_snapshot = hub.get_snapshot(symbol)
+            if hub_snapshot is not None and all(
+                getattr(hub_snapshot, name) is not None
+                for name in (
+                    "last_price",
+                    "price_24h_pcnt",
+                    "turnover_24h",
+                    "volume_24h",
+                    "mark_price",
+                    "open_interest",
+                )
+            ):
+                snapshots.append(
+                    MarketSnapshot(
+                        symbol=symbol,
+                        last_price=float(hub_snapshot.last_price),
+                        price_24h_pct=float(hub_snapshot.price_24h_pcnt) * 100,
+                        turnover_24h=float(hub_snapshot.turnover_24h),
+                        volume_24h=float(hub_snapshot.volume_24h),
+                        mark_price=float(hub_snapshot.mark_price),
+                        open_interest=float(hub_snapshot.open_interest),
+                        timestamp=hub_snapshot.received_at,
+                    )
+                )
+                continue
+            rest = by_symbol.get(symbol)
+            if rest is not None:
+                snapshots.append(rest)
+        return snapshots
+
+    async def run_event_driven_forever(self) -> None:
+        """Minute-window event-driven loop; one process, one state owner."""
+        await self._prepare_event_driven_runtime()
+        coordinator = self._scan_coordinator
+        assert coordinator is not None
+        interval_sec = float(self._config.scan_interval_sec)
+        grace_sec = float(self._config.scan_window_grace_sec)
+        loop = asyncio.get_running_loop()
+        window_sequence = 0
+        next_checkpoint_monotonic = (
+            loop.time() + float(self._config.market_frame_checkpoint_sec)
+        )
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            boundary = (
+                now_utc.replace(second=0, microsecond=0)
+                + timedelta(seconds=interval_sec)
+            )
+            open_at = loop.time() + max(
+                grace_sec, (boundary - now_utc).total_seconds()
+            )
+            await asyncio.sleep(max(0.0, open_at - loop.time()))
+            window_sequence += 1
+            window_id = f"{boundary.strftime('%Y%m%dT%H%M%SZ')}-{window_sequence}"
+            try:
+                if (
+                    loop.time() - self._universe_refreshed_at_monotonic >= 900.0
+                ):
+                    await self._refresh_event_universe()
+                active_states = self._state_store.load_active(now=boundary)
+                active_symbols = tuple(
+                    sorted({str(symbol).upper() for symbol in active_states})
+                )
+                # Re-publish eligible + active every window: new events start
+                # streaming immediately, without waiting for the 900-second
+                # instrument refresh.  The Hub coalesces unchanged universes.
+                subscribed = sorted(
+                    set(self._event_eligible_symbols) | set(active_symbols)
+                )
+                publish = getattr(self._market_data_provider, "update_universe", None)
+                store = getattr(self._market_data_provider, "frame_store", None)
+                known_before_publish = set(store.symbols()) if store is not None else set()
+                if publish is not None:
+                    publish(tuple(subscribed))
+                if store is not None:
+                    new_symbols = sorted(set(subscribed) - known_before_publish)
+                    if new_symbols:
+                        self._schedule_frame_store_warmup(new_symbols)
+                self._reconcile_frame_store_warmup()
+                shortlist = self._market_data_provider.shortlist(
+                    self._hub_market_snapshots()
+                )
+                shortlist_candidates = tuple(snapshot.symbol for snapshot in shortlist)
+                (
+                    scheduled,
+                    top100_diagnostics,
+                    continuity_blocked,
+                    active_scan_symbols,
+                    shortlist_symbols,
+                ) = await self._admit_event_window(
+                    coordinator,
+                    window_id,
+                    boundary,
+                    store=store,
+                    active_symbols=active_symbols,
+                    shortlist_symbols=shortlist_candidates,
+                    interval_sec=interval_sec,
+                )
+                self._logger.info(
+                    "Continuity repair funnel | window=%s queued=%s overflow=%s attempted=%s rest_ok=%s gap_closed=%s frame_ready=%s terminal_readmitted=%s rate_limited=%s",
+                    window_id, self._continuity_repair_queue.queued,
+                    self._continuity_repair_queue.overflow,
+                    *(self._continuity_repair_metrics[key] for key in (
+                        "attempted", "rest_ok", "gap_closed", "frame_ready", "readmitted", "rate_limited"
+                    )),
+                )
+                scheduled_top100 = sum(
+                    (window_id, symbol) in coordinator._scheduled.get(window_id, ())
+                    for symbol in shortlist_symbols
+                )
+                self._logger.info(
+                    "Top100 canonical gate | window=%s original_top100=%s ready=%s reasons=%s eligible=%s scheduled=%s",
+                    window_id,
+                    top100_diagnostics["original_top100"],
+                    top100_diagnostics["ready"],
+                    top100_diagnostics["reasons"],
+                    len(self._event_eligible_symbols),
+                    scheduled_top100,
+                )
+                self._window_records[window_id] = {"opened_at": boundary}
+                window_started_monotonic = loop.time()
+                self._logger.info(
+                    "Event window opened | window=%s scheduled=%s p0=%s shortlist=%s",
+                    window_id,
+                    scheduled,
+                    len(active_scan_symbols),
+                    len(shortlist_symbols),
+                )
+                try:
+                    await asyncio.wait_for(
+                        coordinator.wait_window_complete(window_id),
+                        timeout=self._config.p1_scan_deadline_sec
+                        + self._config.scan_window_grace_sec
+                        + 60.0,
+                    )
+                except asyncio.TimeoutError:
+                    # The watchdog only finalizes expired tasks and reports
+                    # missing terminal accounting; it never launches a scan.
+                    coordinator.expire_pending()
+                    missing = coordinator.missing_tasks(window_id)
+                    if missing:
+                        self._logger.warning(
+                            "Coverage watchdog | window=%s missing_terminals=%s",
+                            window_id,
+                            len(missing),
+                        )
+                try:
+                    await asyncio.wait_for(
+                        coordinator.wait_window_complete(window_id),
+                        timeout=interval_sec * 2.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Second wait is bounded so a never-completing window
+                    # (e.g. empty scheduling that escapes the coordinator
+                    # guard) cannot stall the scan loop indefinitely.
+                    self._logger.error(
+                        "Stuck scan window | window=%s missing_terminals=%s"
+                        " bounded wait expired after %.1fs; continuing loop",
+                        window_id,
+                        len(coordinator.missing_tasks(window_id)),
+                        interval_sec * 2.0,
+                    )
+                busy_ns = self._scan_busy_ns_total
+                self._scan_busy_ns_total = 0
+                elapsed_ms = max(1.0, (loop.time() - window_started_monotonic) * 1000.0)
+                consumers = max(1, self._config.scan_evaluation_consumers)
+                self._last_window_busy_ratio = round(
+                    min(1.0, (busy_ns / 1_000_000) / (elapsed_ms * consumers)), 4
+                )
+                await self._finalize_event_window(window_id)
+                self._record_repair_readmissions(coordinator, window_id, shortlist_symbols)
+                self._publish_window_evidence(coordinator, window_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - window boundary must survive
+                await self._handle_error(f"event-window:{window_id}", exc)
+            self._coverage_watchdog_check(coordinator)
+            if loop.time() >= next_checkpoint_monotonic:
+                next_checkpoint_monotonic = (
+                    loop.time() + float(self._config.market_frame_checkpoint_sec)
+                )
+                checkpoint = getattr(
+                    self._market_data_provider, "checkpoint_frame_store", None
+                )
+                if checkpoint is not None:
+                    written = await checkpoint()
+                    if written is not None:
+                        self._logger.info(
+                            "Frame store checkpoint | symbols=%s", written
+                        )
+
+    def _publish_window_evidence(
+        self, coordinator: ScanCoordinator, window_id: str
+    ) -> None:
+        """Bounded overwrite-in-place window evidence; never gates trading."""
+        store = getattr(self._market_data_provider, "frame_store", None)
+        document: dict[str, Any] = {
+            "schema_version": 2,
+            "timing_semantics": "window_event_driven_v1",
+            "runtime_instance_id": self._runtime_instance_id,
+            "code_version": self._code_version,
+            "window_id": window_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "coordinator": coordinator.evidence_document(),
+            "frame_store": (
+                dict(store.counters) if store is not None else {}
+            ),
+            "provider_counters": {
+                key: value
+                for key, value in self._market_data_provider.evidence_snapshot()[
+                    "counters"
+                ].items()
+                if key.startswith("frame_store")
+            },
+            "outcome_worker": (
+                self._outcome_worker.stats()
+                if self._outcome_worker is not None
+                else None
+            ),
+            "request_scheduler": (
+                self._request_scheduler.stats_snapshot()
+                if self._request_scheduler is not None
+                else {}
+            ),
+            "research_queue": (
+                self._research_queue.stats()
+                if self._research_queue is not None
+                else {}
+            ),
+            "delivery": self._delivery_worker.stats(),
+            "workers": {
+                "evaluation_consumers": self._config.scan_evaluation_consumers,
+                "busy_ratio_last_window": self._last_window_busy_ratio,
+            },
+            "diagnostics": {
+                "event_loop_lag_ms": self._latest_event_loop_lag_ms() or 0.0,
+                "warmup": self.warmup_status(),
+                "pipeline_counters": {
+                    "frame_store": dict(store.counters) if store is not None else {},
+                    "coordinator_terminal": coordinator.status_counts(),
+                    "coordinator_outstanding": coordinator.outstanding_count(),
+                    "coordinator_p0_deadline_misses": coordinator.p0_deadline_misses,
+                },
+            },
+        }
+        try:
+            publish_evidence(
+                self._config.runtime_timing_evidence_path, document
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence never gates runtime
+            if self._error_throttler.should_send("window_evidence"):
+                self._logger.warning(
+                    "Window evidence publication failed | error=%s",
+                    type(exc).__name__,
+                )
+
+    def _coverage_watchdog_check(self, coordinator: ScanCoordinator) -> None:
+        """Report missing terminal tasks; never launch a second scan."""
+        for window_id in coordinator.recent_windows():
+            missing = coordinator.missing_tasks(window_id)
+            if missing:
+                self._logger.warning(
+                    "Coverage watchdog | window=%s missing_terminals=%s symbols=%s",
+                    window_id,
+                    len(missing),
+                    ",".join(missing[:5]),
+                )
+
+    async def _scan_consumer(self) -> None:
+        coordinator = self._scan_coordinator
+        assert coordinator is not None
+        while True:
+            task = await coordinator.acquire()
+            if task is None:
+                return
+            busy_started = time.perf_counter_ns()
+            try:
+                status = await self._execute_scan_task(task)
+            except asyncio.CancelledError:
+                # Mid-flight cancellation still owes terminal accounting.
+                coordinator.record_terminal(task, ScanTerminalStatus.SCAN_ERROR)
+                raise
+            except Exception as exc:  # noqa: BLE001 - one task cannot kill consumers
+                self._logger.exception(
+                    "Scan task crash | window=%s symbol=%s error=%s",
+                    task.window_id,
+                    task.symbol,
+                    type(exc).__name__,
+                )
+                status = ScanTerminalStatus.SCAN_ERROR
+            self._scan_busy_ns_total += time.perf_counter_ns() - busy_started
+            coordinator.record_terminal(task, status)
+
+    async def _execute_scan_task(self, task: ScanTask) -> ScanTerminalStatus:
+        provider = self._market_data_provider
+        store = provider.frame_store
+        coordinator = self._scan_coordinator
+        assert store is not None and coordinator is not None
+        priority = RequestPriority.LIVE_SCAN
+        spans: dict[str, float] = {}
+        stage_started = time.perf_counter()
+        async with self._symbol_mutations.mutation(task.symbol):
+            frame = await provider.decision_market_frame(
+                task.symbol,
+                priority=priority,
+                deadline_monotonic=task.deadline_monotonic,
+            )
+            if frame is None or not frame.actionable:
+                stale_reason = frame.stale_reason if frame else "NO_FRAME"
+                if self._last_data_gate_reasons.get(task.symbol) != stale_reason:
+                    self._last_data_gate_reasons[task.symbol] = stale_reason
+                    self._logger.info(
+                        "Scan task data gate | window=%s symbol=%s reason=%s "
+                        "last_closed=%s ticker_received=%s",
+                        task.window_id,
+                        task.symbol,
+                        stale_reason,
+                        frame.last_closed_at_utc if frame else None,
+                        frame.ticker.received_at if frame and frame.ticker else None,
+                    )
+                if stale_reason in {
+                    "WARMING",
+                    "INCOMPLETE_RING",
+                    "OI_HISTORY_INCOMPLETE",
+                    "NO_FRAME",
+                }:
+                    return ScanTerminalStatus.INCOMPLETE_DATA
+                return ScanTerminalStatus.STALE_DATA
+            if self._last_data_gate_reasons.pop(task.symbol, None) is not None:
+                self._logger.info("Scan task data recovered | symbol=%s", task.symbol)
+            derivatives = store.derivatives_payload(task.symbol) or {}
+            if (
+                self._config.derivatives_enabled
+                and derivatives.get("derivatives_status") == "MISSING"
+            ):
+                # Preserve existing data-quality blocking semantics: missing
+                # enrichment is INCOMPLETE_DATA, never a reinterpretation as
+                # NO_SETUP.
+                return ScanTerminalStatus.INCOMPLETE_DATA
+            decision_market = await provider.capture_decision_snapshot(
+                task.symbol,
+                frame_1m=frame.frame_1m,
+                include_liquidity=False,
+                derivatives=derivatives,
+            )
+            if decision_market is None:
+                return ScanTerminalStatus.INCOMPLETE_DATA
+            validation_mode = self._config.market_data_validation_mode
+            if validation_mode.value != "OFF":
+                try:
+                    validation = MarketDataValidator(
+                        derivatives_enabled=self._config.derivatives_enabled,
+                        now=decision_market.captured_at_utc,
+                    ).validate(
+                        task.symbol,
+                        decision_market.frame_1m.frame,
+                        captured_at=decision_market.captured_at_utc,
+                        oi_observed_at=_observed_at(derivatives.get("oi_observed_at")),
+                        funding_observed_at=_observed_at(derivatives.get("funding_observed_at")),
+                        required_sources=("oi", "funding"),
+                    )
+                except Exception as exc:  # noqa: BLE001 - shadow must be observational
+                    provider.record_decision_evidence("market_validation_error", error=type(exc).__name__)
+                    if validation_mode.value == "ENFORCED":
+                        return ScanTerminalStatus.INCOMPLETE_DATA
+                    self._logger.warning("market-data validation shadow failed | error=%s", type(exc).__name__)
+                else:
+                    provider.record_decision_evidence(
+                        "market_validation", quality=validation.overall.value,
+                    )
+                    if validation_mode.value == "SHADOW" and validation.overall is not MarketDataQuality.ACTIONABLE:
+                        self._logger.warning("market-data validation shadow invalid | symbol=%s quality=%s", task.symbol, validation.overall.value)
+                    elif validation_mode.value == "ENFORCED" and validation.overall is not MarketDataQuality.ACTIONABLE:
+                        if validation.overall is MarketDataQuality.STALE:
+                            return ScanTerminalStatus.STALE_DATA
+                        return ScanTerminalStatus.INCOMPLETE_DATA
+            spans["feature_ms"] = (time.perf_counter() - stage_started) * 1000.0
+            stage_started = time.perf_counter()
+            active_selection_at = datetime.now(timezone.utc)
+            load_active_symbol = getattr(
+                self._state_store, "load_active_symbol", None
+            )
+            state = (
+                load_active_symbol(task.symbol, now=active_selection_at)
+                if load_active_symbol is not None
+                else self._state_store.load(task.symbol)
+            )
+            if state is not None and (
+                state.state in {EventStatus.IDLE, EventStatus.EXPIRED}
+                or (
+                    state.expires_at is not None
+                    and state.expires_at <= active_selection_at
+                )
+            ):
+                state = None
+            task_timing = CycleTiming.begin(cycle_sequence=0)
+            timing_token = attach_cycle_timing(task_timing)
+            try:
+                decision, updated_state = await self._process_symbol(
+                    task.symbol,
+                    decision_market.frame_1m.frame,
+                    state,
+                    market_snapshot=decision_market,
+                )
+            except RequestDeadlineExceeded:
+                detach_cycle_timing(timing_token)
+                return ScanTerminalStatus.DEADLINE_EXCEEDED
+            except Exception as exc:  # noqa: BLE001 - classify per-symbol failures
+                detach_cycle_timing(timing_token)
+                message = str(exc).lower()
+                if (
+                    "rate limit" in message
+                    or "10006" in message
+                    or "too many visits" in message
+                ):
+                    return ScanTerminalStatus.RATE_LIMITED
+                raise
+            storage_ms = task_timing.components_ns["storage"] / 1_000_000
+            detach_cycle_timing(timing_token)
+            process_ms = (time.perf_counter() - stage_started) * 1000.0
+            spans["strategy_ms"] = max(0.0, process_ms - storage_ms)
+            spans["db_write_ms"] = storage_ms
+            spans["outbox_enqueue_ms"] = storage_ms if decision is not None else 0.0
+            stage_started = time.perf_counter()
+            if updated_state is not None:
+                self._state_store.save(updated_state)
+            spans["db_write_ms"] += (time.perf_counter() - stage_started) * 1000.0
+            self._record_provider_evaluation_evidence(
+                task.symbol, decision_market, decision
+            )
+            coordinator.record_task_spans(task, spans)
+            if decision is not None and decision.actionable:
+                self._health.on_signal()
+                self._window_decision_counts[task.window_id] = (
+                    self._window_decision_counts.get(task.window_id, 0) + 1
+                )
+            return (
+                ScanTerminalStatus.SCANNED_OK
+                if decision is not None
+                else ScanTerminalStatus.NO_SETUP
+            )
+
+    # Coverage vocabulary conversion: the coordinator keeps its own seven
+    # terminal statuses; the persisted coverage tables retain the established
+    # SCANNED_OK/SCAN_FAILED reason-code vocabulary.
+    _COVERAGE_STATUS_MAP = {
+        ScanTerminalStatus.SCANNED_OK: ("SCANNED_OK", "SCANNED_OK"),
+        ScanTerminalStatus.NO_SETUP: ("SCANNED_OK", "NO_SETUP"),
+        ScanTerminalStatus.INCOMPLETE_DATA: ("SCAN_FAILED", "MARKET_DATA_INCOMPLETE"),
+        ScanTerminalStatus.STALE_DATA: ("SCAN_FAILED", "STALE_MARKET_DATA"),
+        ScanTerminalStatus.RATE_LIMITED: ("SCAN_FAILED", "RATE_LIMITED"),
+        ScanTerminalStatus.DEADLINE_EXCEEDED: ("SCAN_FAILED", "DEADLINE_EXCEEDED"),
+        ScanTerminalStatus.SCAN_ERROR: ("SCAN_FAILED", "SCAN_EXCEPTION"),
+    }
+
+    async def _finalize_event_window(self, window_id: str) -> None:
+        """Persist one rotation/cycle coverage record per completed window."""
+        record = self._window_records.pop(window_id, None)
+        decisions = self._window_decision_counts.pop(window_id, 0)
+        coordinator = self._scan_coordinator
+        if record is None or coordinator is None:
+            return
+        telemetry = getattr(
+            self._market_data_provider, "last_universe_telemetry", None
+        )
+        if telemetry is None:
+            return
+        started = record["opened_at"]
+        terminal = coordinator.terminal_statuses(window_id)
+        symbol_results = [
+            {
+                "symbol": symbol,
+                "terminal_status": self._COVERAGE_STATUS_MAP[status][0],
+                "reason_code": self._COVERAGE_STATUS_MAP[status][1],
+            }
+            for symbol, status in sorted(terminal.items())
+        ]
+        prepare_rotation = getattr(
+            self._repository, "prepare_market_scan_rotation", None
+        )
+        if prepare_rotation is not None:
+            self._shadow_rotation_id = (
+                prepare_rotation(
+                    rotation_started_at=started,
+                    exchange_symbols=list(telemetry.exchange_symbols),
+                    eligible_symbols=list(telemetry.eligible_symbols),
+                )
+                or "unknown"
+            )
+        record_coverage = getattr(self._repository, "record_market_scan_cycle", None)
+        if record_coverage is None:
+            return
+
+        def _write_coverage() -> Any:
+            return record_coverage(
+                cycle_started_at=started,
+                cycle_completed_at=datetime.now(timezone.utc),
+                exchange_symbols=list(telemetry.exchange_symbols),
+                eligible_symbols=list(telemetry.eligible_symbols),
+                excluded=list(telemetry.excluded),
+                scheduled_symbols=[row["symbol"] for row in symbol_results],
+                symbol_results=symbol_results,
+                candidate_symbols=decisions,
+                evaluated_symbols=len(symbol_results),
+            )
+
+        if self._research_queue is not None:
+            # Coverage is research-class: it drains through the bounded queue
+            # outside P0/P1 evaluation and is dropped (counted) under pressure,
+            # never applied as backpressure onto the trading path.
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
+
+            def _queued_write() -> Any:
+                result = _write_coverage()
+                if not done.done():
+                    loop.call_soon_threadsafe(done.set_result, result)
+                return result
+
+            if self._research_queue.submit(f"coverage:{window_id}", _queued_write):
+                try:
+                    coverage_result = await done
+                except asyncio.CancelledError:
+                    raise
+            else:
+                coverage_result = {"dropped": True}
+                self._logger.warning(
+                    "coverage payload dropped under queue pressure | window=%s",
+                    window_id,
+                )
+        else:
+            with measure_sync("research"):
+                coverage_result = _write_coverage()
+        if coverage_result is None:
+            await self._handle_error(
+                "market-coverage-telemetry",
+                RuntimeError("coverage ledger write returned no result"),
+            )
 
     async def _run_fast_monitor(self) -> None:
         """Bounded, fair active-candidate monitor; never scans the full universe."""
+        request_class.set(RequestPriority.FAST_MONITOR)
         while self._fast_monitor_running:
             try:
-                sleep_started = time.perf_counter()
                 await asyncio.sleep(self._config.climax_fast_poll_sec)
-                event_loop_lag_ms = max(
-                    0.0,
-                    (time.perf_counter() - sleep_started - self._config.climax_fast_poll_sec)
-                    * 1000.0,
-                )
                 poll_started = datetime.now(timezone.utc)
                 self._fast_monitor_poll_sequence += 1
                 poll_sequence = self._fast_monitor_poll_sequence
@@ -1230,9 +2438,8 @@ class ShortSignalBot:
                     pool_size=len(keys),
                     poll_sequence=poll_sequence,
                     last_poll_at=poll_started,
-                    event_loop_lag_ms=event_loop_lag_ms,
+                    event_loop_lag_ms=self._latest_event_loop_lag_ms(),
                 )
-                self._health.mark_event_loop_lag(event_loop_lag_ms)
                 if not keys:
                     completed = datetime.now(timezone.utc)
                     self._repository.update_fast_monitor_heartbeat(
@@ -1240,9 +2447,8 @@ class ShortSignalBot:
                         pool_size=0,
                         poll_sequence=poll_sequence,
                         last_complete_at=completed,
+                        event_loop_lag_ms=self._latest_event_loop_lag_ms(),
                     )
-                    self._health.mark_fast_monitor(completed)
-                    self._persist_runtime_health()
                     self._repository.record_climax_monitor_event(
                         created_at=completed,
                         symbol="__FAST_MONITOR__",
@@ -1282,8 +2488,10 @@ class ShortSignalBot:
                         poll_sequence=poll_sequence,
                         worker_id="climax-fast-monitor",
                     )
+                # Fast monitor shares REST capacity without taking the live reserve.
                 frozen_frames = await self._market_data_provider.prefetch_historical_frames(
-                    [symbol for symbol, _ in selected]
+                    [symbol for symbol, _ in selected],
+                    priority=RequestPriority.FAST_MONITOR,
                 )
                 frames = {
                     symbol: frozen.frame.copy(deep=True)
@@ -1369,9 +2577,8 @@ class ShortSignalBot:
                     pool_size=len(self._active_climax_pool),
                     poll_sequence=poll_sequence,
                     last_complete_at=completed,
+                    event_loop_lag_ms=self._latest_event_loop_lag_ms(),
                 )
-                self._health.mark_fast_monitor(completed)
-                self._persist_runtime_health()
                 self._repository.record_climax_monitor_event(
                     created_at=completed,
                     symbol="__FAST_MONITOR__",
@@ -1398,6 +2605,7 @@ class ShortSignalBot:
                     pool_size=len(self._active_climax_pool),
                     poll_sequence=self._fast_monitor_poll_sequence,
                     last_error=str(exc),
+                    event_loop_lag_ms=self._latest_event_loop_lag_ms(),
                 )
                 self._repository.record_climax_monitor_event(
                     created_at=now,
@@ -1554,8 +2762,242 @@ class ShortSignalBot:
                 worker_id="runtime",
             )
 
-    async def update_outcomes(self, now: datetime | None = None) -> int:
-        return await self._outcome_tracker.update_due_outcomes(now=now)
+    async def update_outcomes(
+        self,
+        now: datetime | None = None,
+        *,
+        signal_limit: int = 25,
+        observation_limit: int = 25,
+    ) -> int:
+        return await self._outcome_tracker.update_due_outcomes(
+            now=now,
+            signal_limit=signal_limit,
+            observation_limit=observation_limit,
+        )
+
+    async def _evaluate_trapped_longs_v2_shadow(
+        self,
+        state: EventState,
+        features: SymbolFeatures,
+        frame_1m: pd.DataFrame,
+        derivatives: dict[str, Any] | None = None,
+    ) -> SignalDecision | None:
+        """Evaluate V2, retain shadow evidence, and optionally admit one live signal."""
+        if not getattr(self._config, "trapped_longs_reversal_v2_enabled", False):
+            return None
+        breakout_at = state.event_high_time or state.event_start_time or features.asof
+        snapshot = dict(state.event_features_snapshot or {})
+        raw_oi = (derivatives or {}).get("open_interest") or snapshot.get("oi_observations", ())
+        oi_items: list[OiObservation] = []
+        for item in raw_oi:
+            if not isinstance(item, dict):
+                continue
+            observed = item.get("observed_at", item.get("timestamp"))
+            value = item.get("value", item.get("openInterest"))
+            try:
+                if isinstance(observed, (int, float)) or str(observed).isdigit():
+                    observed_at = pd.to_datetime(int(observed), unit="ms", utc=True).to_pydatetime()
+                else:
+                    observed_at = pd.to_datetime(observed, utc=True).to_pydatetime()
+                oi_items.append(OiObservation(observed_at, float(value) if value is not None else None))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        oi = tuple(oi_items)
+        breakout = FrozenBreakout(
+            identity=state.event_id or f"{features.symbol}:{breakout_at.isoformat()}",
+            occurred_at=breakout_at,
+            reference=snapshot.get("breakout_reference") or state.event_high,
+            revision=int(snapshot.get("event_revision") or 1),
+            symbol=features.symbol,
+        )
+        result = evaluate_trapped_longs_reversal_v2(frame_1m, breakout, oi, features.asof, config=self._config)
+        evidence = build_observation_evidence(
+            {
+                "result": {
+                    "identity": result.identity,
+                    "revision": result.revision,
+                    "actionable": result.actionable,
+                    "blockers": result.blockers,
+                    "explanation": {
+                        key: {"measurement": value.measurement, "passed": value.passed}
+                        for key, value in result.explanation.items()
+                    },
+                },
+                "features": asdict(features),
+            }
+        )
+        observation_id = f"{result.identity}:{features.asof.isoformat()}"
+        key = make_observation_idempotency_key(
+            strategy_family="TRAPPED_LONGS",
+            strategy=TRAPPED_LONGS_REVERSAL_V2,
+            symbol=features.symbol,
+            root_event_id=result.identity,
+            event_revision=result.revision,
+            evaluation_phase="SHADOW_EVALUATION",
+            market_asof=features.asof,
+            input_fingerprint=evidence.input_fingerprint,
+            model_version=TRAPPED_LONGS_V2_MODEL_VERSION,
+            config_hash=self._strategy_config_hash,
+        )
+        if result.actionable:
+            candidate_id = f"{result.identity}:r{result.revision}"
+            attempt_id = f"{candidate_id}:a1"
+            try:
+                self._repository.upsert_strategy_candidate(
+                    candidate_id=candidate_id,
+                    root_event_id=result.identity,
+                    event_revision=result.revision,
+                    strategy=TRAPPED_LONGS_REVERSAL_V2,
+                    symbol=features.symbol,
+                    state="ACTIONABLE_SHADOW",
+                    observed_at=datetime.now(timezone.utc),
+                    attempt_id=attempt_id,
+                    evidence={
+                        "identity": result.identity,
+                        "blockers": list(result.blockers),
+                        "explanation": {
+                            key: {"measurement": value.measurement, "passed": value.passed}
+                            for key, value in result.explanation.items()
+                        },
+                    },
+                )
+            except Exception:
+                self._logger.exception(
+                    "V2 candidate ledger write failed symbol=%s root_event_id=%s",
+                    features.symbol,
+                    result.identity,
+                )
+            self._repository.record_strategy_observation(
+                StrategyObservation(
+                    observation_id=observation_id,
+                    idempotency_key=key,
+                    run_id=self._runtime_instance_id,
+                    runtime_instance_id=self._runtime_instance_id,
+                    runtime_started_at=self._runtime_started_at,
+                    code_version=self._code_version,
+                    strategy_family="TRAPPED_LONGS",
+                    strategy=TRAPPED_LONGS_REVERSAL_V2,
+                    evaluation_phase="SHADOW_EVALUATION",
+                    symbol=features.symbol,
+                    root_event_id=result.identity,
+                    event_revision=result.revision,
+                    attempt_id=(
+                        f"{result.identity}:r{result.revision}:a1"
+                        if result.actionable
+                        else None
+                    ),
+                    evaluation_id=None,
+                    signal_id=None,
+                    observed_at=datetime.now(timezone.utc),
+                    exchange_time=None,
+                    market_asof=features.asof,
+                    live_decision="UNCHANGED",
+                    shadow_decision="ACTIONABLE" if result.actionable else "BLOCKED",
+                    score=0,
+                    blockers=list(result.blockers),
+                    warnings=[item["path"] for item in evidence.warnings],
+                    market_price=features.price,
+                    event_high=state.event_high,
+                    model_version=TRAPPED_LONGS_V2_MODEL_VERSION,
+                    config_hash=self._strategy_config_hash,
+                    input_fingerprint=evidence.input_fingerprint,
+                    input_snapshot=evidence.snapshot,
+                )
+            )
+        if not result.actionable:
+            return None
+        decision = SignalDecision(
+            symbol=features.symbol,
+            event_id=result.identity,
+            signal_type=SignalType.CONFIRM,
+            grade="B",
+            score=70,
+            market_price=features.price,
+            short_zone_low=float(breakout.reference or features.price) * 0.99,
+            short_zone_high=float(breakout.reference or features.price) * 1.01,
+            signal_time=features.asof,
+            reasons=[key for key, factor in result.explanation.items() if factor.passed],
+            risk_flags=[],
+            features_snapshot=asdict(features),
+            score_breakdown={"trapped_longs_v2": 70.0},
+            strategy_type="TRAPPED_LONGS_REVERSAL",
+            strategy_subtype=TRAPPED_LONGS_REVERSAL_V2,
+            model_version=TRAPPED_LONGS_V2_MODEL_VERSION,
+            lifecycle_state="TRAPPED_LONGS_V2_ADMITTED",
+            strategy_metadata={
+                "event_high": state.event_high,
+                "breakout_reference": breakout.reference,
+                "event_revision": result.revision,
+                "v2_explanation": {
+                    key: {"measurement": value.measurement, "passed": value.passed}
+                    for key, value in result.explanation.items()
+                },
+            },
+        )
+        if not live_delivery_enabled(decision, self._config):
+            return None
+        if self._repository.has_signal_for_event(
+            decision.symbol,
+            decision.event_id,
+            TRAPPED_LONGS_REVERSAL_V2,
+            TRAPPED_LONGS_V2_MODEL_VERSION,
+        ):
+            return None
+        payload = format_signal_message(decision, self._config.timezone)
+        evaluation_id = self._repository.record_climax_evaluation(
+            evaluation_time=datetime.now(timezone.utc),
+            symbol=features.symbol,
+            strategy="TRAPPED_LONGS_REVERSAL",
+            subtype_candidate=TRAPPED_LONGS_REVERSAL_V2,
+            model_version=TRAPPED_LONGS_V2_MODEL_VERSION,
+            event_id=result.identity,
+            event_high=state.event_high,
+            event_high_time=state.event_high_time,
+            event_detected_at=state.event_start_time,
+            candidate_added_at=None,
+            candidate_age_sec=None,
+            fast_monitor=False,
+            poll_sequence=None,
+            frame_asof=features.asof,
+            candles_asof=features.asof,
+            oi_asof=features.asof,
+            orderbook_asof=features.asof if features.liquidity_available else None,
+            score=decision.score,
+            grade=decision.grade,
+            actionable=True,
+            admission_passed=True,
+            veto_reasons=[],
+            passed_conditions=list(decision.reasons),
+            data_quality=list(features.data_quality_warnings),
+            liquidity={"available": features.liquidity_available},
+            oi={"status": features.derivatives_status},
+            features=decision.features_snapshot,
+            lifecycle_state="LIVE_ADMISSION",
+            telegram_eligible=True,
+            runtime_instance_id=self._runtime_instance_id,
+            root_event_id=result.identity,
+            event_revision=result.revision,
+            observed_at=features.asof,
+            market_asof=features.asof,
+            live_decision="ACTIONABLE",
+            live_veto_reasons=[],
+        )
+        if evaluation_id is None:
+            return None
+        self._repository.save_signal(
+            decision,
+            state,
+            telegram_sent=False,
+            delivery_payload=payload,
+            provenance=self._signal_provenance(
+                decision,
+                root_event_id=result.identity,
+                decision_evaluation_id=evaluation_id,
+                admission_evaluation_id=evaluation_id,
+            ),
+        )
+        self._delivery_worker.wake()
+        return decision
 
     def evaluate_trapped_longs_reversal(
         self, state: EventState, features: SymbolFeatures, frame_1m: pd.DataFrame, **kwargs: Any
@@ -1587,46 +3029,26 @@ class ShortSignalBot:
             minutes=int(getattr(self._config, "trapped_longs_max_lifetime_minutes", 15))
         )
         stored_attempt = self._repository.get_shadow_entry_attempt(attempt_id=attempt_id)
-        stored_attempt_created_at = (
+        attempt_created_at = (
             stored_attempt["attempt_created_at"]
             if stored_attempt and stored_attempt["attempt_created_at"] is not None
-            else None
+            else evaluation_time
         )
-        stored_confirmation_expires_at = (
+        confirmation_expires_at = (
             stored_attempt["confirmation_expires_at"]
             if stored_attempt and stored_attempt["confirmation_expires_at"] is not None
-            else None
+            else proposed_expiry
         )
-        attempt_created_at = (
-            stored_attempt_created_at
-            if isinstance(stored_attempt_created_at, datetime)
-            else _parse_optional_datetime(stored_attempt_created_at)
-        ) or evaluation_time
-        confirmation_expires_at = (
-            stored_confirmation_expires_at
-            if isinstance(stored_confirmation_expires_at, datetime)
-            else _parse_optional_datetime(stored_confirmation_expires_at)
-        ) or proposed_expiry
-        registered_evaluations = self._evaluate_registered_strategies(
-            state=state,
-            features=features,
-            frame_1m=frame_1m,
-            short_zone=None,
-            decision_timestamp=evaluation_time,
-            trapped_attempt_created_at=attempt_created_at,
-            trapped_confirmation_expires_at=confirmation_expires_at,
+        evaluation = self.evaluate_trapped_longs_reversal(
+            state,
+            features,
+            frame_1m,
+            attempt_created_at=attempt_created_at,
+            confirmation_expires_at=confirmation_expires_at,
+            decision_time=evaluation_time,
         )
-        evaluation = self._registered_evaluation(
-            registered_evaluations, TRAPPED_LONGS_REVERSAL
-        )
-        if evaluation is None:
-            return None
-        evaluation_vetoes = list(evaluation.vetoes)
-        evaluation_metadata = dict(evaluation.strategy_metadata)
-        evaluation_subtype = evaluation.strategy_subtype
-        evaluation_quality = list(evaluation.risk_flags)
         expiry_blocked = bool(
-            set(evaluation_vetoes)
+            set(evaluation.veto_reasons)
             & {"CONFIRMATION_WINDOW_EXPIRED", "BORN_EXPIRED_ATTEMPT"}
         )
         lifecycle = advance_trapped_longs_lifecycle(
@@ -1634,14 +3056,14 @@ class ShortSignalBot:
             breakout_at=breakout_at,
             observed_at=features.asof,
             event_revision=1,
-            breakout_confirmed="breakout_not_confirmed" not in evaluation_vetoes,
-            oi_confirmed="oi_missing" not in evaluation_vetoes and "oi_below_threshold" not in evaluation_vetoes,
-            closed_candles=int(evaluation_metadata.get("closed_structural_candles") or 0),
-            close_below_reference=bool(evaluation_metadata.get("close_below_breakout_reference")),
-            failed_retest=bool(evaluation_metadata.get("failed_retest_confirmed")),
-            no_new_high=bool(evaluation_metadata.get("no_new_high")),
-            liquidity_ok=not any(reason in evaluation_vetoes for reason in {"liquidity_unavailable", "liquidity_incomplete", "liquidity_block"}),
-            rejection_ok="rejection_below_threshold" not in evaluation_vetoes,
+            breakout_confirmed="breakout_not_confirmed" not in evaluation.veto_reasons,
+            oi_confirmed="oi_missing" not in evaluation.veto_reasons and "oi_below_threshold" not in evaluation.veto_reasons,
+            closed_candles=int(evaluation.metadata.get("closed_structural_candles") or 0),
+            close_below_reference=bool(evaluation.metadata.get("close_below_breakout_reference")),
+            failed_retest=bool(evaluation.metadata.get("failed_retest_confirmed")),
+            no_new_high=bool(evaluation.metadata.get("no_new_high")),
+            liquidity_ok=not any(reason in evaluation.veto_reasons for reason in {"liquidity_unavailable", "liquidity_incomplete", "liquidity_block"}),
+            rejection_ok="rejection_below_threshold" not in evaluation.veto_reasons,
             max_lifetime_minutes=int(getattr(self._config, "trapped_longs_max_lifetime_minutes", 15)),
         )
         self._repository.upsert_shadow_entry_attempt(
@@ -1649,7 +3071,7 @@ class ShortSignalBot:
             root_event_id=root_id,
             observed_at=evaluation_time,
             local_retest_high=features.last_high,
-            breakdown_level=float(evaluation_metadata.get("breakout_reference") or 0.0),
+            breakdown_level=float(evaluation.metadata.get("breakout_reference") or 0.0),
             attempt_state=(
                 "EXPIRED"
                 if expiry_blocked
@@ -1659,7 +3081,7 @@ class ShortSignalBot:
             confirmation_expires_at=proposed_expiry,
             event_revision=lifecycle.event_revision,
             runtime_instance_id=self._runtime_instance_id,
-            model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
+            model_version=TRAPPED_LONGS_MODEL_VERSION,
             max_attempts_per_root_event=1,
         )
         if lifecycle.state == "ADMITTED" and evaluation.actionable:
@@ -1673,16 +3095,16 @@ class ShortSignalBot:
                 observed_at=evaluation_time,
                 market_asof=features.asof,
                 runtime_instance_id=self._runtime_instance_id,
-                model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
+                model_version=TRAPPED_LONGS_MODEL_VERSION,
             )
         evaluation_id = self._repository.record_climax_evaluation(
             evaluation_time=evaluation_time,
             symbol=features.symbol,
             strategy=TRAPPED_LONGS_REVERSAL,
-            subtype_candidate=evaluation_subtype or TRAPPED_LONGS_REVERSAL,
-            model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
+            subtype_candidate=evaluation.subtype or TRAPPED_LONGS_REVERSAL,
+            model_version=TRAPPED_LONGS_MODEL_VERSION,
             event_id=root_id,
-            event_high=evaluation_metadata.get("event_high"),
+            event_high=evaluation.metadata.get("event_high"),
             event_high_time=state.event_high_time,
             event_detected_at=state.event_start_time,
             candidate_added_at=None,
@@ -1697,9 +3119,9 @@ class ShortSignalBot:
             grade=evaluation.grade,
             actionable=evaluation.actionable,
             admission_passed=evaluation.actionable,
-            veto_reasons=evaluation_vetoes,
-            passed_conditions=[k for k, v in evaluation_metadata.items() if isinstance(v, bool) and v],
-            data_quality=evaluation_quality,
+            veto_reasons=evaluation.veto_reasons,
+            passed_conditions=[k for k, v in evaluation.metadata.items() if isinstance(v, bool) and v],
+            data_quality=evaluation.data_quality,
             liquidity={
                 "available": features.liquidity_available,
                 "spread_pct": features.spread_pct,
@@ -1708,7 +3130,7 @@ class ShortSignalBot:
                 "depth_2pct_usdt": features.orderbook_depth_usdt_2pct,
             },
             oi={"change_15m_pct": features.oi_change_15m, "status": features.derivatives_status},
-            features={**asdict(features), "trapped_longs": evaluation_metadata},
+            features={**asdict(features), "trapped_longs": evaluation.metadata},
             lifecycle_state=(
                 "EXPIRED" if expiry_blocked else "ADMITTED" if evaluation.actionable else "RETEST_IN_PROGRESS"
             ),
@@ -1721,15 +3143,149 @@ class ShortSignalBot:
             market_asof=features.asof,
             evaluation_completed_at=evaluation_time,
             live_decision="ACTIONABLE" if evaluation.actionable else "BLOCKED",
-            live_veto_reasons=evaluation_vetoes,
+            live_veto_reasons=evaluation.veto_reasons,
         )
         if not evaluation.actionable or evaluation_id is None:
             return None
         if self._repository.has_signal_for_event(
-            features.symbol, root_id, TRAPPED_LONGS_REVERSAL, evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION
+            features.symbol, root_id, TRAPPED_LONGS_REVERSAL, TRAPPED_LONGS_MODEL_VERSION
         ):
             return None
-        reference = float(evaluation_metadata["breakout_reference"])
+        admission_evaluation_id = evaluation_id
+        # Fail-closed pre-delivery recheck mirroring the LOW_VOLUME template:
+        # unknown != false, missing != zero — no fresh snapshot vetoes delivery.
+        if not getattr(
+            self._scanner,
+            "supports_symbol_frames",
+            hasattr(self._scanner, "fetch_symbol_frames"),
+        ):
+            self._logger.warning(
+                "Trapped longs delivery veto: fresh_data_unavailable "
+                "symbol=%s reason=scanner_frame_capability_missing",
+                features.symbol,
+            )
+            return None
+        decision_market = await self._market_data_provider.capture_decision_snapshot(
+            features.symbol
+        )
+        if decision_market is None or decision_market.frame_1m.frame.empty:
+            self._logger.warning(
+                "Trapped longs delivery veto: fresh_data_unavailable "
+                "symbol=%s reason=decision_snapshot_missing",
+                features.symbol,
+            )
+            return None
+        recheck_time = datetime.now(timezone.utc)
+        fresh_frame = decision_market.frame_1m.frame.copy(deep=True)
+        fresh_features = self._feature_builder.build(
+            features.symbol,
+            fresh_frame,
+            state=state,
+            derivatives=dict(decision_market.derivatives),
+            liquidity=dict(decision_market.liquidity or {}),
+            market_asof=recheck_time,
+        )
+        fresh_evaluation = self.evaluate_trapped_longs_reversal(
+            state,
+            fresh_features,
+            fresh_frame,
+            attempt_created_at=attempt_created_at,
+            confirmation_expires_at=confirmation_expires_at,
+            decision_time=recheck_time,
+        )
+        if fresh_evaluation is None:
+            self._logger.warning(
+                "Trapped longs delivery veto: fresh_data_unavailable "
+                "symbol=%s reason=recheck_evaluation_missing",
+                features.symbol,
+            )
+            return None
+        fresh_evaluation_id = self._repository.record_climax_evaluation(
+            evaluation_time=recheck_time,
+            symbol=features.symbol,
+            strategy=TRAPPED_LONGS_REVERSAL,
+            subtype_candidate=fresh_evaluation.subtype or TRAPPED_LONGS_REVERSAL,
+            model_version=TRAPPED_LONGS_MODEL_VERSION,
+            event_id=root_id,
+            event_high=fresh_evaluation.metadata.get("event_high"),
+            event_high_time=state.event_high_time,
+            event_detected_at=state.event_start_time,
+            candidate_added_at=None,
+            candidate_age_sec=None,
+            fast_monitor=False,
+            poll_sequence=None,
+            frame_asof=fresh_features.asof,
+            candles_asof=fresh_features.asof,
+            oi_asof=fresh_features.asof
+            if fresh_features.oi_change_15m is not None
+            else None,
+            orderbook_asof=fresh_features.asof
+            if fresh_features.liquidity_available
+            else None,
+            score=fresh_evaluation.score,
+            grade=fresh_evaluation.grade,
+            actionable=fresh_evaluation.actionable,
+            admission_passed=fresh_evaluation.actionable,
+            veto_reasons=fresh_evaluation.veto_reasons,
+            passed_conditions=[
+                k
+                for k, v in fresh_evaluation.metadata.items()
+                if isinstance(v, bool) and v
+            ],
+            data_quality=fresh_evaluation.data_quality,
+            liquidity={
+                "available": fresh_features.liquidity_available,
+                "spread_pct": fresh_features.spread_pct,
+                "slippage_pct": fresh_features.slippage_pct,
+                "depth_1pct_usdt": fresh_features.orderbook_depth_usdt_1pct,
+                "depth_2pct_usdt": fresh_features.orderbook_depth_usdt_2pct,
+            },
+            oi={
+                "change_15m_pct": fresh_features.oi_change_15m,
+                "status": fresh_features.derivatives_status,
+            },
+            features={
+                **asdict(fresh_features),
+                "trapped_longs": {
+                    **fresh_evaluation.metadata,
+                    "evaluation_phase": "PRE_DELIVERY_RECHECK",
+                },
+            },
+            lifecycle_state="DELIVERY_RECHECK",
+            telegram_eligible=fresh_evaluation.actionable,
+            runtime_instance_id=self._runtime_instance_id,
+            root_event_id=root_id,
+            event_revision=1,
+            attempt_id=attempt_id,
+            observed_at=recheck_time,
+            market_asof=fresh_features.asof,
+            evaluation_completed_at=recheck_time,
+            live_decision="ACTIONABLE" if fresh_evaluation.actionable else "BLOCKED",
+            live_veto_reasons=fresh_evaluation.veto_reasons,
+        )
+        self._record_trapped_longs_recheck_observation(
+            fresh_evaluation,
+            fresh_evaluation_id,
+            state=state,
+            features=fresh_features,
+            root_id=root_id,
+            attempt_id=attempt_id,
+            observed_at=recheck_time,
+        )
+        if (
+            fresh_evaluation_id is None
+            or not fresh_evaluation.actionable
+            or (fresh_evaluation.subtype or TRAPPED_LONGS_REVERSAL)
+            != (evaluation.subtype or TRAPPED_LONGS_REVERSAL)
+        ):
+            self._logger.info(
+                "Trapped longs delivery veto: fresh_admission_failed symbol=%s reasons=%s",
+                features.symbol,
+                fresh_evaluation.veto_reasons,
+            )
+            return None
+        admission_evaluation_id = fresh_evaluation_id
+        reference = float(evaluation.metadata["breakout_reference"])
         decision = SignalDecision(
             symbol=features.symbol,
             event_id=root_id,
@@ -1740,34 +3296,121 @@ class ShortSignalBot:
             short_zone_low=reference * 0.99,
             short_zone_high=reference * 1.01,
             signal_time=features.asof,
-            reasons=list(evaluation.reasons),
-            risk_flags=list(evaluation.risk_flags),
+            reasons=["False breakout", "OI build-up", "Failed retest below breakout level"],
+            risk_flags=[],
             features_snapshot=asdict(features),
-            score_breakdown={"registry_score": float(evaluation.score)},
-            strategy_type=evaluation.strategy_type,
-            strategy_subtype=evaluation.strategy_subtype,
-            model_version=evaluation.model_version or TRAPPED_LONGS_MODEL_VERSION,
+            score_breakdown={"trapped_longs_v1": float(evaluation.score)},
+            strategy_type=TRAPPED_LONGS_REVERSAL,
+            strategy_subtype=TRAPPED_LONGS_REVERSAL,
+            model_version=TRAPPED_LONGS_MODEL_VERSION,
             lifecycle_state="TRAPPED_LONGS_ADMITTED",
-            blockers=list(evaluation.blockers),
-            strategy_metadata=evaluation_metadata,
+            strategy_metadata=evaluation.metadata,
         )
         if not live_delivery_enabled(decision, self._config):
             return None
         payload = format_signal_message(decision, self._config.timezone)
-        record = self._repository.persist_final_signal_bundle(
+        self._repository.save_signal(
             decision,
             state,
+            telegram_sent=False,
             delivery_payload=payload,
             provenance=self._signal_provenance(
                 decision,
                 root_event_id=root_id,
                 decision_evaluation_id=evaluation_id,
-                admission_evaluation_id=evaluation_id,
+                admission_evaluation_id=admission_evaluation_id,
             ),
         )
-        sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)
-        self._repository.update_signal_telegram_status(record.id, sent)
+        self._delivery_worker.wake()
         return decision
+
+    def _record_trapped_longs_recheck_observation(
+        self,
+        evaluation: object,
+        evaluation_id: int | None,
+        *,
+        state: EventState,
+        features: SymbolFeatures,
+        root_id: str,
+        attempt_id: str,
+        observed_at: datetime,
+    ) -> None:
+        """Ledger the trapped-longs PRE_DELIVERY_RECHECK; telemetry-only, never fatal."""
+        record_observation = getattr(
+            self._repository, "record_strategy_observation", None
+        )
+        if record_observation is None:
+            return
+        try:
+            snapshot = {
+                "event": {
+                    "event_id": state.event_id,
+                    "root_event_id": root_id,
+                    "event_revision": 1,
+                    "attempt_id": attempt_id,
+                    "event_high": state.event_high,
+                },
+                "evaluation": {
+                    "strategy": TRAPPED_LONGS_REVERSAL,
+                    "evaluation_phase": "PRE_DELIVERY_RECHECK",
+                    "score": evaluation.score,
+                    "grade": evaluation.grade,
+                    "metadata": dict(evaluation.metadata),
+                    "blockers": list(evaluation.veto_reasons),
+                    "warnings": list(evaluation.data_quality),
+                },
+                "features": asdict(features),
+            }
+            evidence = build_observation_evidence(snapshot)
+            observation = StrategyObservation(
+                observation_id=uuid.uuid4().hex,
+                idempotency_key=make_observation_idempotency_key(
+                    strategy_family="TRAPPED_LONGS",
+                    strategy=TRAPPED_LONGS_REVERSAL,
+                    symbol=features.symbol,
+                    root_event_id=root_id,
+                    event_revision=1,
+                    evaluation_phase="PRE_DELIVERY_RECHECK",
+                    market_asof=features.asof,
+                    input_fingerprint=evidence.input_fingerprint,
+                    model_version=TRAPPED_LONGS_MODEL_VERSION,
+                    config_hash=self._strategy_config_hash,
+                ),
+                run_id=self._runtime_instance_id,
+                runtime_instance_id=self._runtime_instance_id,
+                runtime_started_at=self._runtime_started_at,
+                code_version=self._code_version,
+                strategy_family="TRAPPED_LONGS",
+                strategy=TRAPPED_LONGS_REVERSAL,
+                evaluation_phase="PRE_DELIVERY_RECHECK",
+                symbol=features.symbol,
+                root_event_id=root_id,
+                event_revision=1,
+                attempt_id=attempt_id,
+                evaluation_id=evaluation_id,
+                signal_id=None,
+                observed_at=observed_at,
+                exchange_time=None,
+                market_asof=features.asof,
+                live_decision="ACTIONABLE" if evaluation.actionable else "BLOCKED",
+                shadow_decision="UNCHANGED",
+                score=evaluation.score,
+                blockers=list(evaluation.veto_reasons),
+                warnings=[item["path"] for item in evidence.warnings],
+                market_price=features.price,
+                event_high=state.event_high,
+                model_version=TRAPPED_LONGS_MODEL_VERSION,
+                config_hash=self._strategy_config_hash,
+                input_fingerprint=evidence.input_fingerprint,
+                input_snapshot=evidence.snapshot,
+            )
+            record_observation(observation)
+        except Exception:
+            self._logger.exception(
+                "Trapped longs recheck observation write failed symbol=%s root_event_id=%s",
+                features.symbol,
+                root_id,
+            )
 
     async def _evaluate_and_send_climax(
         self,
@@ -1815,24 +3458,21 @@ class ShortSignalBot:
                 liquidity=liquidity,
                 market_asof=market_asof,
             )
-        registered_evaluations = self._evaluate_registered_strategies(
-            state=state,
-            features=features,
-            frame_1m=frame_1m,
-            short_zone=None,
-            decision_timestamp=datetime.now(timezone.utc),
+        root_event_id = str(
+            (state.event_features_snapshot or {}).get("root_event_id") or state.event_id
         )
-        registered_climax = self._registered_evaluation(
-            registered_evaluations, "CLIMAX_EXHAUSTION"
+        event_revision = int(
+            (state.event_features_snapshot or {}).get("root_event_revision") or 1
         )
-        if registered_climax is None:
-            return None
-        evaluation = self._climax_evaluation_from_registry(registered_climax)
-        shadow_evaluation: ClimaxEvaluation | None = None
-        # Retain the legacy bundle only as an observation ledger payload.
         bundle = evaluate_climax_bundle(
-            state, features, frame_1m, self._config, strict_closed_candles=True
+            state, features, frame_1m, self._config, strict_closed_candles=True,
+            v2_episode_cache=self._low_volume_v2_episodes,
+            v2_state_repository=self._repository,
+            root_event_id=root_event_id,
+            event_revision=event_revision,
         )
+        evaluation: ClimaxEvaluation = bundle.selected
+        shadow_evaluation: ClimaxEvaluation | None = None
         if (
             self._config.low_volume_frozen_initial_extension_enabled
             and self._config.low_volume_frozen_initial_extension_shadow_only
@@ -2245,7 +3885,9 @@ class ShortSignalBot:
                 data_quality=list(evaluation.data_quality),
                 metadata=volume_metadata,
                 source_evaluation_id=evaluation_id,
-                attempt_id=shadow_attempt_id,
+                attempt_id=climax_branch_attempt_id(
+                    root_event_id, "VOLUME_CLIMAX_UNWIND", event_revision
+                ),
             )
         if self._config.climax_root_event_tracking_enabled and lifecycle_shadow is None:
             lifecycle_model_version = str(
@@ -2335,9 +3977,9 @@ class ShortSignalBot:
             },
         )
         admission_evaluation_id = evaluation_id
-        final_recheck_performed = False
-        if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE":
-            event_high = float(decision.strategy_metadata.get("event_high") or 0.0)
+        if decision.strategy_subtype in {"LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2"}:
+            high_key = "current_anchor_high" if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2" else "event_high"
+            event_high = float(decision.strategy_metadata.get(high_key) or 0.0)
             stored_distance = float(
                 decision.strategy_metadata.get("entry_distance_below_high_pct") or 0.0
             )
@@ -2353,71 +3995,9 @@ class ShortSignalBot:
                 )
                 return None
             if getattr(self._scanner, "supports_symbol_frames", hasattr(self._scanner, "fetch_symbol_frames")):
-                decision_market = None
-                recheck_attempts = max(
-                    1, int(getattr(self._config, "climax_fresh_recheck_attempts", 2))
+                decision_market = (
+                    await self._market_data_provider.capture_decision_snapshot(symbol)
                 )
-                recheck_delay_sec = max(
-                    0.0,
-                    float(getattr(self._config, "climax_fresh_recheck_retry_delay_sec", 3.0)),
-                )
-                for recheck_attempt in range(1, recheck_attempts + 1):
-                    decision_market = (
-                        await self._market_data_provider.capture_decision_snapshot(symbol)
-                    )
-                    has_frame = (
-                        decision_market is not None
-                        and not decision_market.frame_1m.frame.empty
-                    )
-                    has_liquidity = bool(
-                        decision_market is not None
-                        and decision_market.liquidity
-                    )
-                    if has_frame and has_liquidity:
-                        self._logger.info(
-                            "Climax fresh recheck status=LIQUIDITY_SNAPSHOT_READY symbol=%s attempt=%s/%s",
-                            symbol,
-                            recheck_attempt,
-                            recheck_attempts,
-                        )
-                        break
-                    status = "LIQUIDITY_DATA_MISSING" if has_frame else "RECHECK_TIMEOUT"
-                    self._logger.info(
-                        "Climax fresh recheck status=%s symbol=%s attempt=%s/%s",
-                        status,
-                        symbol,
-                        recheck_attempt,
-                        recheck_attempts,
-                    )
-                    if recheck_attempt < recheck_attempts and recheck_delay_sec:
-                        await asyncio.sleep(recheck_delay_sec)
-                if decision_market is None or decision_market.frame_1m.frame.empty:
-                    finalized_at = datetime.now(timezone.utc)
-                    observation_results = self._record_strategy_observations(
-                        bundle,
-                        evaluation_phase="PRE_DELIVERY_RECHECK",
-                        state=state,
-                        features=features,
-                        root_event_id=root_event_id,
-                        event_revision=event_revision,
-                        attempt_id=shadow_attempt_id,
-                        evaluation_id=None,
-                        lifecycle_shadow=lifecycle_shadow,
-                        observed_at=finalized_at,
-                        initial_evaluation_id=evaluation_id,
-                        initial_decision="ACTIONABLE",
-                        final_decision="BLOCKED_BY_RECHECK",
-                        final_reason="final_recheck_data_missing",
-                        finalized_at=finalized_at,
-                    )
-                    await self._report_strategy_observation_failures(
-                        observation_results, root_event_id=root_event_id
-                    )
-                    self._logger.info(
-                        "Climax delivery veto: final_recheck_data_missing symbol=%s",
-                        symbol,
-                    )
-                    return None
                 if decision_market is not None and not decision_market.frame_1m.frame.empty:
                     fresh_frame = decision_market.frame_1m.frame.copy(deep=True)
                     fresh_derivatives = dict(decision_market.derivatives)
@@ -2431,47 +4011,19 @@ class ShortSignalBot:
                         liquidity=fresh_liquidity,
                         market_asof=recheck_market_asof,
                     )
-                    fresh_registered = self._evaluate_registered_strategies(
-                        state=state,
-                        features=fresh_features,
-                        frame_1m=fresh_frame,
-                        short_zone=None,
-                        decision_timestamp=datetime.now(timezone.utc),
-                    )
-                    fresh_registered_climax = self._registered_evaluation(
-                        fresh_registered, "CLIMAX_EXHAUSTION"
-                    )
-                    if fresh_registered_climax is None:
-                        return None
-                    fresh_eval = self._climax_evaluation_from_registry(
-                        fresh_registered_climax
-                    )
-                    # The legacy bundle is retained only for observation output.
                     fresh_bundle = evaluate_climax_bundle(
                         state,
                         fresh_features,
                         fresh_frame,
                         self._config,
                         strict_closed_candles=True,
+                        v2_episode_cache=self._low_volume_v2_episodes,
+                        v2_state_repository=self._repository,
+                        v2_delivery_recheck=True,
+                        root_event_id=root_event_id,
+                        event_revision=event_revision,
                     )
-                    if not fresh_features.liquidity_available:
-                        self._logger.info(
-                            "Climax fresh recheck status=LIQUIDITY_DATA_MISSING symbol=%s",
-                            symbol,
-                        )
-                    elif any(
-                        reason in {"liquidity_not_confirmed", "climax_liquidity_block"}
-                        for reason in fresh_eval.veto_reasons
-                    ):
-                        self._logger.info(
-                            "Climax fresh recheck status=LIQUIDITY_THRESHOLD_FAILED symbol=%s",
-                            symbol,
-                        )
-                    else:
-                        self._logger.info(
-                            "Climax fresh recheck status=LIQUIDITY_CONFIRMED symbol=%s",
-                            symbol,
-                        )
+                    fresh_eval = fresh_bundle.selected
                     fresh_evaluation_id = self._repository.record_climax_evaluation(
                         evaluation_time=datetime.now(timezone.utc),
                         symbol=symbol,
@@ -2515,11 +4067,7 @@ class ShortSignalBot:
                             "change_pct": fresh_features.oi_change_pct,
                         },
                         features=asdict(fresh_features),
-                        lifecycle_state=(
-                            "FINAL_ACTIONABLE"
-                            if fresh_eval.actionable
-                            else "BLOCKED_BY_RECHECK"
-                        ),
+                        lifecycle_state="DELIVERY_RECHECK",
                         telegram_eligible=fresh_eval.actionable,
                         runtime_instance_id=self._runtime_instance_id,
                         root_event_id=root_event_id,
@@ -2539,23 +4087,13 @@ class ShortSignalBot:
                         evaluation_id=fresh_evaluation_id,
                         lifecycle_shadow=lifecycle_shadow,
                         observed_at=datetime.now(timezone.utc),
-                        initial_evaluation_id=evaluation_id,
-                        initial_decision="ACTIONABLE",
-                        final_decision=("ACTIONABLE" if fresh_eval.actionable else "BLOCKED_BY_RECHECK"),
-                        final_reason=(
-                            "final_actionable"
-                            if fresh_eval.actionable
-                            else ";".join(fresh_eval.veto_reasons)
-                            or "final_recheck_blocked"
-                        ),
-                        finalized_at=datetime.now(timezone.utc),
                     )
                     await self._report_strategy_observation_failures(
                         observation_results, root_event_id=root_event_id
                     )
                     if (
                         not fresh_eval.actionable
-                        or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE"
+                        or fresh_eval.subtype != decision.strategy_subtype
                     ):
                         self._logger.info(
                             "Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s",
@@ -2564,23 +4102,20 @@ class ShortSignalBot:
                         )
                         return None
                     admission_evaluation_id = fresh_evaluation_id
-                    final_recheck_performed = True
-                    decision = replace(
-                        decision,
-                        grade=fresh_eval.grade,
-                        score=fresh_eval.score,
-                        market_price=fresh_features.price,
-                        signal_time=fresh_features.asof,
-                        features_snapshot=asdict(fresh_features),
-                        strategy_subtype=fresh_eval.subtype or decision.strategy_subtype,
-                        model_version=str(fresh_eval.metadata.get("model_version", decision.model_version)),
-                        strategy_metadata={
-                            **fresh_eval.metadata,
-                            "veto_reasons": fresh_eval.veto_reasons,
-                            "fast_monitor": fast_monitor,
-                        },
+                else:
+                    self._logger.warning(
+                        "Climax delivery veto: fresh_data_unavailable "
+                        "symbol=%s reason=decision_snapshot_missing",
+                        symbol,
                     )
-                    features = fresh_features
+                    return None
+            else:
+                self._logger.warning(
+                    "Climax delivery veto: fresh_data_unavailable "
+                    "symbol=%s reason=scanner_frame_capability_missing",
+                    symbol,
+                )
+                return None
         if not live_delivery_enabled(decision, self._config):
             self._logger.warning(
                 "live_delivery_disabled strategy_type=%s strategy_subtype=%s",
@@ -2592,6 +4127,7 @@ class ShortSignalBot:
         record = self._repository.save_signal(
             decision,
             state,
+            telegram_sent=False,
             delivery_payload=payload,
             provenance=self._signal_provenance(
                 decision,
@@ -2599,29 +4135,169 @@ class ShortSignalBot:
                 decision_evaluation_id=evaluation_id,
                 admission_evaluation_id=admission_evaluation_id,
             ),
-            audit_root_event_id=root_event_id if final_recheck_performed else None,
-            audit_strategy=decision.strategy_subtype if final_recheck_performed else None,
-            lifecycle_state="FINAL_ACTIONABLE" if final_recheck_performed else "OUTBOX_ENQUEUED",
         )
-        try:
-            telegram_sent = await self._send_new_delivery(
-                entity_type="SIGNAL", entity_id=record.id
-            )
-        except BaseException:
-            self._finalize_persisted_signal(
-                state, record.id, features.asof, remove_candidate=True
-            )
-            raise
-        if not telegram_sent:
-            self._logger.warning(
-                "Telegram delivery pending/retry | signal_id=%s", record.id
-            )
+        self._delivery_worker.wake()
         state = self._baseline_lifecycle.mark_signal_sent(
             state, signal_id=record.id, when=features.asof
         )
         self._state_store.save(state)
         self._remove_climax_candidate(symbol, state.event_id, reason="signal_created")
+        await self._deliver_independent_climax_branch(
+            bundle=bundle,
+            selected_subtype=decision.strategy_subtype,
+            symbol=symbol,
+            state=state,
+            features=features,
+            root_event_id=root_event_id,
+            event_revision=event_revision,
+            evaluation_id=evaluation_id,
+        )
         return decision
+
+    async def _deliver_independent_climax_branch(
+        self,
+        *,
+        bundle: ClimaxEvaluationBundle,
+        selected_subtype: str | None,
+        symbol: str,
+        state: EventState,
+        features: SymbolFeatures,
+        root_event_id: str,
+        event_revision: int,
+        evaluation_id: int | None,
+    ) -> None:
+        """Deliver the other actionable climax branch exactly once."""
+        for subtype, branch in bundle.branch_evaluations.items():
+            if subtype == selected_subtype or not branch.actionable:
+                continue
+            # Recheck every independently delivered branch against a fresh market snapshot;
+            # the selected branch's recheck must not be reused for a different subtype.
+            if not getattr(
+                self._scanner,
+                "supports_symbol_frames",
+                hasattr(self._scanner, "fetch_symbol_frames"),
+            ):
+                self._logger.warning(
+                    "Climax independent delivery veto: fresh_data_unavailable symbol=%s subtype=%s",
+                    symbol,
+                    subtype,
+                )
+                continue
+            decision_market = await self._market_data_provider.capture_decision_snapshot(symbol)
+            if decision_market is None or decision_market.frame_1m.frame.empty:
+                self._logger.warning(
+                    "Climax independent delivery veto: fresh_data_unavailable symbol=%s subtype=%s",
+                    symbol,
+                    subtype,
+                )
+                continue
+            fresh_frame = decision_market.frame_1m.frame.copy(deep=True)
+            recheck_time = datetime.now(timezone.utc)
+            fresh_features = self._feature_builder.build(
+                symbol,
+                fresh_frame,
+                state=state,
+                derivatives=dict(decision_market.derivatives),
+                liquidity=dict(decision_market.liquidity or {}),
+                market_asof=recheck_time,
+            )
+            fresh_bundle = evaluate_climax_bundle(
+                state,
+                fresh_features,
+                fresh_frame,
+                self._config,
+                strict_closed_candles=True,
+                v2_episode_cache=self._low_volume_v2_episodes,
+                v2_state_repository=self._repository,
+                v2_delivery_recheck=True,
+                root_event_id=root_event_id,
+                event_revision=event_revision,
+            )
+            fresh_branch = fresh_bundle.branch_evaluations.get(subtype)
+            if fresh_branch is None or not fresh_branch.actionable:
+                self._logger.info(
+                    "Climax independent delivery veto: fresh_admission_failed symbol=%s subtype=%s reasons=%s",
+                    symbol,
+                    subtype,
+                    fresh_branch.veto_reasons if fresh_branch else ["branch_missing"],
+                )
+                continue
+            fresh_evaluation_id = self._repository.record_climax_evaluation(
+                evaluation_time=datetime.now(timezone.utc),
+                symbol=symbol,
+                strategy="CLIMAX_EXHAUSTION",
+                subtype_candidate=fresh_branch.metadata.get("strategy_subtype", subtype),
+                model_version=str(fresh_branch.metadata.get("model_version", "climax-v1")),
+                event_id=state.event_id,
+                event_high=fresh_branch.metadata.get("event_high"),
+                event_high_time=state.event_high_time,
+                event_detected_at=state.event_start_time,
+                candidate_added_at=None,
+                candidate_age_sec=None,
+                fast_monitor=False,
+                poll_sequence=None,
+                frame_asof=fresh_features.asof,
+                candles_asof=fresh_features.asof,
+                oi_asof=fresh_features.asof if fresh_features.oi_change_pct is not None else None,
+                orderbook_asof=fresh_features.asof if fresh_features.liquidity_available else None,
+                score=fresh_branch.score,
+                grade=fresh_branch.grade,
+                actionable=fresh_branch.actionable,
+                admission_passed=not fresh_branch.veto_reasons,
+                veto_reasons=fresh_branch.veto_reasons,
+                passed_conditions=[],
+                data_quality=fresh_branch.data_quality,
+                liquidity={
+                    "available": fresh_features.liquidity_available,
+                    "spread_pct": fresh_features.spread_pct,
+                    "slippage_pct": fresh_features.slippage_pct,
+                    "depth_1pct_usdt": fresh_features.orderbook_depth_usdt_1pct,
+                    "depth_2pct_usdt": fresh_features.orderbook_depth_usdt_2pct,
+                },
+                oi={"status": fresh_features.derivatives_status, "change_pct": fresh_features.oi_change_pct},
+                features=asdict(fresh_features),
+                lifecycle_state="DELIVERY_RECHECK",
+                telegram_eligible=True,
+                runtime_instance_id=self._runtime_instance_id,
+                root_event_id=root_event_id,
+                event_revision=event_revision,
+                observed_at=fresh_features.asof,
+                market_asof=fresh_features.asof,
+            )
+            branch = fresh_branch
+            high_key = (
+                "current_anchor_high"
+                if subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2"
+                else "event_high"
+            )
+            high = float(branch.metadata.get(high_key) or features.price)
+            side_decision = SignalDecision(
+                symbol=symbol, event_id=state.event_id, signal_type=SignalType.CONFIRM,
+                grade=branch.grade, score=branch.score, market_price=fresh_features.price,
+                short_zone_low=high * 0.97, short_zone_high=high,
+                signal_time=fresh_features.asof,
+                reasons=["Climax exhaustion confirmed", "Failed continuation below event high"],
+                risk_flags=["Повышенный риск ликвидности"] if branch.metadata.get("liquidity_warning") else [],
+                features_snapshot=asdict(fresh_features), score_breakdown={"climax_v1": float(branch.score)},
+                decision_type="SIGNAL", actionable=True, lifecycle_state="CLIMAX_SIGNAL_SENT",
+                strategy_type="CLIMAX_EXHAUSTION", strategy_subtype=subtype,
+                model_version=str(branch.metadata.get("model_version", "climax-v1")),
+                strategy_metadata={**branch.metadata, "veto_reasons": branch.veto_reasons},
+            )
+            if not live_delivery_enabled(side_decision, self._config):
+                continue
+            if self._repository.has_signal_for_event(symbol, state.event_id, subtype, side_decision.model_version):
+                continue
+            payload = format_signal_message(side_decision, self._config.timezone)
+            record = self._repository.save_signal(
+                side_decision, state, telegram_sent=False, delivery_payload=payload,
+                provenance=self._signal_provenance(
+                    side_decision, root_event_id=root_event_id,
+                    decision_evaluation_id=evaluation_id,
+                    admission_evaluation_id=fresh_evaluation_id,
+                ),
+            )
+            self._delivery_worker.wake()
 
     def _record_strategy_observations(
         self,
@@ -2636,11 +4312,6 @@ class ShortSignalBot:
         evaluation_id: int | None,
         lifecycle_shadow: object | None,
         observed_at: datetime,
-        initial_evaluation_id: int | None = None,
-        initial_decision: str | None = None,
-        final_decision: str | None = None,
-        final_reason: str | None = None,
-        finalized_at: datetime | None = None,
     ) -> list[ObservationWriteResult]:
         """Persist every enabled climax branch without affecting live evaluation."""
 
@@ -2653,11 +4324,19 @@ class ShortSignalBot:
         results: list[ObservationWriteResult] = []
         for strategy, branch_evaluation in bundle.branch_evaluations.items():
             try:
+                branch_candidate_id = climax_branch_candidate_id(
+                    root_event_id, strategy, event_revision
+                )
+                branch_attempt_id = climax_branch_attempt_id(
+                    root_event_id, strategy, event_revision
+                )
                 snapshot = {
                     "event": {
                         "event_id": state.event_id,
                         "root_event_id": root_event_id,
                         "event_revision": event_revision,
+                        "candidate_id": branch_candidate_id,
+                        "attempt_id": branch_attempt_id,
                         "event_high": state.event_high,
                     },
                     "evaluation": {
@@ -2706,10 +4385,9 @@ class ShortSignalBot:
                     strategy=strategy,
                     evaluation_phase=evaluation_phase,
                     symbol=features.symbol,
-                    event_id=state.event_id,
                     root_event_id=root_event_id,
                     event_revision=event_revision,
-                    attempt_id=attempt_id,
+                    attempt_id=branch_attempt_id,
                     evaluation_id=evaluation_id
                     if branch_evaluation is bundle.selected
                     else None,
@@ -2733,21 +4411,6 @@ class ShortSignalBot:
                     config_hash=self._strategy_config_hash,
                     input_fingerprint=evidence.input_fingerprint,
                     input_snapshot=evidence.snapshot,
-                    initial_evaluation_id=initial_evaluation_id
-                    if branch_evaluation is bundle.selected
-                    else None,
-                    initial_decision=initial_decision
-                    if branch_evaluation is bundle.selected
-                    else None,
-                    final_decision=final_decision
-                    if branch_evaluation is bundle.selected
-                    else None,
-                    final_reason=final_reason
-                    if branch_evaluation is bundle.selected
-                    else None,
-                    finalized_at=finalized_at
-                    if branch_evaluation is bundle.selected
-                    else None,
                 )
                 results.append(record_observation(observation))
             except Exception:
@@ -2785,7 +4448,9 @@ class ShortSignalBot:
                 decision_at=decision.signal_time,
             )
         if decision.strategy_type == "TRAPPED_LONGS_REVERSAL":
-            if root_event_id is None or decision_evaluation_id is None:
+            if decision.strategy_subtype != TRAPPED_LONGS_REVERSAL_V2 and (
+                root_event_id is None or decision_evaluation_id is None
+            ):
                 raise ValueError("trapped longs signal has incomplete provenance")
             return SignalProvenanceInput(
                 strategy_family="TRAPPED_LONGS_REVERSAL",
@@ -2806,12 +4471,27 @@ class ShortSignalBot:
         if (
             decision.strategy_type != "CLIMAX_EXHAUSTION"
             or decision.strategy_subtype
-            not in {"VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"}
+            not in {"VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2"}
             or root_event_id is None
             or decision_evaluation_id is None
         ):
             raise ValueError(
                 "actionable signal has incomplete deterministic provenance"
+            )
+        provenance_high_key = (
+            "current_anchor_high"
+            if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2"
+            else "event_high"
+        )
+        provenance_high = decision.strategy_metadata.get(provenance_high_key)
+        provenance_distance = decision.strategy_metadata.get(
+            "entry_distance_below_high_pct"
+        )
+        if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2" and provenance_high:
+            provenance_distance = (
+                (float(provenance_high) - decision.market_price)
+                / float(provenance_high)
+                * 100.0
             )
         return SignalProvenanceInput(
             strategy_family="CLIMAX_EXHAUSTION",
@@ -2826,16 +4506,15 @@ class ShortSignalBot:
             runtime_started_at=self._runtime_started_at,
             decision_at=decision.signal_time,
             decision_entry_price=decision.market_price,
-            decision_event_high=float(decision.strategy_metadata.get("event_high"))
-            if decision.strategy_metadata.get("event_high") is not None
-            else None,
-            decision_distance_from_high=float(
-                decision.strategy_metadata.get("entry_distance_below_high_pct")
-            )
-            if decision.strategy_metadata.get("entry_distance_below_high_pct")
-            is not None
-            else None,
+            decision_event_high=float(provenance_high) if provenance_high is not None else None,
+            decision_distance_from_high=(
+                float(provenance_distance) if provenance_distance is not None else None
+            ),
             provenance_anomaly=_provenance_anomaly(decision),
+            event_revision=int(decision.strategy_metadata.get("event_revision") or 1)
+            if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2" else None,
+            entry_trigger_time=_parse_optional_datetime(decision.strategy_metadata.get("entry_trigger_time"))
+            if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2" else None,
         )
 
     @staticmethod
@@ -2896,6 +4575,84 @@ class ShortSignalBot:
                 "strategy observation ledger failure alert could not be sent"
             )
 
+
+    def _run_causal_pump_v2_shadow(self, symbol: str, frame_1m: pd.DataFrame, features: Any, state: EventState | None, now: datetime) -> None:
+        if not self._config.causal_pump_v2_shadow_enabled or not isinstance(frame_1m, pd.DataFrame):
+            return
+        config = _causal_pump_v2_config(self._config)
+        current = self._repository.get_active_causal_pump_v2_root(symbol, now=now)
+        if current is None:
+            decision = CausalPumpV2Detector(config).detect(symbol, frame_1m, asdict(features), now)
+            if decision is None or decision.root_id is None:
+                return
+            created_at = now
+        else:
+            decision = CausalPumpV2Tracker(config).advance(CausalV2RootDecision(**{key: current[key] for key in CausalV2RootDecision.__dataclass_fields__ if key in current}), frame_1m, asdict(features), now)
+            created_at = current["created_at"]
+        expires_at = (decision.event_high_time + timedelta(minutes=config.expiry_minutes) if decision.event_high_time else now + timedelta(minutes=config.expiry_minutes))
+        changed = self._repository.upsert_causal_pump_v2_root({**asdict(decision), "symbol": symbol, "created_at": created_at, "updated_at": now, "expires_at": expires_at, "trigger_window": decision.condition_snapshot.get("trigger_window")})
+        if not changed:
+            return
+        v1 = state
+        comparison = CausalPumpV2Comparator().compare(symbol, now, v1.event_id if v1 else None, v1.state.value if v1 else None, v1.event_high_time if v1 else None, v1.event_high if v1 else None, v1.trigger_window if v1 else None, decision.root_id, decision.state, decision.event_low_time, decision.event_low_price, decision.event_high_time, decision.event_high_price, decision.condition_snapshot.get("trigger_window"), features.price)
+        self._repository.record_causal_pump_v2_comparison(asdict(comparison))
+
+    def _evaluate_early_drop_warning(
+        self, state: EventState, features: SymbolFeatures, frame_1m: pd.DataFrame
+    ) -> None:
+        """Persist a separate non-actionable early-drop observation."""
+        if not self._config.early_drop_warning_enabled:
+            return
+        if not isinstance(frame_1m, pd.DataFrame) or len(frame_1m) < 2:
+            return
+        try:
+            latest_at = frame_1m.index[-1].to_pydatetime()
+            previous_close = float(frame_1m["close"].iloc[-2])
+            current_close = float(frame_1m["close"].iloc[-1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return
+        root_id = str((state.event_features_snapshot or {}).get("root_event_id") or state.event_id)
+        revision = int((state.event_features_snapshot or {}).get("root_event_revision") or 1)
+        evaluation = evaluate_early_drop_warning(
+            EarlyDropSnapshot(
+                root_event_id=root_id,
+                event_revision=revision,
+                symbol=features.symbol,
+                root_started_at=state.event_start_time,
+                observed_at=features.asof,
+                market_asof=features.market_asof or features.asof,
+                latest_candle_at=latest_at,
+                impulse_pct=state.event_range_pct or features.event_range_pct,
+                drawdown_pct=features.pullback_from_high_pct,
+                event_high=state.event_high,
+                price=features.price,
+                previous_close=previous_close,
+                current_close=current_close,
+                spread_pct=features.spread_pct,
+                slippage_pct=features.slippage_pct,
+                depth_1pct_usdt=features.orderbook_depth_usdt_1pct,
+                depth_2pct_usdt=features.orderbook_depth_usdt_2pct,
+            ),
+            max_candle_age=timedelta(seconds=self._config.early_drop_warning_max_candle_age_sec),
+        )
+        if not evaluation.warning:
+            self._repository.save_early_drop_warning(evaluation, None)
+            return
+        if self._repository.has_recent_early_drop_warning(
+            evaluation.symbol,
+            now=features.asof,
+            cooldown=timedelta(minutes=self._config.early_drop_warning_cooldown_minutes),
+        ):
+            return
+        payload = (
+            format_early_drop_warning(evaluation)
+            if self._config.early_drop_warning_send_to_telegram
+            else None
+        )
+        write = self._repository.save_early_drop_warning(evaluation, payload)
+        if write.created and payload is not None:
+            self._delivery_worker.wake()
+
     async def _process_symbol(
         self,
         symbol: str,
@@ -2929,6 +4686,7 @@ class ShortSignalBot:
             market_asof=market_asof,
         )
         now = features.asof
+        self._run_causal_pump_v2_shadow(symbol, frame_1m, features, state, now)
         shadow_candidate_id = self._observe_root_detector_shadow(features, state, now)
         if shadow_candidate_id and state is not None and state.event_id:
             self._repository.link_root_detector_shadow_candidate(
@@ -2988,6 +4746,7 @@ class ShortSignalBot:
                     liquidity=liquidity,
                     market_asof=market_asof,
                 )
+                self._evaluate_early_drop_warning(new_state, features, frame_1m)
                 climax_decision = await self._evaluate_and_send_climax(
                     symbol,
                     frame_1m,
@@ -3023,6 +4782,7 @@ class ShortSignalBot:
                 liquidity=liquidity,
                 market_asof=market_asof,
             )
+            self._evaluate_early_drop_warning(state, features, frame_1m)
             climax_decision = await self._evaluate_and_send_climax(
                 symbol,
                 frame_1m,
@@ -3065,6 +4825,9 @@ class ShortSignalBot:
         state = lifecycle.state
         if state is None or state.state == EventStatus.EXPIRED:
             return None, state
+        await self._evaluate_trapped_longs_v2_shadow(
+            state, features, frame_1m, derivatives=derivatives
+        )
         if state.state == EventStatus.PUMP_DETECTED:
             return await self._maybe_emit_early_pump_watch(state, features, now), state
 
@@ -3101,46 +4864,7 @@ class ShortSignalBot:
             state.state = EventStatus.SHORT_ZONE_ACTIVE
 
         await self._evaluate_and_send_trapped_longs(state, features, frame_1m)
-        registered_evaluations = self._evaluate_registered_strategies(
-            state=state,
-            features=features,
-            frame_1m=frame_1m,
-            short_zone=zone,
-            decision_timestamp=now,
-        )
-        registered_baseline = self._registered_evaluation(
-            registered_evaluations, "BASELINE_PULLBACK"
-        )
-        if registered_baseline is None:
-            # Canonical registry authority is fail-closed: invalid or missing
-            # market context must never fall back to the legacy signal engine.
-            evaluation = CandidateEvaluation(
-                checked=False,
-                reject_reasons=["canonical_baseline_unavailable"],
-                blockers=["canonical_baseline_unavailable"],
-                data_quality_warnings=["canonical_baseline_unavailable"],
-            )
-        else:
-            canonical_decision = (
-                self._new_decision_from_registered_evaluation(
-                    state=state,
-                    features=features,
-                    zone=zone,
-                    signal_time=now,
-                    evaluation=registered_baseline,
-                )
-                if registered_baseline.actionable
-                else None
-            )
-            evaluation = CandidateEvaluation(
-                checked=True,
-                decision=canonical_decision,
-                score=registered_baseline.score,
-                grade=registered_baseline.grade,
-                reject_reasons=list(registered_baseline.vetoes),
-                blockers=list(registered_baseline.blockers),
-                risk_flags=list(registered_baseline.risk_flags),
-            )
+        evaluation = self._signal_engine.analyze(state, features, zone, now)
         self._repository.record_reject_stat(
             symbol=symbol,
             timeframe=state.trigger_window or "15m",
@@ -3168,29 +4892,19 @@ class ShortSignalBot:
                 return None, state
             delivery_enabled = (
                 self._config.send_watch_to_telegram
-                and self._watch_sent_in_cycle < self._config.watch_max_per_cycle
+                and self._watch_enqueued_in_cycle < self._config.watch_max_per_cycle
             )
             payload = (
                 format_signal_message(decision, self._config.timezone)
                 if delivery_enabled
                 else None
             )
-            candidate = self._repository.save_watch_candidate(
+            self._repository.save_watch_candidate(
                 decision, state, telegram_sent=False, delivery_payload=payload
             )
-            telegram_sent = False
             if delivery_enabled:
-                try:
-                    telegram_sent = await self._send_new_delivery(
-                        entity_type="WATCH", entity_id=candidate.id
-                    )
-                except BaseException:
-                    _mark_watch_emitted(state, watch_type=watch_type)
-                    self._state_store.save(state)
-                    raise
-                if telegram_sent:
-                    self._watch_sent_in_cycle += 1
-            self._repository.update_watch_telegram_status(candidate.id, telegram_sent)
+                self._watch_enqueued_in_cycle += 1
+                self._delivery_worker.wake()
             _mark_watch_emitted(state, watch_type=watch_type)
             return decision, state
 
@@ -3202,23 +4916,14 @@ class ShortSignalBot:
             )
             return None, state
         payload = format_signal_message(decision, self._config.timezone)
-        record = self._repository.persist_final_signal_bundle(
+        record = self._repository.save_signal(
             decision,
             state,
+            telegram_sent=False,
             delivery_payload=payload,
             provenance=self._signal_provenance(decision),
         )
-        try:
-            telegram_sent = await self._send_new_delivery(
-                entity_type="SIGNAL", entity_id=record.id
-            )
-        except BaseException:
-            self._finalize_persisted_signal(state, record.id, now)
-            raise
-        if not telegram_sent:
-            self._logger.warning(
-                "Telegram delivery pending/retry | signal_id=%s", record.id
-            )
+        self._delivery_worker.wake()
         state = self._baseline_lifecycle.mark_signal_sent(
             state, signal_id=record.id, when=now
         )
@@ -3463,29 +5168,19 @@ class ShortSignalBot:
         )
         delivery_enabled = (
             self._config.send_watch_to_telegram
-            and self._watch_sent_in_cycle < self._config.watch_max_per_cycle
+            and self._watch_enqueued_in_cycle < self._config.watch_max_per_cycle
         )
         payload = (
             format_signal_message(decision, self._config.timezone)
             if delivery_enabled
             else None
         )
-        candidate = self._repository.save_watch_candidate(
+        self._repository.save_watch_candidate(
             decision, state, telegram_sent=False, delivery_payload=payload
         )
-        telegram_sent = False
         if delivery_enabled:
-            try:
-                telegram_sent = await self._send_new_delivery(
-                    entity_type="WATCH", entity_id=candidate.id
-                )
-            except BaseException:
-                _mark_early_watch_emitted(state, watch_type="EARLY_PUMP_WATCH")
-                self._state_store.save(state)
-                raise
-            if telegram_sent:
-                self._watch_sent_in_cycle += 1
-        self._repository.update_watch_telegram_status(candidate.id, telegram_sent)
+            self._watch_enqueued_in_cycle += 1
+            self._delivery_worker.wake()
         return decision
 
     def _finalize_persisted_signal(
@@ -3558,15 +5253,14 @@ class ShortSignalBot:
 
     async def _handle_error(self, key: str, exc: Exception) -> None:
         self._health.on_error()
-        summary = safe_exception_summary(exc)
-        self._logger.error("Runtime error in %s: %s", key, summary)
+        self._logger.exception("Runtime error in %s: %s", key, exc)
         if is_sqlite_full(exc):
             await self._emit_storage_incident(
                 self._storage_incident.record_failure(at=time.time())
             )
             return
         if self._error_throttler.should_send(key):
-            await self._notifier.send_alert(f"Short signal bot error in {key}: {summary}")
+            await self._notifier.send_alert(f"Short signal bot error in {key}: {exc!r}")
 
     def _capacity_snapshot(self) -> DiskCapacitySnapshot | None:
         if not self._repository.db_url.startswith("sqlite:///"):

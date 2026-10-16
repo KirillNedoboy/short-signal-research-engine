@@ -1,0 +1,12 @@
+[Unit]
+Description=Run bounded research retention periodically
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 UTC
+RandomizedDelaySec=2min
+AccuracySec=1min
+Persistent=true
+Unit=short-telegram-bot-lite-research-retention.service
+
+[Install]
+WantedBy=timers.target

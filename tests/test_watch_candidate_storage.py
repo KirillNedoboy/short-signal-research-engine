@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from math import nan
 
-import pytest
 from sqlalchemy import select
 
 from app.domain import SignalType
@@ -79,21 +78,25 @@ def test_watch_candidate_missing_dist_to_vwap_pct_is_stored_without_integrity_er
 
 
 def test_delivery_status_can_be_updated_after_durable_insert(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
+    """The sole acknowledgement path is the atomic mark_delivery_sent transition."""
     database = Database(f"sqlite:///{tmp_path / 'delivery-status.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
-    signal = repository.save_signal(make_signal_decision(), state, telegram_sent=False, provenance=make_signal_provenance())
+    signal = repository.save_signal(make_signal_decision(), state, telegram_sent=False, delivery_payload="signal", provenance=make_signal_provenance())
     watch_decision = make_signal_decision(
         signal_type=SignalType.WATCH,
         actionable=False,
         decision_type="WATCH",
         blockers=["thin_orderbook"],
     )
-    watch = repository.save_watch_candidate(watch_decision, state, telegram_sent=False)
+    watch = repository.save_watch_candidate(watch_decision, state, telegram_sent=False, delivery_payload="watch")
 
-    repository.update_signal_telegram_status(signal.id, True)
-    repository.update_watch_telegram_status(watch.id, True)
+    claimed = repository.claim_due_deliveries(
+        datetime.now(timezone.utc), limit=10, lease_seconds=30
+    )
+    for delivery in claimed:
+        repository.mark_delivery_sent(delivery["id"])
 
     with database.session() as session:
         assert session.get(SignalModel, signal.id).telegram_sent is True
@@ -115,47 +118,6 @@ def test_actionable_signal_still_persists_dist_to_vwap_pct(tmp_path, make_event_
         stored = session.scalars(select(SignalModel)).one()
         assert stored.dist_to_vwap_pct == 13.0
         assert session.scalars(select(WatchCandidateModel)).all() == []
-
-
-def test_omitted_signal_delivery_payload_creates_legacy_outbox(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
-    database = Database(f"sqlite:///{tmp_path / 'legacy-outbox.db'}")
-    database.create_all()
-    repository = BotRepository(database)
-    state = repository.upsert_event_state(make_event_state())
-
-    signal = repository.save_signal(
-        make_signal_decision(),
-        state,
-        telegram_sent=False,
-        provenance=make_signal_provenance(),
-    )
-
-    with database.session() as session:
-        outboxes = session.scalars(select(TelegramDeliveryOutboxModel)).all()
-        assert len(outboxes) == 1
-        assert outboxes[0].entity_type == "SIGNAL"
-        assert outboxes[0].entity_id == signal.id
-        assert outboxes[0].payload == "LEGACY_SIGNAL_PAYLOAD"
-
-
-def test_explicit_none_signal_delivery_payload_creates_no_rows(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
-    database = Database(f"sqlite:///{tmp_path / 'none-outbox.db'}")
-    database.create_all()
-    repository = BotRepository(database)
-    state = repository.upsert_event_state(make_event_state())
-
-    with pytest.raises(ValueError, match="delivery payload is required"):
-        repository.save_signal(
-            make_signal_decision(),
-            state,
-            telegram_sent=False,
-            delivery_payload=None,
-            provenance=make_signal_provenance(),
-        )
-
-    with database.session() as session:
-        assert session.scalars(select(SignalModel)).all() == []
-        assert session.scalars(select(TelegramDeliveryOutboxModel)).all() == []
 
 
 def test_signal_delivery_outbox_is_atomic_and_retryable(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
@@ -246,7 +208,7 @@ def test_delivery_success_updates_source_and_outbox_atomically(tmp_path, make_ev
         assert session.scalars(select(TelegramDeliveryOutboxModel)).one().status == "SENT"
 
 
-def test_legacy_unsent_signals_have_compatibility_outbox(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
+def test_legacy_unsent_signals_are_not_auto_enqueued(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'legacy.db'}")
     database.create_all()
     repository = BotRepository(database)
@@ -254,8 +216,4 @@ def test_legacy_unsent_signals_have_compatibility_outbox(tmp_path, make_event_st
     repository.save_signal(make_signal_decision(model_version=None), state, telegram_sent=False, provenance=make_signal_provenance())
 
     assert repository.count_legacy_unsent_signals() == 1
-    with database.session() as session:
-        outbox = session.scalars(select(TelegramDeliveryOutboxModel)).one()
-        assert outbox.payload == "LEGACY_SIGNAL_PAYLOAD"
-    claimed = repository.claim_due_deliveries(datetime.now(timezone.utc), limit=10, lease_seconds=30)
-    assert len(claimed) == 1
+    assert repository.claim_due_deliveries(datetime.now(timezone.utc), limit=10, lease_seconds=30) == []

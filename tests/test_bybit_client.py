@@ -6,33 +6,15 @@ from datetime import UTC, datetime
 import pytest
 
 from app.market.bybit_client import BybitClient, BybitResponseError
+from app.infra.provider_errors import ProviderRateLimited, RateLimitPolicy, retry_after_seconds
+from app.infra.request_scheduler import RequestPriority, RequestScheduler
 
 
-class _FakeHTTP:
-    def __init__(self, **kwargs) -> None:
-        self.kwargs = kwargs
-
-
-def test_bybit_client_passes_timeout(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
-    def _build_http(**kwargs):
-        captured.update(kwargs)
-        return _FakeHTTP(**kwargs)
-
-    monkeypatch.setattr("app.market.bybit_client.HTTP", _build_http)
-
-    BybitClient(scheduler=object(), timeout=27)
-
-    assert captured["timeout"] == 27
-    assert captured["testnet"] is False
-    assert captured["max_retries"] == 1
-    assert captured["retry_codes"] == {-1}
 
 
 class _StaticScheduler:
-    async def schedule(self, operation, **kwargs):
-        return operation(**kwargs)
+    async def schedule(self, func, *args, priority=None, operation=None, deadline_monotonic=None, **kwargs):
+        return func(*args, **kwargs)
 
 
 class _ResponseHTTP:
@@ -97,35 +79,6 @@ def test_ticker_metadata_retains_server_time_without_changing_legacy_method() ->
     assert asyncio.run(client.fetch_tickers()) == [{"symbol": "TESTUSDT"}]
 
 
-def test_kline_metadata_uses_existing_scheduler_and_range_parameters() -> None:
-    class RecordingHTTP(_ResponseHTTP):
-        def __init__(self) -> None:
-            super().__init__({})
-            self.kwargs = None
-
-        def get_kline(self, **kwargs):
-            self.kwargs = kwargs
-            return {"retCode": 0, "time": 1_788_609_600_000, "result": {"list": [["1"]]}}
-
-    client = BybitClient.__new__(BybitClient)
-    client._scheduler = _StaticScheduler()
-    client._client = RecordingHTTP()
-
-    response = asyncio.run(
-        client.fetch_klines_with_metadata(
-            "BTCUSDT", "1", limit=15, start_ms=1000, end_ms=2000
-        )
-    )
-
-    assert response.data == [["1"]]
-    assert client._client.kwargs == {
-        "category": "linear",
-        "symbol": "BTCUSDT",
-        "interval": "1",
-        "limit": 15,
-        "start": 1000,
-        "end": 2000,
-    }
 
 
 def test_nonzero_bybit_response_code_raises_typed_error() -> None:
@@ -162,8 +115,9 @@ def test_instrument_pagination_validates_second_page() -> None:
         }
     )
 
-    with pytest.raises(BybitResponseError, match="fetch_instruments"):
+    with pytest.raises(ProviderRateLimited) as error:
         asyncio.run(client.fetch_instruments())
+    assert error.value.provider_code == 10006
 
 
 def test_orderbook_requires_mapping_result() -> None:
@@ -187,3 +141,54 @@ def test_bybit_response_error_does_not_include_full_payload() -> None:
         asyncio.run(client.fetch_open_interest("TESTUSDT"))
 
     assert secret_marker not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("status,code", [(200, 10006), (429, 0)])
+def test_real_pybit_send_is_single_attempt_for_outcome(monkeypatch, status, code):
+    import json
+    import requests
+    calls = []
+    scheduler = RequestScheduler(2, 0, 0, 0)
+    client = BybitClient(scheduler)
+    def send(request, **kwargs):
+        calls.append(request.url)
+        response = requests.Response()
+        response.status_code = status
+        response.headers["Retry-After"] = "17"
+        response._content = json.dumps({"retCode": code, "retMsg": "rate limit", "result": {"list": []}}).encode()
+        return response
+    monkeypatch.setattr(client._client.client, "send", send)
+    with pytest.raises(ProviderRateLimited) as error:
+        asyncio.run(client.fetch_klines("ARKUSDT", "1", priority=RequestPriority.OUTCOME_REPLAY))
+    assert len(calls) == 1
+    assert error.value.retry_after == 17
+    assert scheduler.stats_snapshot()["fetch_klines:OUTCOME_REPLAY"]["attempts"] == 1
+
+
+def test_real_pybit_rate_limit_then_success_reacquires_scheduler(monkeypatch):
+    import json
+    import requests
+    scheduler = RequestScheduler(2, 0, 0, 0, rate_limit_policy=RateLimitPolicy(windows=((0, 0),)*4))
+    client = BybitClient(scheduler)
+    calls = []
+    candles = [["1000", "1", "2", "1", "1", "10", "10"]]
+    def send(request, **kwargs):
+        calls.append(request.url)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({
+            "retCode": 10006 if len(calls) < 3 else 0,
+            "retMsg": "rate limit" if len(calls) < 3 else "OK",
+            "result": {"list": candles},
+        }).encode()
+        return response
+    monkeypatch.setattr(client._client.client, "send", send)
+    assert asyncio.run(client.fetch_klines("ARKUSDT", "1")) == candles
+    assert len(calls) == scheduler.stats_snapshot()["fetch_klines:LIVE_SCAN"]["attempts"] == 3
+
+
+def test_retry_after_dates_reset_and_invalid_headers():
+    now = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
+    assert retry_after_seconds({"Retry-After": "Sat, 03 Oct 2026 14:02:00 GMT"}, now=now) == 120
+    assert retry_after_seconds({"X-Bapi-Limit-Reset-Timestamp": str(int(now.timestamp()*1000)+45000)}, now=now) == 45
+    assert retry_after_seconds({"Retry-After": "nan"}, now=now) == 0

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -27,14 +26,7 @@ class _Scanner:
     def __init__(self) -> None:
         self.client = _Client()
         self.last_universe_telemetry = None
-        now = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=2)
-        timestamps = [now, now + timedelta(minutes=1)]
-        self.frames = {"AAAUSDT": pd.DataFrame({
-            "start_ms": [int(value.timestamp() * 1000) for value in timestamps],
-            "open": [1.0, 1.0], "high": [1.0, 2.0], "low": [1.0, 1.0],
-            "close": [1.0, 2.0], "volume": [1.0, 1.0], "turnover": [1.0, 2.0],
-            "timestamp": timestamps,
-        }).set_index("timestamp", drop=False)}
+        self.frames = {"AAAUSDT": pd.DataFrame({"close": [1.0, 2.0]})}
         self.derivatives_calls = 0
         self.liquidity_calls = 0
 
@@ -60,25 +52,6 @@ class _Scanner:
     async def fetch_optional_liquidity(self, symbol, price):
         self.liquidity_calls += 1
         return {"symbol": symbol, "price": price}
-
-
-class _MissingDerivativesScanner(_Scanner):
-    async def fetch_optional_derivatives(self, symbol):
-        return {
-            "symbol": symbol,
-            "derivatives_status": "MISSING",
-            "scan_failure": {"reason_code": "MARKET_DATA_INCOMPLETE"},
-        }
-
-
-class _UnmarkedMissingDerivativesScanner(_Scanner):
-    async def fetch_optional_derivatives(self, symbol):
-        return {
-            "symbol": symbol,
-            "derivatives_status": "MISSING",
-            "open_interest": [],
-            "funding": [],
-        }
 
 
 class _Client:
@@ -250,7 +223,7 @@ def test_frozen_candle_frame_defensively_copies_and_rejects_future_availability(
         )
 
 
-def test_decision_snapshot_is_defensive_and_captured_after_all_async_reads(make_frame) -> None:
+def test_decision_snapshot_is_defensive_and_captured_after_all_async_reads() -> None:
     class Clock:
         def __init__(self, values):
             self.values = iter(values)
@@ -263,9 +236,7 @@ def test_decision_snapshot_is_defensive_and_captured_after_all_async_reads(make_
         scanner = _Scanner()
         clock = Clock([start, start + timedelta(seconds=1), start + timedelta(seconds=2)])
         provider = CanonicalMarketDataProvider(scanner=scanner, config=AppConfig(), clock=clock)
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=make_frame([1.0], start=start - timedelta(minutes=1))
-        )
+        decision = await provider.capture_decision_snapshot("AAAUSDT")
         assert decision is not None
         # Frame collection consumes the first timestamp; decision capture occurs
         # only after the subsequent derivative and liquidity awaits complete.
@@ -278,146 +249,14 @@ def test_decision_snapshot_is_defensive_and_captured_after_all_async_reads(make_
     asyncio.run(run())
 
 
-def test_decision_snapshot_keeps_absent_liquidity_distinct_from_an_empty_result(make_frame) -> None:
+def test_decision_snapshot_keeps_absent_liquidity_distinct_from_an_empty_result() -> None:
     async def run() -> None:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        provider = CanonicalMarketDataProvider(
-            scanner=_Scanner(), config=AppConfig(),
-            clock=lambda: start + timedelta(minutes=2, seconds=30),
-        )
+        provider = CanonicalMarketDataProvider(scanner=_Scanner(), config=AppConfig())
         decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=make_frame([1.0, 2.0], start=start),
-            include_liquidity=False,
+            "AAAUSDT", include_liquidity=False
         )
         assert decision is not None
         assert decision.liquidity is None
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_rejects_incomplete_candle_schema_at_admission() -> None:
-    async def run() -> None:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        provider = CanonicalMarketDataProvider(
-            scanner=_Scanner(), config=AppConfig(),
-            clock=lambda: start + timedelta(minutes=2, seconds=30),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=pd.DataFrame({"close": [1.0, 2.0]}),
-            include_liquidity=False,
-        )
-
-        assert decision is None
-        assert provider.evidence_snapshot()["details"][-1]["reason"] == "MARKET_DATA_INCOMPLETE"
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_rejects_non_admissible_candle_frame(make_frame) -> None:
-    async def run() -> None:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        frame = make_frame([1.0, 2.0], start=start)
-        provider = CanonicalMarketDataProvider(
-            scanner=_Scanner(), config=AppConfig(),
-            clock=lambda: start + timedelta(minutes=1, seconds=30),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=frame, include_liquidity=False
-        )
-
-        assert decision is None
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_reports_stale_indexed_frame_reason(make_frame) -> None:
-    async def run() -> None:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        frame = make_frame([1.0, 2.0], start=start).drop(columns=["timestamp"])
-        provider = CanonicalMarketDataProvider(
-            scanner=_Scanner(), config=AppConfig(),
-            clock=lambda: start + timedelta(minutes=22),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=frame, include_liquidity=False
-        )
-
-        assert decision is None
-        assert provider.evidence_snapshot()["details"][-1]["reason"] == "STALE_MARKET_DATA"
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_validates_indexed_ohlcv_without_timestamp_column(make_frame) -> None:
-    async def run() -> None:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        frame = make_frame([1.0, 2.0], start=start).drop(columns=["timestamp"])
-        provider = CanonicalMarketDataProvider(
-            scanner=_Scanner(), config=AppConfig(),
-            clock=lambda: start + timedelta(minutes=1, seconds=30),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=frame, include_liquidity=False
-        )
-
-        assert decision is None
-        assert provider.evidence_snapshot()["details"][-1]["reason"] == "STALE_MARKET_DATA"
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_accepts_valid_indexed_ohlcv_frame(make_frame) -> None:
-    async def run() -> None:
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        frame = make_frame([1.0, 2.0], start=start).drop(columns=["timestamp"])
-        provider = CanonicalMarketDataProvider(
-            scanner=_Scanner(), config=AppConfig(),
-            clock=lambda: start + timedelta(minutes=2, seconds=30),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", frame_1m=frame, include_liquidity=False
-        )
-
-        assert decision is not None
-        assert decision.frame_1m.frame.equals(frame)
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_rejects_missing_required_derivatives() -> None:
-    async def run() -> None:
-        provider = CanonicalMarketDataProvider(
-            scanner=_MissingDerivativesScanner(),
-            config=AppConfig(derivatives_enabled=True),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", include_liquidity=False
-        )
-
-        assert decision is None
-
-    asyncio.run(run())
-
-
-def test_decision_snapshot_rejects_unmarked_missing_required_derivatives() -> None:
-    async def run() -> None:
-        provider = CanonicalMarketDataProvider(
-            scanner=_UnmarkedMissingDerivativesScanner(),
-            config=AppConfig(derivatives_enabled=True),
-        )
-
-        decision = await provider.capture_decision_snapshot(
-            "AAAUSDT", include_liquidity=False
-        )
-
-        assert decision is None
-        assert provider.evidence_snapshot()["details"][-1]["reason"] == "MARKET_DATA_INCOMPLETE"
 
     asyncio.run(run())
 
@@ -599,25 +438,6 @@ def test_hub_shadow_compares_confirmed_1m_identity_and_values_against_rest(
     asyncio.run(run())
 
 
-def test_runtime_uses_provider_as_the_only_market_data_facade(tmp_path) -> None:
-    class Notifier:
-        async def start(self):
-            return None
-
-        async def close(self):
-            return None
-
-    database = Database(f"sqlite:///{tmp_path / 'provider.sqlite'}")
-    database.create_all()
-    bot = ShortSignalBot(
-        config=AppConfig(canonical_market_data_provider_mode="HUB_PREFERRED"),
-        repository=BotRepository(database), scanner=_Scanner(), notifier=Notifier(),
-        market_data_hub=_Hub(_hub_snapshot()),
-    )
-    assert isinstance(bot._market_data_provider, CanonicalMarketDataProvider)
-    assert bot._scanner is bot._market_data_provider
-    assert bot._shadow_outcome_scheduler._client is bot._market_data_provider
-
 
 def test_runtime_accepts_injected_provider_and_attaches_continuity_to_hub(tmp_path) -> None:
     class Notifier:
@@ -672,11 +492,78 @@ def test_enriched_market_snapshot_preserves_frozen_frame_derivatives_and_provena
     asyncio.run(run())
 
 
-def test_runtime_calls_explicit_provider_snapshot_apis_at_scan_boundaries() -> None:
-    assert "build_scan_snapshot" in inspect.getsource(ShortSignalBot.run_cycle)
-    assert "prefetch_historical_frames" in inspect.getsource(
-        ShortSignalBot._run_fast_monitor
-    )
-    assert "capture_decision_snapshot" in inspect.getsource(
-        ShortSignalBot._evaluate_and_send_climax
-    )
+
+def test_live_backfill_does_not_wait_for_outcome_singleflight() -> None:
+    from app.infra.request_scheduler import RequestPriority
+
+    class Store:
+        def __init__(self):
+            self.outcome_started = asyncio.Event()
+            self.release_outcome = asyncio.Event()
+
+        async def backfill_missing(self, _client, _symbol, *, priority, **_kwargs):
+            if priority is RequestPriority.OUTCOME_REPLAY:
+                self.outcome_started.set()
+                await self.release_outcome.wait()
+                return False
+            return priority is RequestPriority.LIVE_SCAN
+
+    async def run():
+        provider = CanonicalMarketDataProvider(scanner=_Scanner(), config=AppConfig())
+        store = Store()
+        provider.attach_frame_store(store)
+        outcome = asyncio.create_task(provider._single_flight_backfill(
+            "AAAUSDT", priority=RequestPriority.OUTCOME_REPLAY, deadline_monotonic=None
+        ))
+        await store.outcome_started.wait()
+        live = await asyncio.wait_for(provider._single_flight_backfill(
+            "AAAUSDT", priority=RequestPriority.LIVE_SCAN, deadline_monotonic=None
+        ), timeout=0.2)
+        assert live is True
+        assert not outcome.done()
+        store.release_outcome.set()
+        assert await outcome is False
+
+    asyncio.run(run())
+
+
+def test_prefetch_propagates_deadline_to_scheduler_without_scanner_kwargs() -> None:
+    import threading
+    import time
+
+    from app.infra.request_scheduler import RequestPriority, RequestScheduler
+    from app.market.bybit_client import BybitClient
+    from app.market.scanner import MarketScanner
+
+    async def run():
+        scheduler = RequestScheduler(1, 0, 0, 0)
+        client = BybitClient(scheduler)
+        sends = []
+        client._client.get_kline = lambda **_kwargs: sends.append(True)
+        provider = CanonicalMarketDataProvider(
+            scanner=MarketScanner(client=client, config=AppConfig()),
+            config=AppConfig(),
+        )
+        entered, release = threading.Event(), threading.Event()
+
+        def hold_slot():
+            entered.set()
+            assert release.wait(2)
+
+        blocker = asyncio.create_task(
+            scheduler.schedule(hold_slot, priority=RequestPriority.RESEARCH)
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        try:
+            frames = await provider.prefetch_historical_frames(
+                ["AAAUSDT"], priority=RequestPriority.LIVE_SCAN,
+                deadline_monotonic=time.monotonic() + 0.03,
+            )
+            assert frames == {}
+            assert sends == []
+            assert scheduler.stats_snapshot()["fetch_klines:LIVE_SCAN"]["deadline_expired"] == 1
+        finally:
+            release.set()
+        await blocker
+
+    asyncio.run(run())

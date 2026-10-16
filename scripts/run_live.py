@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.config import load_config, require_manual_only  # noqa: E402
+from app.config import load_config  # noqa: E402
 from app.logger import configure_logging  # noqa: E402
 from app.main import ShortSignalBot  # noqa: E402
 from app.runtime.instance_fence import run_fenced  # noqa: E402
@@ -28,7 +28,7 @@ async def _run_bot() -> None:
 async def main() -> int:
     configure_logging()
     global _validated_config
-    _validated_config = require_manual_only(load_config())
+    _validated_config = load_config()
     return await run_fenced(_run_bot)
 
 

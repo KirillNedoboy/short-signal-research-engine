@@ -173,5 +173,6 @@ def test_v2_outcome_persists_top_level_and_nested_datetimes_as_utc_iso(tmp_path)
 def test_v2_outcome_rejects_unsupported_json_values_explicitly(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 'unsupported.sqlite'}")
     db.create_all()
+    repo = BotRepository(db)
     with pytest.raises(TypeError, match="unsupported observation evidence value"):
         canonicalize_json_payload({"bad": object()})

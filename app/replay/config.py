@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from app.replay.canonical import sha256_canonical
 
 
 # Deliberately explicit: adding a runtime field never makes it replay evidence by
-# accident.  Credentials, endpoints, chat IDs, delivery toggles and scheduling
+# accident. Credentials, endpoints, chat IDs, delivery toggles and scheduling
 # controls are therefore absent by construction.
 STRATEGY_CONFIG_FIELDS = frozenset(
     {
@@ -37,8 +38,15 @@ STRATEGY_CONFIG_FIELDS = frozenset(
         "low_volume_require_closed_candles_only", "low_volume_require_equal_volume_windows",
         "low_volume_block_price_acceleration_resumed", "low_volume_block_active_short_squeeze",
         "low_volume_high_liquidity_risk_mode", "low_volume_current_ret5_gate_enabled",
+        "low_volume_extension_v2_enabled", "low_volume_extension_v2_live_delivery_enabled",
+        "low_volume_v2_min_closed_candles_after_retest", "low_volume_v2_max_episode_lifetime_minutes",
+        "low_volume_v2_max_entry_distance_below_high_pct", "low_volume_v2_new_high_tolerance_pct",
+        "low_volume_v2_require_breakout_close", "low_volume_v2_require_lower_high_or_swing_break",
+        "low_volume_v2_block_oi_acceleration_pct", "low_volume_v2_block_price_acceleration_resumed",
+        "low_volume_v2_recheck_interval_sec",
+        "low_volume_v2_extension_below_threshold_policy",
         "climax_max_spread_pct", "climax_max_slippage_pct", "climax_min_depth_1pct_usdt", "climax_min_depth_2pct_usdt",
-        "trapped_longs_reversal_enabled", "trapped_longs_live_delivery_enabled", "trapped_longs_min_oi_change_15m_pct",
+        "trapped_longs_reversal_enabled", "trapped_longs_reversal_v2_enabled", "trapped_longs_require_oi_sequence", "trapped_longs_require_breakout_oi_expansion", "trapped_longs_require_oi_sequence_points", "trapped_longs_min_closed_5m_candles_after_breakout", "trapped_longs_block_price_oi_acceleration_together", "trapped_longs_price_acceleration_veto_pct", "trapped_longs_oi_acceleration_veto_pct", "trapped_longs_v2_min_oi_retained_increase_pct", "trapped_longs_max_oi_age_minutes", "trapped_longs_live_delivery_enabled", "trapped_longs_v2_live_delivery_enabled", "trapped_longs_min_oi_change_15m_pct",
         "trapped_longs_min_closed_candles", "trapped_longs_max_lifetime_minutes", "trapped_longs_new_high_tolerance_pct",
         "trapped_longs_min_rejection_pct", "trapped_longs_min_signal_score", "trapped_longs_min_public_grade",
         "trapped_longs_max_spread_pct", "trapped_longs_max_slippage_pct", "trapped_longs_min_depth_1pct_usdt", "trapped_longs_min_depth_2pct_usdt",

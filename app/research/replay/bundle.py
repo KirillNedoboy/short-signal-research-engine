@@ -195,7 +195,7 @@ def verify_bundle(path: str | Path) -> VerificationReport:
             errors.append("strategy-contract-version-mismatch")
         if contract.get("strategy_config_sha256") != manifest.get("config_hash") or contract.get("strategy_contract_version") != manifest.get("strategy_contract_version"):
             errors.append("strategy-contract-mismatch")
-        if set(contract.get("strategies", [])) != {"BASELINE_PULLBACK", "VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"}:
+        if set(contract.get("strategies", [])) != {"BASELINE_PULLBACK", "VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2", "TRAPPED_LONGS_REVERSAL_V2"}:
             errors.append("strategy-contract-strategy-set-mismatch")
         if contract.get("grade_c_public") is not False or contract.get("autoexecution") != "OFF" or contract.get("root_detector_shadow_v2") != "RESEARCH_ONLY_NOT_STRATEGY":
             errors.append("strategy-contract-invariants-mismatch")
@@ -238,7 +238,7 @@ def _write_payload(root: Path, spec: Mapping[str, Any], config: AppConfig, *, ru
     (root / "config/config_sanitized.yaml").write_text(yaml.safe_dump(strategy_payload, sort_keys=True, allow_unicode=True), encoding="utf-8")
     contract_body = {
         "bundle_version": BUNDLE_VERSION,
-        "strategies": ["BASELINE_PULLBACK", "VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"],
+        "strategies": ["BASELINE_PULLBACK", "VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2", "TRAPPED_LONGS_REVERSAL_V2"],
         "grade_c_public": False,
         "autoexecution": "OFF",
         "root_detector_shadow_v2": "RESEARCH_ONLY_NOT_STRATEGY",
@@ -344,13 +344,21 @@ def _validate_spec(spec: Mapping[str, Any]) -> None:
         if _parse_utc(availability) > cutoff:
             raise ValueError("market row available after dataset cutoff")
     ordering: set[tuple[str, int, str, str, str]] = set()
-    for row in [*spec.get("provenance", []), *spec.get("state_transitions", [])]:
+    for row in [
+        *spec.get("provenance", []),
+        *spec.get("state_transitions", []),
+        *spec.get("baseline_transitions", []),
+    ]:
         key = _event_order_key(row)
         if key in ordering:
             raise ValueError("duplicate full event ordering key")
         ordering.add(key)
         if row.get("availability_time_utc", row.get("available_at_utc")) is not None and _parse_utc(row.get("availability_time_utc", row.get("available_at_utc"))) > cutoff:
             raise ValueError("event available after dataset cutoff")
+    for row in spec.get("asof_candles", []):
+        availability = row.get("availability_time_utc", row.get("available_at_utc", row.get("available_time_utc")))
+        if _parse_utc(availability) > cutoff:
+            raise ValueError("as-of market row available after dataset cutoff")
     for payload in spec.get("inputs", []):
         decision_time = _parse_utc(payload.get("decision_time_utc"))
         if decision_time > cutoff:
@@ -394,7 +402,7 @@ def _decision_record(
     decision_time = str(payload["decision_time_utc"])
     contract_version = strategy_contract_version or sha256_canonical({
         "bundle_version": BUNDLE_VERSION,
-        "strategies": ["BASELINE_PULLBACK", "VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"],
+        "strategies": ["BASELINE_PULLBACK", "VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2", "TRAPPED_LONGS_REVERSAL_V2"],
         "grade_c_public": False,
         "autoexecution": "OFF",
         "root_detector_shadow_v2": "RESEARCH_ONLY_NOT_STRATEGY",
@@ -451,11 +459,21 @@ def _validate_replay_rows(root: Path, manifest: Mapping[str, Any], errors: list[
         if len(inputs) != len(decisions):
             errors.append("row-count-mismatch:inputs-decisions")
         seen: set[str] = set()
-        for input_row, decision_row in zip(inputs, decisions, strict=False):
+        decision_by_input_id: dict[str, Mapping[str, Any]] = {}
+        for decision_row in decisions:
+            decision_input_id = str(decision_row.get("input_id"))
+            if decision_input_id in decision_by_input_id:
+                errors.append(f"duplicate-decision-input-id:{decision_input_id}")
+            decision_by_input_id[decision_input_id] = decision_row
+        for input_row in inputs:
             input_id = str(input_row.get("input_id"))
             if input_id in seen:
                 errors.append(f"duplicate-input-id:{input_id}")
             seen.add(input_id)
+            decision_row = decision_by_input_id.get(input_id)
+            if decision_row is None:
+                errors.append(f"missing-decision-input-id:{input_id}")
+                continue
             payload = json.loads(input_row["payload_json"])
             decision_time = _parse_utc(payload["decision_time_utc"])
             if decision_time > cutoff:
@@ -478,6 +496,20 @@ def _validate_replay_rows(root: Path, manifest: Mapping[str, Any], errors: list[
         availability_column = "availability_time_utc" if "availability_time_utc" in candles.columns else "available_at_utc"
         if not candles.empty and (pd.to_datetime(candles[availability_column], utc=True) > pd.Timestamp(cutoff)).any():
             errors.append("market-row-after-cutoff")
+        optional_cutoff_columns = {
+            "market_data/asof_candles_1m.parquet": "asof-market-row-after-cutoff",
+            "state/baseline_transitions.parquet": "baseline-transition-after-cutoff",
+        }
+        for relative, error_code in optional_cutoff_columns.items():
+            if relative not in manifest.get("artifacts", []):
+                continue
+            table = pq.read_table(root / relative)
+            if table.num_rows == 0:
+                continue
+            frame = table.to_pandas()
+            column = "availability_time_utc" if "availability_time_utc" in frame.columns else "available_at_utc"
+            if (pd.to_datetime(frame[column], utc=True) > pd.Timestamp(cutoff)).any():
+                errors.append(error_code)
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
         errors.append(f"invalid:replay-rows:{exc}")
 

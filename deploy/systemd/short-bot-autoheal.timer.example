@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the bounded Short Bot autoheal check
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=short-bot-autoheal.service
+
+[Install]
+WantedBy=timers.target

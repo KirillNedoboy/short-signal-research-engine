@@ -13,7 +13,17 @@ from app.replay.canonical import canonicalize
 BASELINE_PULLBACK = "BASELINE_PULLBACK"
 VOLUME_CLIMAX_UNWIND = "VOLUME_CLIMAX_UNWIND"
 LOW_VOLUME_EXTENSION_FAILURE = "LOW_VOLUME_EXTENSION_FAILURE"
-STRATEGIES = frozenset({BASELINE_PULLBACK, VOLUME_CLIMAX_UNWIND, LOW_VOLUME_EXTENSION_FAILURE})
+LOW_VOLUME_EXTENSION_FAILURE_V2 = "LOW_VOLUME_EXTENSION_FAILURE_V2"
+TRAPPED_LONGS_REVERSAL_V2 = "TRAPPED_LONGS_REVERSAL_V2"
+STRATEGIES = frozenset(
+    {
+        BASELINE_PULLBACK,
+        VOLUME_CLIMAX_UNWIND,
+        LOW_VOLUME_EXTENSION_FAILURE,
+        LOW_VOLUME_EXTENSION_FAILURE_V2,
+        TRAPPED_LONGS_REVERSAL_V2,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +47,32 @@ class ClimaxStrategyInput:
     strategy: str = VOLUME_CLIMAX_UNWIND
 
 
-StrategyInput: TypeAlias = BaselineStrategyInput | ClimaxStrategyInput
+@dataclass(frozen=True, slots=True)
+class TrappedLongsV2StrategyInput:
+    symbol: str
+    event_id: str
+    frame_rows: tuple[dict[str, Any], ...]
+    breakout_identity: str
+    breakout_at: datetime
+    breakout_reference: float | None
+    revision: int
+    oi_observations: tuple[dict[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.oi_observations) != 4
+            or self.revision <= 0
+            or not self.breakout_identity
+        ):
+            raise ValueError("invalid trapped V2 replay contract")
+
+    decision_time_utc: datetime
+    strategy: str = TRAPPED_LONGS_REVERSAL_V2
+
+
+StrategyInput: TypeAlias = (
+    BaselineStrategyInput | ClimaxStrategyInput | TrappedLongsV2StrategyInput
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +100,8 @@ class StrategyDecisionRecord:
 def strategy_input_to_dict(value: StrategyInput) -> dict[str, Any]:
     """Serialize an input using only canonical, portable built-in values."""
 
+    if isinstance(value, TrappedLongsV2StrategyInput):
+        return canonicalize(asdict(value))
     payload: dict[str, Any] = {
         "strategy": value.strategy,
         "state": asdict(value.state),
@@ -84,20 +121,43 @@ def strategy_input_from_dict(value: Mapping[str, Any]) -> StrategyInput:
     strategy = str(value["strategy"])
     if strategy not in STRATEGIES:
         raise ValueError(f"unsupported replay strategy: {strategy}")
+    if strategy == TRAPPED_LONGS_REVERSAL_V2:
+        data = dict(value)
+        data["breakout_at"] = _parse_datetime(data["breakout_at"])
+        data["decision_time_utc"] = _parse_datetime(data["decision_time_utc"])
+        data["frame_rows"] = tuple(data["frame_rows"])
+        data["oi_observations"] = tuple(data["oi_observations"])
+        return TrappedLongsV2StrategyInput(**data)
     state_data = dict(value["state"])
     state_data["state"] = EventStatus(state_data["state"])
     state = EventState(**_restore_datetimes(state_data))
     features = SymbolFeatures(**_restore_datetimes(dict(value["features"])))
     decision_time = _parse_datetime(value["decision_time_utc"])
     if strategy == BASELINE_PULLBACK:
-        return BaselineStrategyInput(state, features, ShortZone(**dict(value["short_zone"])), decision_time, strategy)
-    return ClimaxStrategyInput(state, features, str(value["frame_ref"]), decision_time, strategy)
+        return BaselineStrategyInput(
+            state,
+            features,
+            ShortZone(**dict(value["short_zone"])),
+            decision_time,
+            strategy,
+        )
+    return ClimaxStrategyInput(
+        state, features, str(value["frame_ref"]), decision_time, strategy
+    )
 
 
 def _restore_datetimes(value: dict[str, Any]) -> dict[str, Any]:
     datetime_fields = {
-        "event_start_time", "event_high_time", "pullback_detected_at", "signal_sent_at", "expires_at", "updated_at",
-        "asof", "market_asof", "last_high_time", "last_structural_close_time",
+        "event_start_time",
+        "event_high_time",
+        "pullback_detected_at",
+        "signal_sent_at",
+        "expires_at",
+        "updated_at",
+        "asof",
+        "market_asof",
+        "last_high_time",
+        "last_structural_close_time",
     }
     for key in datetime_fields & set(value):
         if value[key] is not None and isinstance(value[key], str):

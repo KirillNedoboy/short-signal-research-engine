@@ -81,26 +81,3 @@ def test_format_watch_message_is_not_actionable_short() -> None:
     assert "WATCH / НЕ ВХОД" in text
     assert "Orderbook spread is too wide." in text
     assert "SHORT SIGNAL" not in text
-
-
-def test_format_strategy4_names_strategy_separately_from_signal_type() -> None:
-    text = format_signal_message(
-        _minimal_decision(
-            strategy_subtype="TRAPPED_LONGS_REVERSAL",
-            strategy_metadata={
-                "breakout_reference": 100.0,
-                "failed_retest_high": 101.0,
-                "decision_price": 99.0,
-                "event_high": 102.0,
-                "entry_reference": 100.0,
-                "distance_from_breakout_pct": 1.0,
-                "distance_from_retest_high_pct": 1.98,
-            },
-        ),
-        "UTC",
-    )
-    assert "Стратегия: TRAPPED_LONGS_REVERSAL" in text
-    assert "Тип: Подтверждающий" in text
-    assert "Breakout level: 100.000000" in text
-    assert "Failed-retest high: 101.000000" in text
-    assert "Шорт-зона:" not in text

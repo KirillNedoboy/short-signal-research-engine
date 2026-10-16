@@ -11,13 +11,14 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+
+from app.infra.runtime_metadata import resolve_code_version
 from typing import Any, Iterable, Sequence
 
 RESEARCH_APPEND_ONLY = "RESEARCH_APPEND_ONLY"
@@ -827,22 +828,11 @@ def _canonical_json(value: Any) -> str:
 
 
 def _resolve_code_sha() -> str:
-    configured = os.getenv("SHORT_BOT_CODE_VERSION", "").strip()
-    if configured:
-        return configured[:64]
-    repository_root = Path(__file__).resolve().parents[2]
+    """Resolve the immutable release SHA; offline CLI archives degrade to unknown."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
+        return resolve_code_version()
+    except Exception:
         return "unknown"
-    return result.stdout.strip()[:64] or "unknown"
 
 
 def _canonical_scalar(value: Any) -> str:

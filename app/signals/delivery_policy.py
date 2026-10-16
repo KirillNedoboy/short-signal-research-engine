@@ -16,6 +16,8 @@ def live_delivery_enabled(decision: SignalDecision, config: AppConfig) -> bool:
     if decision.strategy_type == "BASELINE_PULLBACK":
         return config.baseline_live_delivery_enabled
     if decision.strategy_type == "TRAPPED_LONGS_REVERSAL":
+        if decision.strategy_subtype == "TRAPPED_LONGS_REVERSAL_V2":
+            return getattr(config, "trapped_longs_v2_live_delivery_enabled", False)
         return getattr(config, "trapped_longs_live_delivery_enabled", False)
     if decision.strategy_type != "CLIMAX_EXHAUSTION":
         return False
@@ -23,4 +25,6 @@ def live_delivery_enabled(decision: SignalDecision, config: AppConfig) -> bool:
         return config.volume_climax_live_delivery_enabled
     if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE":
         return config.low_volume_live_delivery_enabled
+    if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2":
+        return getattr(config, "low_volume_extension_v2_live_delivery_enabled", False)
     return False

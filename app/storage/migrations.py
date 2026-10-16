@@ -8,19 +8,23 @@ compatibility helper).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Mapping
 
 from sqlalchemy import Connection, Engine, UniqueConstraint, inspect, text
 
-from app.storage.identity import signal_identity
 from app.storage.models import Base
 
-
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
+V1_VERSION = 1
 LEGACY_VERSION = 0
 SCHEMA_VERSION_PRAGMA = "user_version"
 HEARTBEAT_TABLE = "__db_heartbeat"
+_CORRECTNESS_TABLES = frozenset({
+    "causal_pump_v2_roots",
+    "causal_pump_v2_comparisons",
+    "outcome_contract_v2_results",
+})
 _V2_TABLES = frozenset({
     "root_detector_shadow_v2_roots",
     "root_detector_shadow_v2_outcomes",
@@ -98,7 +102,7 @@ class SchemaValidationResult:
         object.__setattr__(
             self,
             "valid",
-            self.structure_valid and self.version == CURRENT_VERSION and self.version_error is None,
+            self.structure_valid and self.version_error is None,
         )
 
     @property
@@ -167,11 +171,10 @@ class MigrationResult:
     bootstrapped: bool
     adopted_legacy: bool
     validation: SchemaValidationResult
-    schema_repaired: bool = False
 
     @property
     def changed(self) -> bool:
-        return self.bootstrapped or self.adopted_legacy or self.schema_repaired
+        return self.bootstrapped or self.adopted_legacy
 
 
 def schema_contract(*, include_shadow_v2: bool = True) -> dict[str, TableContract]:
@@ -183,7 +186,7 @@ def schema_contract(*, include_shadow_v2: bool = True) -> dict[str, TableContrac
     database while still failing closed on missing runtime state.
     """
 
-    excluded = _V2_TABLES if not include_shadow_v2 else frozenset()
+    excluded = (_V2_TABLES | _CORRECTNESS_TABLES) if not include_shadow_v2 else frozenset()
     contract: dict[str, TableContract] = {}
     for table in Base.metadata.sorted_tables:
         if table.name in excluded:
@@ -283,26 +286,6 @@ def migrate_database(
     return _run_migration(bind, include_shadow_v2=include_shadow_v2)
 
 
-def migrate_legacy_schema(
-    bind: Engine | Connection,
-    *,
-    include_shadow_v2: bool = True,
-) -> MigrationResult:
-    """Apply an opt-in additive bridge for a prior-release SQLite schema.
-
-    This rollback-preparation operation is not implicit runtime repair. Callers
-    must take and verify a backup first; reversal is by restoring that backup,
-    never by dropping added columns. Existing rows are retained, signal
-    identities use the normal collision policy, and additions are idempotent.
-    """
-
-    return _run_migration(
-        bind,
-        include_shadow_v2=include_shadow_v2,
-        compatibility_mode=True,
-    )
-
-
 def bootstrap_test_schema(
     bind: Engine | Connection,
     *,
@@ -319,8 +302,9 @@ def bootstrap_test_schema(
         tables = _metadata_tables(include_shadow_v2=include_shadow_v2)
         Base.metadata.create_all(connection, tables=tables)
         if connection.dialect.name == "sqlite":
+            _ensure_low_volume_v2_episode_columns(connection)
             _ensure_legacy_sqlite_schema(connection)
-            _set_schema_version(connection, CURRENT_VERSION)
+            _set_schema_version(connection, CURRENT_VERSION if include_shadow_v2 else V1_VERSION)
         else:
             connection.execute(
                 text(
@@ -338,28 +322,25 @@ def _run_migration(
     bind: Engine | Connection,
     *,
     include_shadow_v2: bool,
-    compatibility_mode: bool = False,
 ) -> MigrationResult:
     def operation(connection: Connection) -> MigrationResult:
         _require_sqlite(connection)
         previous_version = _get_schema_version(connection)
         _ensure_supported_version(previous_version)
-        _upgrade_signal_identity(connection)
-        schema_repaired = False
-        if compatibility_mode:
-            schema_repaired = _ensure_legacy_additive_compatibility(
-                connection, include_shadow_v2=include_shadow_v2
-            ) or schema_repaired
-        else:
-            schema_repaired = _ensure_event_lifecycle_state_column(
-                connection,
-                include_shadow_v2=include_shadow_v2,
-            )
-            schema_repaired = _ensure_strategy_observation_event_id_column(
-                connection,
-                include_shadow_v2=include_shadow_v2,
-            ) or schema_repaired
         user_tables = _user_tables(connection)
+        _ensure_trapped_longs_provenance_constraint(connection)
+        _ensure_low_volume_v2_episode_columns(connection)
+        if previous_version == CURRENT_VERSION and user_tables:
+            _ensure_v2_additive_schema(connection)
+        if include_shadow_v2:
+            candidate_table = Base.metadata.tables.get("strategy_candidates")
+            if candidate_table is not None:
+                Base.metadata.create_all(connection, tables=[candidate_table])
+        early_drop_table = Base.metadata.tables.get("early_drop_warnings")
+        if early_drop_table is not None:
+            Base.metadata.create_all(connection, tables=[early_drop_table])
+        Base.metadata.create_all(connection, tables=[Base.metadata.tables["outcome_fetch_retries"]])
+
         if previous_version == LEGACY_VERSION and not user_tables:
             _create_fresh_schema(connection, include_shadow_v2=include_shadow_v2)
             validation = _validate_connection(connection, include_shadow_v2=include_shadow_v2)
@@ -367,14 +348,14 @@ def _run_migration(
                 raise SchemaValidationError(
                     "schema contract mismatch after bootstrap: " + "; ".join(validation.errors)
                 )
-            _set_schema_version(connection, CURRENT_VERSION)
+            _set_schema_version(connection, CURRENT_VERSION if include_shadow_v2 else V1_VERSION)
+            target_version = CURRENT_VERSION if include_shadow_v2 else V1_VERSION
             return MigrationResult(
-                version=CURRENT_VERSION,
+                version=target_version,
                 previous_version=previous_version,
                 bootstrapped=True,
                 adopted_legacy=False,
-                validation=replace(validation, version=CURRENT_VERSION, version_error=None),
-                schema_repaired=schema_repaired,
+                validation=replace(validation, version=target_version, version_error=None),
             )
 
         validation = _validate_connection(connection, include_shadow_v2=include_shadow_v2)
@@ -390,9 +371,22 @@ def _run_migration(
                 bootstrapped=False,
                 adopted_legacy=True,
                 validation=replace(validation, version=CURRENT_VERSION, version_error=None),
-                schema_repaired=schema_repaired,
             )
 
+        if previous_version == V1_VERSION and include_shadow_v2:
+            v1_validation = _validate_connection(connection, include_shadow_v2=False)
+            # V1→V2 must validate the V1 contract only.  A partially present
+            # V2 table set is precisely what this migration repairs.
+            v1_validation = replace(v1_validation, partial_optional_tables=())
+            if not v1_validation.valid:
+                raise SchemaValidationError("schema contract mismatch before V1→V2 migration: " + "; ".join(v1_validation.errors))
+            tables = [table for table in Base.metadata.sorted_tables if table.name in (_CORRECTNESS_TABLES | _V2_TABLES | {"low_volume_v2_episode_states"})]
+            Base.metadata.create_all(connection, tables=tables)
+            validation = _validate_connection(connection, include_shadow_v2=True)
+            if not validation.structure_valid:
+                raise SchemaValidationError("schema contract mismatch after V1→V2 migration: " + "; ".join(validation.errors))
+            _set_schema_version(connection, CURRENT_VERSION)
+            return MigrationResult(version=CURRENT_VERSION, previous_version=previous_version, bootstrapped=False, adopted_legacy=False, validation=replace(validation, version=CURRENT_VERSION, version_error=None))
         if not validation.valid:
             raise SchemaValidationError(
                 "schema contract mismatch: " + "; ".join(validation.errors)
@@ -403,7 +397,6 @@ def _run_migration(
             bootstrapped=False,
             adopted_legacy=False,
             validation=validation,
-            schema_repaired=schema_repaired,
         )
 
     return _with_transaction(bind, operation)
@@ -416,7 +409,10 @@ def _ensure_trapped_longs_provenance_constraint(connection: Connection) -> None:
     ddl = connection.execute(
         text("SELECT sql FROM sqlite_master WHERE type='table' AND name='signal_provenance'")
     ).scalar_one_or_none()
-    if ddl is None or "TRAPPED_LONGS_REVERSAL" in str(ddl):
+    if ddl is None or (
+        "TRAPPED_LONGS_REVERSAL" in str(ddl)
+        and "LOW_VOLUME_EXTENSION_FAILURE_V2" in str(ddl)
+    ):
         return
     connection.exec_driver_sql("ALTER TABLE signal_provenance RENAME TO signal_provenance_legacy")
     connection.exec_driver_sql(
@@ -440,13 +436,13 @@ def _ensure_trapped_longs_provenance_constraint(connection: Connection) -> None:
             provenance_anomaly VARCHAR(64),
             CONSTRAINT ck_signal_provenance_strategy_branch CHECK (
                 strategy_branch IN ('BASELINE_PULLBACK', 'VOLUME_CLIMAX_UNWIND',
-                'LOW_VOLUME_EXTENSION_FAILURE', 'TRAPPED_LONGS_REVERSAL')
+                'LOW_VOLUME_EXTENSION_FAILURE', 'LOW_VOLUME_EXTENSION_FAILURE_V2', 'TRAPPED_LONGS_REVERSAL')
             ),
             CONSTRAINT ck_signal_provenance_strategy_shape CHECK (
                 (strategy_branch = 'BASELINE_PULLBACK' AND strategy_family = 'BASELINE_PULLBACK'
                  AND root_event_id IS NULL AND decision_evaluation_id IS NULL
                  AND admission_evaluation_id IS NULL)
-                OR (strategy_branch IN ('VOLUME_CLIMAX_UNWIND', 'LOW_VOLUME_EXTENSION_FAILURE')
+                OR (strategy_branch IN ('VOLUME_CLIMAX_UNWIND', 'LOW_VOLUME_EXTENSION_FAILURE', 'LOW_VOLUME_EXTENSION_FAILURE_V2')
                  AND strategy_family = 'CLIMAX_EXHAUSTION' AND root_event_id IS NOT NULL
                  AND decision_evaluation_id IS NOT NULL)
                 OR (strategy_branch = 'TRAPPED_LONGS_REVERSAL'
@@ -479,109 +475,6 @@ def _ensure_trapped_longs_provenance_constraint(connection: Connection) -> None:
         )
 
 
-def _ensure_legacy_additive_compatibility(
-    connection: Connection,
-    *,
-    include_shadow_v2: bool,
-) -> bool:
-    """Bridge the known prior-release shape using additive SQLite DDL."""
-    before = validate_schema(connection, include_shadow_v2=include_shadow_v2)
-    _ensure_legacy_sqlite_schema(connection)
-    repaired = before != validate_schema(connection, include_shadow_v2=include_shadow_v2)
-    _ensure_contract_indexes(connection, include_shadow_v2=include_shadow_v2)
-    return repaired
-
-
-def _ensure_contract_indexes(
-    connection: Connection,
-    *,
-    include_shadow_v2: bool,
-) -> None:
-    """Create only missing contract indexes after additive columns exist."""
-    inspector = inspect(connection)
-    for table_name, contract in schema_contract(include_shadow_v2=include_shadow_v2).items():
-        if not inspector.has_table(table_name):
-            continue
-        actual: dict[str, tuple[tuple[str, ...], bool]] = {}
-        for item in inspector.get_indexes(table_name):
-            if item.get("name"):
-                actual[item["name"]] = (tuple(item.get("column_names") or ()), bool(item.get("unique")))
-        for item in inspector.get_unique_constraints(table_name):
-            if item.get("name"):
-                actual[item["name"]] = (tuple(item.get("column_names") or ()), True)
-        for index in contract.indexes:
-            if index.name in actual:
-                continue
-            if any(columns == index.columns and (not index.unique or unique) for columns, unique in actual.values()):
-                continue
-            prefix = "UNIQUE " if index.unique else ""
-            columns = ", ".join(index.columns)
-            connection.exec_driver_sql(
-                f"CREATE {prefix}INDEX IF NOT EXISTS {index.name} ON {table_name} ({columns})"
-            )
-        inspector = inspect(connection)
-
-
-def _ensure_strategy_observation_event_id_column(
-    connection: Connection,
-    *,
-    include_shadow_v2: bool,
-) -> bool:
-    """Add the nullable observation event identity without backfilling history."""
-    inspector = inspect(connection)
-    if not inspector.has_table("strategy_observations"):
-        return False
-    columns = {column["name"] for column in inspector.get_columns("strategy_observations")}
-    if "event_id" in columns:
-        return False
-    validation = _validate_connection(
-        connection,
-        include_shadow_v2=include_shadow_v2,
-        allow_missing_strategy_observation_event_id=True,
-    )
-    if not validation.structure_valid:
-        raise SchemaValidationError(
-            "schema contract mismatch before strategy_observations event_id migration: "
-            + "; ".join(validation.errors)
-        )
-    connection.exec_driver_sql(
-        "ALTER TABLE strategy_observations ADD COLUMN event_id VARCHAR(128)"
-    )
-    connection.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS ix_strategy_observations_event_id "
-        "ON strategy_observations (event_id)"
-    )
-    return True
-
-
-def _ensure_event_lifecycle_state_column(
-    connection: Connection,
-    *,
-    include_shadow_v2: bool,
-) -> bool:
-    """Add the nullable lifecycle column only after structural validation."""
-    inspector = inspect(connection)
-    if not inspector.has_table("event_states"):
-        return False
-    columns = {column["name"] for column in inspector.get_columns("event_states")}
-    if "lifecycle_state" in columns:
-        return False
-    validation = _validate_connection(
-        connection,
-        include_shadow_v2=include_shadow_v2,
-        allow_missing_event_lifecycle=True,
-    )
-    if not validation.structure_valid:
-        raise SchemaValidationError(
-            "schema contract mismatch before lifecycle_state migration: "
-            + "; ".join(validation.errors)
-        )
-    connection.exec_driver_sql(
-        "ALTER TABLE event_states ADD COLUMN lifecycle_state VARCHAR(32)"
-    )
-    return True
-
-
 def _create_fresh_schema(connection: Connection, *, include_shadow_v2: bool) -> None:
     Base.metadata.create_all(
         connection,
@@ -598,40 +491,25 @@ def _create_fresh_schema(connection: Connection, *, include_shadow_v2: bool) -> 
 
 
 def _metadata_tables(*, include_shadow_v2: bool) -> list[object]:
-    excluded = _V2_TABLES if not include_shadow_v2 else frozenset()
+    excluded = (_V2_TABLES | _CORRECTNESS_TABLES) if not include_shadow_v2 else frozenset()
     return [table for table in Base.metadata.sorted_tables if table.name not in excluded]
 
 
-def _validate_connection(
-    connection: Connection,
-    *,
-    include_shadow_v2: bool,
-    allow_missing_event_lifecycle: bool = False,
-    allow_missing_strategy_observation_event_id: bool = False,
-) -> SchemaValidationResult:
+def _validate_connection(connection: Connection, *, include_shadow_v2: bool) -> SchemaValidationResult:
     _require_sqlite(connection)
     version = _get_schema_version(connection)
     _ensure_supported_version(version, raise_error=False)
     contract = schema_contract(include_shadow_v2=include_shadow_v2)
-    if allow_missing_event_lifecycle:
-        event_contract = contract["event_states"]
-        contract["event_states"] = replace(
-            event_contract,
-            columns=tuple(column for column in event_contract.columns if column != "lifecycle_state"),
-            column_types={key: value for key, value in event_contract.column_types.items() if key != "lifecycle_state"},
-        )
-    if allow_missing_strategy_observation_event_id:
-        observation_contract = contract["strategy_observations"]
-        contract["strategy_observations"] = replace(
-            observation_contract,
-            columns=tuple(column for column in observation_contract.columns if column != "event_id"),
-            column_types={key: value for key, value in observation_contract.column_types.items() if key != "event_id"},
-        )
     inspector = inspect(connection)
     all_tables = set(_user_tables(connection))
-    present_v2 = all_tables & _V2_TABLES
-    partial_optional_tables = tuple(sorted(present_v2)) if present_v2 and present_v2 != _V2_TABLES else ()
-    actual_tables = all_tables | (_V2_TABLES if present_v2 == _V2_TABLES else set())
+    optional_tables = _V2_TABLES | _CORRECTNESS_TABLES
+    present_optional = all_tables & optional_tables
+    partial_optional_tables = (
+        tuple(sorted(present_optional))
+        if present_optional and present_optional != optional_tables
+        else ()
+    )
+    actual_tables = all_tables
     missing_tables = tuple(sorted(set(contract) - actual_tables))
     missing_columns: dict[str, tuple[str, ...]] = {}
     missing_indexes: dict[str, tuple[str, ...]] = {}
@@ -695,10 +573,13 @@ def _validate_connection(
         if missing_for_table:
             missing_indexes[table_name] = tuple(sorted(set(missing_for_table)))
 
-    unexpected_tables = tuple(sorted((all_tables - set(contract)) - _V2_TABLES))
+    unexpected_tables = tuple(sorted((all_tables - set(contract)) - _V2_TABLES - _CORRECTNESS_TABLES))
     version_error = None
-    if version != CURRENT_VERSION:
-        version_error = f"schema version {version} is not current (expected {CURRENT_VERSION})"
+    expected_version = CURRENT_VERSION if include_shadow_v2 else V1_VERSION
+    optional_tables = _V2_TABLES | _CORRECTNESS_TABLES
+    disabled_accepts_complete_v2 = not include_shadow_v2 and version == CURRENT_VERSION and optional_tables <= all_tables
+    if version != expected_version and not disabled_accepts_complete_v2:
+        version_error = f"schema version {version} is not current (expected {expected_version})"
     return SchemaValidationResult(
         version=version,
         missing_tables=missing_tables,
@@ -757,57 +638,32 @@ def _with_transaction(bind: Engine | Connection, operation):
     return operation(bind)
 
 
-def _upgrade_signal_identity(connection: Connection) -> None:
-    """Add and safely backfill the nullable signal identity on legacy schemas."""
-    inspector = inspect(connection)
-    if not inspector.has_table("signals"):
+def _ensure_low_volume_v2_episode_columns(connection: Connection) -> None:
+    """Add lifecycle columns without rewriting or dropping legacy V2 rows."""
+    if not inspect(connection).has_table("low_volume_v2_episode_states"):
         return
-    columns = {column["name"] for column in inspector.get_columns("signals")}
-    required_columns = {
-        "id", "symbol", "event_id", "strategy_type", "strategy_subtype", "model_version",
+    existing = {column["name"] for column in inspect(connection).get_columns("low_volume_v2_episode_states")}
+    additions = {
+        "first_event_high": "FLOAT",
+        "last_retest_high": "FLOAT",
+        "last_closed_candle_time": "TIMESTAMP",
+        "episode_started_at": "TIMESTAMP",
+        "invalidated_reason": "VARCHAR(128)",
     }
-    missing_columns = sorted(required_columns - columns)
-    if missing_columns:
-        raise SchemaValidationError(
-            "schema contract mismatch during signal identity migration: "
-            f"signals missing columns: {', '.join(missing_columns)}"
-        )
-    if "signal_identity" not in columns:
-        connection.exec_driver_sql("ALTER TABLE signals ADD COLUMN signal_identity TEXT")
-    rows = connection.exec_driver_sql(
-        "SELECT id, signal_identity, symbol, event_id, strategy_type, strategy_subtype, model_version FROM signals ORDER BY id"
-    ).mappings().all()
-    identities: dict[str, int] = {}
-    for row in rows:
-        try:
-            identity = signal_identity(
-                symbol=row["symbol"], event_id=row["event_id"],
-                strategy_type=row["strategy_type"], strategy_subtype=row["strategy_subtype"],
-                model_version=row["model_version"],
-            )
-        except ValueError:
-            continue
-        prior = identities.get(identity)
-        if prior is not None and prior != row["id"]:
-            raise MigrationError(f"signal identity collision between rows {prior} and {row['id']}")
-        identities[identity] = row["id"]
-        existing = row["signal_identity"]
-        if existing is not None and existing != identity:
-            raise MigrationError(f"signal identity mismatch for row {row['id']}")
-        if existing is None:
+    for name, ddl_type in additions.items():
+        if name not in existing:
             connection.exec_driver_sql(
-                "UPDATE signals SET signal_identity = ? WHERE id = ?", (identity, row["id"])
+                f"ALTER TABLE low_volume_v2_episode_states ADD COLUMN {name} {ddl_type}"
             )
-    duplicate = connection.exec_driver_sql(
-        "SELECT signal_identity FROM signals WHERE signal_identity IS NOT NULL GROUP BY signal_identity HAVING COUNT(*) > 1 LIMIT 1"
-    ).first()
-    if duplicate:
-        raise MigrationError("signal identity collision prevents unique index creation")
-    index_names = {index["name"] for index in inspect(connection).get_indexes("signals") if index.get("name")}
-    constraint_names = {item["name"] for item in inspect(connection).get_unique_constraints("signals") if item.get("name")}
-    if "uq_signal_identity" not in index_names and "uq_signal_identity" not in constraint_names:
-        connection.exec_driver_sql("CREATE UNIQUE INDEX uq_signal_identity ON signals(signal_identity)")
 
+
+def _ensure_v2_additive_schema(connection: Connection) -> None:
+    """Repair missing V2 objects without replacing any existing table or row."""
+    episode_table = Base.metadata.tables.get("low_volume_v2_episode_states")
+    if episode_table is not None:
+        Base.metadata.create_all(connection, tables=[episode_table])
+    _ensure_low_volume_v2_episode_columns(connection)
+    _ensure_legacy_sqlite_schema(connection)
 
 
 def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
@@ -819,14 +675,10 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
         for table in inspector.get_table_names()
     }
     additions: dict[str, list[tuple[str, str]]] = {
-        "event_states": [
-            ("lifecycle_state", "TEXT"),
-        ],
         "signals": [
             ("strategy_type", "TEXT"),
             ("strategy_subtype", "TEXT"),
             ("model_version", "TEXT"),
-            ("signal_identity", "TEXT"),
         ],
         "signal_outcomes": [
             ("risk_adjusted_status", "TEXT"),
@@ -835,12 +687,6 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
             ("is_squeeze_before_tp", "BOOLEAN"),
         ],
         "strategy_observations": [
-            ("event_id", "TEXT"),
-            ("initial_evaluation_id", "INTEGER"),
-            ("initial_decision", "TEXT"),
-            ("final_decision", "TEXT"),
-            ("final_reason", "TEXT"),
-            ("finalized_at", "TIMESTAMP"),
             ("runtime_started_at", "TIMESTAMP"),
             ("code_version", "TEXT"),
             ("outcome_status", "TEXT"),
@@ -859,6 +705,8 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
             ("decision_event_high", "FLOAT"),
             ("decision_distance_from_high", "FLOAT"),
             ("provenance_anomaly", "TEXT"),
+            ("event_revision", "INTEGER"),
+            ("entry_trigger_time", "TIMESTAMP"),
         ],
         "climax_evaluations": [
             ("runtime_instance_id", "TEXT"),
@@ -896,16 +744,6 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
             ("runtime_instance_id", "TEXT"),
             ("model_version", "TEXT"),
             ("config_fingerprint", "TEXT"),
-            ("process_last_seen", "TIMESTAMP"),
-            ("full_scan_last_complete", "TIMESTAMP"),
-            ("fast_monitor_last_complete", "TIMESTAMP"),
-            ("market_data_last_healthy", "TIMESTAMP"),
-            ("outbox_last_progress", "TIMESTAMP"),
-            ("outbox_last_observed", "TIMESTAMP"),
-            ("market_data_health", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
-            ("outbox_health", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
-            ("last_scan_duration_ms", "FLOAT"),
-            ("last_event_loop_lag_ms", "FLOAT"),
         ],
         "reject_stats": [
             ("derivatives_status", "TEXT"),
@@ -925,6 +763,11 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
                 )
 
     connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_signal_provenance_v2_identity "
+        "ON signal_provenance(root_event_id, strategy_branch, event_revision, entry_trigger_time)"
+    )
+
+    connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_root_shadow_symbol_seen "
         "ON root_detector_shadow_candidates(symbol, first_seen_at)"
     )
@@ -940,15 +783,6 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
         "CREATE INDEX IF NOT EXISTS ix_strategy_observations_outcome_next_attempt_at "
         "ON strategy_observations(outcome_next_attempt_at)"
     )
-    for name, column in (
-        ("ix_strategy_observations_initial_evaluation_id", "initial_evaluation_id"),
-        ("ix_strategy_observations_initial_decision", "initial_decision"),
-        ("ix_strategy_observations_final_decision", "final_decision"),
-        ("ix_strategy_observations_finalized_at", "finalized_at"),
-    ):
-        connection.exec_driver_sql(
-            f"CREATE INDEX IF NOT EXISTS {name} ON strategy_observations({column})"
-        )
     if "signals" in columns_by_table:
         index_names = {index["name"] for index in inspect(connection).get_indexes("signals")}
         constraint_names = {
@@ -966,20 +800,31 @@ def _ensure_legacy_sqlite_schema(connection: Connection) -> None:
                 "CREATE UNIQUE INDEX uq_signal_enriched_identity "
                 "ON signals(symbol, event_id, strategy_subtype, model_version)"
             )
-        identity_duplicate = connection.exec_driver_sql(
-            "SELECT 1 FROM signals "
-            "WHERE signal_identity IS NOT NULL "
-            "GROUP BY signal_identity HAVING COUNT(*) > 1 LIMIT 1"
-        ).first()
-        if identity_duplicate:
-            raise MigrationError("duplicate non-null signal_identity values prevent unique index creation")
-        if (
-            "uq_signal_identity" not in index_names
-            and "uq_signal_identity" not in constraint_names
-        ):
-            connection.exec_driver_sql(
-                "CREATE UNIQUE INDEX uq_signal_identity ON signals(signal_identity)"
-            )
+
+    connection.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS early_drop_warnings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "lane VARCHAR(8) NOT NULL DEFAULT 'LANE-A', "
+        "root_event_id VARCHAR(128) NOT NULL, "
+        "event_revision INTEGER NOT NULL, "
+        "symbol VARCHAR(32) NOT NULL, "
+        "status VARCHAR(32) NOT NULL, "
+        "reason VARCHAR(128) NOT NULL, "
+        "metadata_json JSON NOT NULL DEFAULT '{}', "
+        "non_actionable BOOLEAN NOT NULL DEFAULT 1, "
+        "created_at TIMESTAMP NOT NULL, "
+        "telegram_sent BOOLEAN NOT NULL DEFAULT 0, "
+        "CONSTRAINT uq_early_drop_warning_root_revision UNIQUE (root_event_id, event_revision)"
+        ")"
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_early_drop_warnings_symbol "
+        "ON early_drop_warnings(symbol)"
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_early_drop_warnings_created_at "
+        "ON early_drop_warnings(created_at)"
+    )
 
     connection.exec_driver_sql(
         "CREATE TABLE IF NOT EXISTS __db_heartbeat ("

@@ -258,6 +258,8 @@ def evaluate_row(
     if signal_id is not None and int(signal_id) in context.pending_signal_ids:
         return _decision(table_spec, identity, "KEEP", "KEEP_PENDING_SIGNAL_OUTCOME", ("signal_id",))
     row_status = str(row.get("outcome_status") or "")
+    if row_status in {"deferred", "DEFERRED"}:
+        return _decision(table_spec, identity, "KEEP", "KEEP_RETRYABLE_ERROR", ("outcome_status",))
     if row_status in {"incomplete", "PARTIAL", "CENSORED"}:
         return _decision(table_spec, identity, "KEEP", "KEEP_PENDING_OUTCOME", ("outcome_status",))
     if row_status == "unknown" and row.get("outcome_next_attempt_at") is not None:

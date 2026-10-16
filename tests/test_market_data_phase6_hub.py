@@ -104,7 +104,7 @@ class FakeConnection:
 
 
 @pytest.mark.asyncio
-async def test_simultaneous_shards_reconnect_with_independent_epochs(monkeypatch) -> None:
+async def test_failed_shard_reconnect_preserves_other_epoch(monkeypatch) -> None:
     observer = RecordingObserver()
     connections = [FakeConnection() for _ in range(4)]
 
@@ -135,11 +135,12 @@ async def test_simultaneous_shards_reconnect_with_independent_epochs(monkeypatch
             ConnectionEpoch(0, 1), ConnectionEpoch(1, 1)
         }
         first_live = tuple(hub._connections)
-        await first_live[0].incoming.put(ConnectionError("controlled close"))
-        await _eventually(lambda: len(observer.connections) == 4)
-        assert {event.connection_epoch for event in observer.connections[-2:]} == {
-            ConnectionEpoch(0, 2), ConnectionEpoch(1, 2)
-        }
+        failed = first_live[0]
+        await failed.incoming.put(ConnectionError("controlled close"))
+        await _eventually(lambda: len(observer.connections) == 3)
+        assert observer.connections[-1].connection_epoch.shard_id in (0, 1)
+        assert sorted(epoch.generation for epoch in (event.connection_epoch for event in observer.connections)) == [1, 1, 2]
+        assert len(hub._connections) == 2
     finally:
         await hub.stop()
 

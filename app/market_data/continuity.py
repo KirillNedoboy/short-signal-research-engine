@@ -83,14 +83,22 @@ class GapTracker:
         self._max_candles = max_candles_per_symbol
         self._candles: dict[str, dict[datetime, MarketCandle]] = {}
         self._states: dict[str, GapState] = {}
-        self._active: dict[tuple[str, datetime, datetime], GapEvent] = {}
+        self._active: dict[str, dict[tuple[str, datetime, datetime], GapEvent]] = {}
         self._events: deque[GapEvent] = deque(maxlen=max_evidence_events)
         self._conflicts: deque[ParityConflict] = deque(maxlen=max_evidence_events)
         self._health = GapHealth()
 
+    def ensure_decision_window(self, candles: int) -> None:
+        """Cover the store ring before observing candles; never resize lost history."""
+        if candles <= self._max_candles:
+            return
+        if self._candles:
+            raise ValueError("cannot enlarge continuity window after observing candles")
+        self._max_candles = candles
+
     @property
     def active_gaps(self) -> tuple[GapEvent, ...]:
-        return tuple(sorted(self._active.values(), key=lambda gap: gap.identity))
+        return tuple(sorted((gap for gaps in self._active.values() for gap in gaps.values()), key=lambda gap: gap.identity))
 
     @property
     def events(self) -> tuple[GapEvent, ...]:
@@ -101,10 +109,23 @@ class GapTracker:
         return tuple(self._conflicts)
 
     def get_health(self) -> GapHealth:
-        return replace(self._health, active_gaps=len(self._active))
+        return replace(self._health, active_gaps=sum(len(gaps) for gaps in self._active.values()))
 
     def get_symbol_state(self, symbol: str) -> GapState:
         return self._states.get(symbol.upper(), GapState.UNINITIALIZED)
+
+    def has_gap_since(self, symbol: str, oldest_open_time: datetime) -> bool:
+        """Whether an unresolved gap overlaps the retained decision candles."""
+        return any(
+            gap.observed_next_start > oldest_open_time
+            for gap in self._active.get(symbol.upper(), {}).values()
+        )
+
+    def has_gap_at(self, symbol: str, open_time: datetime) -> bool:
+        return any(
+            gap.expected_start <= open_time < gap.observed_next_start
+            for gap in self._active.get(symbol.upper(), {}).values()
+        )
 
     def get_candles(self, symbol: str) -> tuple[MarketCandle, ...]:
         candles = self._candles.get(symbol.upper(), {})
@@ -132,23 +153,22 @@ class GapTracker:
             self._health = replace(
                 self._health, late_candles=self._health.late_candles + 1
             )
-        prior_active = set(self._active)
         candles[candle.open_time] = candle
-        self._recompute_symbol(symbol, detected_at=candle.received_at)
-        current_active = set(self._active)
-        if candle.source == REST_BACKFILL_SOURCE and prior_active - current_active:
-            self._health = replace(
-                self._health, gaps_backfilled=self._health.gaps_backfilled + 1
-            )
         while len(candles) > self._max_candles:
             candles.pop(min(candles))
+        repaired = self._recompute_symbol(symbol, detected_at=candle.received_at)
+        if candle.source == REST_BACKFILL_SOURCE and repaired:
+            self._health = replace(
+                self._health, gaps_backfilled=self._health.gaps_backfilled + 1,
+            )
 
     def mark_backfilling(self, gap: GapEvent) -> None:
-        if gap.identity in self._active:
+        if gap.identity in self._active.get(gap.symbol, {}):
             self._states[gap.symbol] = GapState.BACKFILLING
 
     def mark_backfill_failure(self, gap: GapEvent) -> None:
-        self._states[gap.symbol] = GapState.DEGRADED
+        if gap.identity in self._active.get(gap.symbol, {}):
+            self._states[gap.symbol] = GapState.DEGRADED
         self._health = replace(
             self._health, backfill_failures=self._health.backfill_failures + 1
         )
@@ -198,27 +218,38 @@ class GapTracker:
             self._health, duplicates=self._health.duplicates + 1
         )
 
-    def _recompute_symbol(self, symbol: str, *, detected_at: datetime) -> None:
+    def _recompute_symbol(self, symbol: str, *, detected_at: datetime) -> bool:
         candles = self._candles[symbol]
         times = sorted(candles)
-        prior_for_symbol = {
-            identity: gap
-            for identity, gap in self._active.items()
-            if gap.symbol == symbol
+        active = self._active.setdefault(symbol, {})
+        prior_for_symbol = dict(active)
+        active.clear()
+        # A gap at or before the earliest retained candle cannot overlap the
+        # decision window. Retiring it is not a REST repair.
+        retained = {
+            identity: gap for identity, gap in prior_for_symbol.items()
+            if gap.observed_next_start > times[0]
         }
-        for identity in prior_for_symbol:
-            self._active.pop(identity, None)
-        for identity, gap in prior_for_symbol.items():
-            missing_times = {
-                gap.expected_start + timedelta(minutes=index)
-                for index in range(gap.missing_count)
-            }
-            if not missing_times.issubset(candles):
-                self._active[identity] = gap
+        repaired = False
+        for identity, gap in retained.items():
+            # Check only the missing span that can still overlap the retained
+            # decision window. An older unfilled prefix is not a veto once it
+            # has left that window; nor does its retirement count as a repair.
+            missing_start = max(gap.expected_start, times[0])
+            relevant_count = int(
+                (gap.observed_next_start - missing_start) / timedelta(minutes=1)
+            )
+            if relevant_count > len(candles) or any(
+                missing_start + timedelta(minutes=index) not in candles
+                for index in range(relevant_count)
+            ):
+                active[identity] = gap
+            elif gap.expected_start >= times[0]:
+                repaired = True
         if len(times) == 1:
             self._states[symbol] = GapState.TRACKING
-            return
-        gaps: list[GapEvent] = []
+            return repaired
+        detected = False
         for previous, current in pairwise(times):
             distance = int((current - previous) / timedelta(minutes=1))
             if distance <= 1:
@@ -231,28 +262,28 @@ class GapTracker:
                 detected_at=detected_at,
                 connection_epoch=candles[current].connection_epoch,
             )
-            if any(_contains(existing, gap) for existing in prior_for_symbol.values()):
+            if any(_contains(existing, gap) for existing in retained.values()):
                 continue
-            gaps.append(gap)
-            self._active[gap.identity] = gap
-            if gap.identity not in prior_for_symbol:
-                self._events.append(gap)
-                self._health = replace(
-                    self._health, gaps_detected=self._health.gaps_detected + 1
-                )
-                LOGGER.warning(
-                    "closed candle gap detected symbol=%s expected=%s observed=%s missing=%s epoch=%s",
-                    gap.symbol,
-                    gap.expected_start.isoformat(),
-                    gap.observed_next_start.isoformat(),
-                    gap.missing_count,
-                    gap.connection_epoch,
-                )
+            active[gap.identity] = gap
+            detected = True
+            self._events.append(gap)
+            self._health = replace(
+                self._health, gaps_detected=self._health.gaps_detected + 1
+            )
+            LOGGER.warning(
+                "closed candle gap detected symbol=%s expected=%s observed=%s missing=%s epoch=%s",
+                gap.symbol,
+                gap.expected_start.isoformat(),
+                gap.observed_next_start.isoformat(),
+                gap.missing_count,
+                gap.connection_epoch,
+            )
         self._states[symbol] = (
             GapState.GAP_DETECTED
-            if any(gap.symbol == symbol for gap in self._active.values())
+            if detected or any(identity in active for identity in retained)
             else GapState.CONTIGUOUS
         )
+        return repaired
 
 
 def _contains(existing: GapEvent, candidate: GapEvent) -> bool:

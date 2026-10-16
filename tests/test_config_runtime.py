@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -31,13 +32,16 @@ def test_corrected_config_defaults_pass_validation() -> None:
     assert config.request_min_delay_ms == 350
 
 
-def test_unknown_config_keys_are_rejected() -> None:
-    with pytest.raises(ValueError, match="phase0_unknown_key"):
-        AppConfig.model_validate({"phase0_unknown_key": "rejected"})
-
-
-def test_relaxed_config_file_passes_validation() -> None:
-    config = load_config(config_path=Path("config.yaml"), env_path=Path(".env.missing"))
+def test_relaxed_config_file_passes_validation(tmp_path: Path) -> None:
+    fixture = tmp_path / "config.yaml"
+    fixture.write_text(
+        """\nshortlist_size: 100\nvol_zscore_min: 0.8\nupper_wick_min: 0.15\npullback_min_pct: 2.4\nshort_zone_range_low_pct: 0.70\ndist_to_vwap_min: 7.5\nsignal_expiry_minutes: 90\n""",
+        encoding="utf-8",
+    )
+    config = load_config(
+        config_path=fixture,
+        env_path=tmp_path / ".env.missing",
+    )
 
     assert config.shortlist_size == 100
     assert config.vol_zscore_min == 0.8
@@ -78,7 +82,7 @@ def test_reversed_request_jitter_bounds_fail_validation() -> None:
 
 
 def test_partial_telegram_credentials_fail_validation_without_secret_values() -> None:
-    token = "123456:secret-token"
+    token = "<TEST_REDACTED>"
     with pytest.raises(ValueError) as exc_info:
         AppConfig(telegram_token=None, signal_chat_id="-100123")
 
@@ -93,12 +97,12 @@ def test_env_db_url_is_source_of_truth(tmp_path) -> None:
     env_path = tmp_path / ".env"
     config_path.write_text("db_url: sqlite:///./from-config.sqlite\n", encoding="utf-8")
     env_path.write_text(
-        "DB_URL=sqlite:///<APP_ROOT>/data/bot.sqlite\n", encoding="utf-8"
+        "DB_URL=sqlite:////opt/krntrade/data/bot.sqlite\n", encoding="utf-8"
     )
 
     config = load_config(config_path=config_path, env_path=env_path)
 
-    assert config.db_url == "sqlite:///<APP_ROOT>/data/bot.sqlite"
+    assert config.db_url == "sqlite:////opt/krntrade/data/bot.sqlite"
 
 
 def test_request_timeout_env_override_is_loaded(tmp_path) -> None:
@@ -194,3 +198,117 @@ def test_research_spool_defaults_are_infrastructure_only() -> None:
     assert strategy_config_fingerprint(
         config.model_copy(update={"research_storage_health_path": "/tmp/health.json"})
     ) == baseline
+    assert config.runtime_timing_evidence_path.endswith(
+        "runtime-cycle-timing.json"
+    )
+    assert strategy_config_fingerprint(
+        config.model_copy(
+            update={"runtime_timing_evidence_path": "/tmp/timing.json"}
+        )
+    ) == baseline
+
+
+def test_frame_store_mode_requires_non_rest_provider_mode() -> None:
+    with pytest.raises(Exception, match="REST_ONLY"):
+        AppConfig(
+            canonical_market_data_provider_mode="REST_ONLY",
+            market_frame_store_mode="SHADOW",
+        )
+    # PREFERRED store with a hub-backed provider validates cleanly.
+    AppConfig(
+        canonical_market_data_provider_mode="HUB_PREFERRED",
+        market_frame_store_mode="PREFERRED",
+    )
+
+
+def test_event_driven_scan_requires_preferred_modes() -> None:
+    with pytest.raises(Exception, match="event_driven_scan_enabled"):
+        AppConfig(
+            event_driven_scan_enabled=True,
+            canonical_market_data_provider_mode="HUB_PREFERRED",
+            market_frame_store_mode="SHADOW",
+        )
+    with pytest.raises(Exception, match="event_driven_scan_enabled"):
+        AppConfig(
+            event_driven_scan_enabled=True,
+            canonical_market_data_provider_mode="HUB_SHADOW",
+            market_frame_store_mode="PREFERRED",
+        )
+    AppConfig(
+        event_driven_scan_enabled=True,
+        canonical_market_data_provider_mode="HUB_PREFERRED",
+        market_frame_store_mode="PREFERRED",
+    )
+
+
+def test_scan_evaluation_consumers_bounded_to_one_or_two() -> None:
+    with pytest.raises(Exception):
+        AppConfig(scan_evaluation_consumers=3)
+    with pytest.raises(Exception):
+        AppConfig(scan_evaluation_consumers=0)
+
+
+def test_duplicate_yaml_key_is_rejected(tmp_path) -> None:
+    config_path = tmp_path / "duplicate.yaml"
+    config_path.write_text(
+        "market_data_ws_shadow_enabled: false\n"
+        "min_public_signal_grade: B\n"
+        "market_data_ws_shadow_enabled: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        load_config(config_path=config_path, env_path=tmp_path / ".env.missing")
+    assert "duplicate key" in str(excinfo.value)
+    assert "market_data_ws_shadow_enabled" in str(excinfo.value)
+
+
+def test_unknown_yaml_key_warns_without_failing(tmp_path, caplog) -> None:
+    config_path = tmp_path / "unknown.yaml"
+    config_path.write_text(
+        "climax_root_event_shadow_only_typo: true\n", encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING, logger="app.config"):
+        config = load_config(
+            config_path=config_path, env_path=tmp_path / ".env.missing"
+        )
+    assert isinstance(config, AppConfig)
+    assert "climax_root_event_shadow_only_typo" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "trapped_longs_v2_min_oi_retained_increase_pct",
+        "trapped_longs_max_oi_age_minutes",
+        "trapped_longs_price_acceleration_veto_pct",
+        "trapped_longs_oi_acceleration_veto_pct",
+        "trapped_longs_new_high_tolerance_pct",
+    ],
+)
+def test_v2_float_thresholds_reject_negative_and_non_finite(field: str) -> None:
+    for value in (-1.0, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            AppConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["trapped_longs_require_oi_sequence_points", "trapped_longs_min_closed_5m_candles_after_breakout"],
+)
+def test_v2_counts_reject_negative_values(field: str) -> None:
+    with pytest.raises(ValueError):
+        AppConfig(**{field: -1})
+
+
+@pytest.mark.parametrize("changes", [
+    {"outcome_max_concurrency": 0},
+    {"outcome_max_requests_per_cycle": 0},
+    {"background_max_requests_per_minute": 0},
+    {"outcome_max_total_attempts": 2},
+    {"outcome_rate_limit_retry_windows_sec": ((4, 2), (8, 12), (30, 45), (90, 120))},
+    {"outcome_rate_limit_max_backoff_sec": 60},
+    {"outcome_deferred_retry_minutes": 90, "outcome_deferred_max_retry_minutes": 60},
+])
+def test_outcome_budget_rejects_unsafe_bounds(changes):
+    with pytest.raises(ValueError):
+        AppConfig(**changes)

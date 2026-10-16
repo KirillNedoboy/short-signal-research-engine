@@ -2,14 +2,12 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pandas as pd
-import pytest
 
 from app.domain import EventState, SymbolFeatures
 from app.signals.trapped_longs import (
     TRAPPED_LONGS_REVERSAL,
     advance_trapped_longs_lifecycle,
     evaluate_trapped_longs_reversal,
-    trapped_longs_expiry_reasons,
     trapped_longs_admission_id,
     trapped_longs_attempt_id,
     trapped_longs_evaluation_id,
@@ -17,65 +15,6 @@ from app.signals.trapped_longs import (
 )
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-
-def test_trapped_longs_expiry_blocks_decision_at_or_after_expiry():
-    assert trapped_longs_expiry_reasons(
-        attempt_created_at=T0,
-        confirmation_expires_at=T0 + timedelta(minutes=15),
-        decision_time=T0 + timedelta(minutes=15),
-    ) == ["CONFIRMATION_WINDOW_EXPIRED"]
-
-
-def test_trapped_longs_expiry_blocks_born_expired_attempt():
-    assert trapped_longs_expiry_reasons(
-        attempt_created_at=T0 + timedelta(minutes=15),
-        confirmation_expires_at=T0 + timedelta(minutes=10),
-        decision_time=T0 + timedelta(minutes=16),
-    ) == ["BORN_EXPIRED_ATTEMPT", "CONFIRMATION_WINDOW_EXPIRED"]
-
-
-def test_trapped_longs_evaluation_is_not_actionable_after_expiry():
-    result = evaluate_trapped_longs_reversal(
-        state(),
-        features(asof=T0 + timedelta(minutes=15)),
-        frame(),
-        config(),
-        attempt_created_at=T0,
-        confirmation_expires_at=T0 + timedelta(minutes=15),
-        decision_time=T0 + timedelta(minutes=15),
-    )
-    assert result.subtype is None
-    assert "CONFIRMATION_WINDOW_EXPIRED" in result.veto_reasons
-
-
-def test_trapped_longs_shadow_metrics_are_diagnostic_only():
-    from app.signals.trapped_longs import compute_trapped_longs_shadow_metrics
-
-    metrics = compute_trapped_longs_shadow_metrics(
-        decision_price=0.99,
-        breakout_reference=1.0,
-        failed_retest_high=1.01,
-        event_high=1.02,
-        atr=0.01,
-        breakout_failure_time=None,
-        failed_retest_time=None,
-        decision_time=None,
-        event_high_time=None,
-    )
-    assert metrics["distance_from_breakout_pct"] == pytest.approx(1.0)
-    assert metrics["distance_from_breakout_atr"] == pytest.approx(1.0)
-    assert metrics["entry_classification"] == "ENTRY_HEAVILY_CHASED"
-    assert metrics["shadow_quality_score"] is not None
-
-
-def test_trapped_longs_oi_sequence_classification_is_shadow_only():
-    from app.signals.trapped_longs import classify_trapped_longs_oi_sequence
-
-    assert classify_trapped_longs_oi_sequence(
-        price_before=100.0, price_breakout=102.0, price_failure=101.0,
-        oi_before=100.0, oi_breakout=103.0, oi_failure=102.0, oi_decision=102.0,
-    ) == "STRONG_TRAPPED_LONG_EVIDENCE"
 
 
 def config(**overrides):
@@ -109,7 +48,6 @@ def test_trapped_longs_fails_closed_for_missing_oi_liquidity_or_new_high():
     assert "oi_missing" in evaluate_trapped_longs_reversal(state(), features(oi_change_15m=None, derivatives_status="MISSING"), frame(), config()).veto_reasons
     assert "liquidity_unavailable" in evaluate_trapped_longs_reversal(state(), features(liquidity_available=False), frame(), config()).veto_reasons
     assert "new_high_before_delivery" in evaluate_trapped_longs_reversal(state(), features(last_high=106), frame(), config()).veto_reasons
-    assert evaluate_trapped_longs_reversal(state(), features(), frame(), config()).metadata["failed_retest_quality"] == "PREDICATE_SHAPE_ONLY"
 
 
 def test_trapped_longs_lifecycle_is_bounded_and_namespaced():

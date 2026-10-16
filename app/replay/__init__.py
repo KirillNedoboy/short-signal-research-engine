@@ -3,6 +3,7 @@
 from app.replay.contracts import (
     BASELINE_PULLBACK,
     LOW_VOLUME_EXTENSION_FAILURE,
+    LOW_VOLUME_EXTENSION_FAILURE_V2,
     VOLUME_CLIMAX_UNWIND,
     BaselineStrategyInput,
     ClimaxStrategyInput,
@@ -12,6 +13,6 @@ from app.replay.contracts import (
 from app.replay.evaluator import evaluate_strategy_input
 
 __all__ = [
-    "BASELINE_PULLBACK", "LOW_VOLUME_EXTENSION_FAILURE", "VOLUME_CLIMAX_UNWIND",
+    "BASELINE_PULLBACK", "LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2", "VOLUME_CLIMAX_UNWIND",
     "BaselineStrategyInput", "ClimaxStrategyInput", "StrategyInput", "StrategyDecisionRecord", "evaluate_strategy_input",
 ]

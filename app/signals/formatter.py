@@ -79,7 +79,7 @@ def format_signal_message(decision: SignalDecision, timezone_name: str) -> str:
         return _format_watch_message(decision, local_time)
     if decision.strategy_subtype == "TRAPPED_LONGS_REVERSAL":
         return _format_trapped_longs_message(decision, local_time, type_ru=_SIGNAL_TYPE_RU[decision.signal_type])
-    if decision.strategy_subtype in {"VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"}:
+    if decision.strategy_subtype in {"VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE", "LOW_VOLUME_EXTENSION_FAILURE_V2"}:
         return _format_climax_message(decision)
     type_ru = _SIGNAL_TYPE_RU[decision.signal_type]
     why_lines = "\n".join(f"- {_translate_reason_line(line)}" for line in decision.reasons)
@@ -124,9 +124,11 @@ def _format_climax_message(decision: SignalDecision) -> str:
         x = m.get(key)
         return "н/д" if x is None else f"{x:.2f}{suffix}"
 
-    event_high_text = "н/д" if m.get("event_high") is None else f"{float(m['event_high']):.8f}"
-    if m.get("event_high") is not None and decision.market_price:
-        computed_distance = (float(m["event_high"]) - decision.market_price) / float(m["event_high"]) * 100
+    anchor_key = "current_anchor_high" if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE_V2" else "event_high"
+    event_high_value = m.get(anchor_key)
+    event_high_text = "н/д" if event_high_value is None else f"{float(event_high_value):.8f}"
+    if event_high_value is not None and decision.market_price:
+        computed_distance = (float(event_high_value) - decision.market_price) / float(event_high_value) * 100
         stored_distance = float(m.get("entry_distance_below_high_pct") or computed_distance)
         if abs(computed_distance - stored_distance) > 0.15:
             return ""
@@ -135,13 +137,23 @@ def _format_climax_message(decision: SignalDecision) -> str:
                 f"Цена 5m: {val('price_change_5m', '%')}\nOI 5m: {val('oi_change_5m', '%')}\n")
         title = "VOLUME CLIMAX UNWIND"
         confirm = "short-covering exhaustion + failed continuation"
-    else:
+    elif decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE":
         body = (f"Рост текущего импульса: {val('price_change_5m', '%')}\n"
                 f"Объём к предыдущему импульсу: {val('current_previous_volume_ratio', 'x')}\n"
                 f"Эффективность объёма: {val('volume_efficiency_ratio', 'x')}\n"
                 f"OI: {m.get('oi_confirmation_state', 'unavailable')}\n")
         title = "LOW-VOLUME EXTENSION"
         confirm = "weak extension + failed high"
+    else:
+        body = (f"Рост текущего импульса: {val('price_change_5m', '%')}\n"
+                f"Объём к предыдущему импульсу: {val('current_previous_volume_ratio', 'x')}\n"
+                f"Текущий anchor high: {event_high_text}\n"
+                f"Anchor high time: {m.get('current_anchor_high_time', 'н/д')}\n"
+                f"V2 entry trigger / decision: {m.get('entry_trigger_time') or m.get('decision_at') or 'н/д'}\n"
+                f"Состояние подтверждения: {m.get('v2_state', 'н/д')}\n"
+                f"Extension below threshold: {m.get('extension_below_threshold', False)}\n")
+        title = "LOW-VOLUME EXTENSION V2"
+        confirm = "V2 closed-candle confirmation + failed high"
     return ("🔴 SHORT-SIGNAL\n\n"
             f"Стратегия: {title}\nМонета: {decision.symbol}\nGrade: {decision.grade}\nScore: {decision.score}\n\n"
             f"Вход: {decision.market_price:.8f}\nEvent high: {event_high_text}\nРасстояние от хая: {val('entry_distance_below_high_pct', '%')}\n"

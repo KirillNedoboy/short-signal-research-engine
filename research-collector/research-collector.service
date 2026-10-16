@@ -1,0 +1,27 @@
+[Unit]
+Description=Short Bot research microstructure collector (collection only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@COLLECTOR_ROOT@
+ExecStart=@COLLECTOR_PYTHON@ -m research_collector --config @COLLECTOR_CONFIG@
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@COLLECTOR_DATA@
+ReadOnlyPaths=@LANE_A_DB@
+ReadOnlyPaths=@LANE_B_DB@
+ReadOnlyPaths=@LANE_C_DB@
+LimitNOFILE=4096
+MemoryMax=768M
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target

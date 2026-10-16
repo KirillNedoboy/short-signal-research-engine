@@ -1,0 +1,13 @@
+[Unit]
+Description=Short Bot bounded coverage autoheal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=@ADMIN_ROOT@/tools/short_bot_autoheal.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=@LANE_A_ROOT@ @LANE_B_ROOT@ @LANE_C_ROOT@

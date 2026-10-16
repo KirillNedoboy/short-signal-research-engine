@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Short Bot release drift check periodically
+
+[Timer]
+OnCalendar=*:00/15:00
+AccuracySec=1min
+Persistent=true
+Unit=short-bot-release-drift.service
+
+[Install]
+WantedBy=timers.target

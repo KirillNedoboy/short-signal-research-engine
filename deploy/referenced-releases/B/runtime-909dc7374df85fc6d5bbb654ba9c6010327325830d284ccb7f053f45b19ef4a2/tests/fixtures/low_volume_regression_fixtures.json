@@ -1,0 +1,1298 @@
+{
+  "fixtures": [
+    {
+      "candles_1m": [
+        {
+          "close": 0.02256,
+          "high": 0.02278,
+          "low": 0.02212,
+          "open": 0.02274,
+          "timestamp": 1784310600,
+          "volume": 4286082.0
+        },
+        {
+          "close": 0.02263,
+          "high": 0.02285,
+          "low": 0.0225,
+          "open": 0.02256,
+          "timestamp": 1784310660,
+          "volume": 1515479.0
+        },
+        {
+          "close": 0.0226,
+          "high": 0.02269,
+          "low": 0.02245,
+          "open": 0.02263,
+          "timestamp": 1784310720,
+          "volume": 1350523.0
+        },
+        {
+          "close": 0.02258,
+          "high": 0.0228,
+          "low": 0.02251,
+          "open": 0.0226,
+          "timestamp": 1784310780,
+          "volume": 1258008.0
+        },
+        {
+          "close": 0.02306,
+          "high": 0.0232,
+          "low": 0.02249,
+          "open": 0.02258,
+          "timestamp": 1784310840,
+          "volume": 2452248.0
+        },
+        {
+          "close": 0.02328,
+          "high": 0.02348,
+          "low": 0.02299,
+          "open": 0.02306,
+          "timestamp": 1784310900,
+          "volume": 4207388.0
+        },
+        {
+          "close": 0.02327,
+          "high": 0.0234,
+          "low": 0.02307,
+          "open": 0.02328,
+          "timestamp": 1784310960,
+          "volume": 2219271.0
+        },
+        {
+          "close": 0.02327,
+          "high": 0.02343,
+          "low": 0.02322,
+          "open": 0.02327,
+          "timestamp": 1784311020,
+          "volume": 1692797.0
+        },
+        {
+          "close": 0.0234,
+          "high": 0.02348,
+          "low": 0.0231,
+          "open": 0.02327,
+          "timestamp": 1784311080,
+          "volume": 2100848.0
+        },
+        {
+          "close": 0.02369,
+          "high": 0.02376,
+          "low": 0.02307,
+          "open": 0.0234,
+          "timestamp": 1784311140,
+          "volume": 3675298.0
+        },
+        {
+          "close": 0.02407,
+          "high": 0.02439,
+          "low": 0.02363,
+          "open": 0.02369,
+          "timestamp": 1784311200,
+          "volume": 9828790.0
+        },
+        {
+          "close": 0.02426,
+          "high": 0.02426,
+          "low": 0.02391,
+          "open": 0.02407,
+          "timestamp": 1784311260,
+          "volume": 1443978.0
+        },
+        {
+          "close": 0.02397,
+          "high": 0.0243,
+          "low": 0.02374,
+          "open": 0.02426,
+          "timestamp": 1784311320,
+          "volume": 1970880.0
+        },
+        {
+          "close": 0.02318,
+          "high": 0.02408,
+          "low": 0.02223,
+          "open": 0.02397,
+          "timestamp": 1784311380,
+          "volume": 9311904.0
+        },
+        {
+          "close": 0.02159,
+          "high": 0.02325,
+          "low": 0.02151,
+          "open": 0.02318,
+          "timestamp": 1784311440,
+          "volume": 12666947.0
+        },
+        {
+          "close": 0.02166,
+          "high": 0.02185,
+          "low": 0.02139,
+          "open": 0.02159,
+          "timestamp": 1784311500,
+          "volume": 5163392.0
+        },
+        {
+          "close": 0.02162,
+          "high": 0.02177,
+          "low": 0.02139,
+          "open": 0.02166,
+          "timestamp": 1784311560,
+          "volume": 2108741.0
+        },
+        {
+          "close": 0.02222,
+          "high": 0.02235,
+          "low": 0.02144,
+          "open": 0.02162,
+          "timestamp": 1784311620,
+          "volume": 6155539.0
+        },
+        {
+          "close": 0.02155,
+          "high": 0.02226,
+          "low": 0.02144,
+          "open": 0.02222,
+          "timestamp": 1784311680,
+          "volume": 3237449.0
+        },
+        {
+          "close": 0.02317,
+          "high": 0.02326,
+          "low": 0.02111,
+          "open": 0.02155,
+          "timestamp": 1784311740,
+          "volume": 8368734.0
+        },
+        {
+          "close": 0.02346,
+          "high": 0.02349,
+          "low": 0.02299,
+          "open": 0.02317,
+          "timestamp": 1784311800,
+          "volume": 2270701.0
+        },
+        {
+          "close": 0.02362,
+          "high": 0.02362,
+          "low": 0.02326,
+          "open": 0.02346,
+          "timestamp": 1784311860,
+          "volume": 1818508.0
+        }
+      ],
+      "context": {
+        "actionable": true,
+        "asof": "2026-07-17T18:10:00+00:00",
+        "atr_14": 0.0015071756309832894,
+        "blockers": [],
+        "body_pct": 0.7116279069767445,
+        "close_position_in_range": 0.9674418604651159,
+        "current_leg_high": 0.02321,
+        "current_leg_volume": 20486127.0,
+        "current_previous_volume_ratio": 0.6704211567713835,
+        "current_volume": 615664.0,
+        "data_quality_warnings": [],
+        "decision_type": "SIGNAL",
+        "depth_1pct_usdt": 9135.97996,
+        "depth_2pct_usdt": 18858.92444,
+        "derivatives_reasons": [],
+        "derivatives_status": "OK",
+        "dist_to_ema20_atr": 1.3227322665854493,
+        "dist_to_ema20_pct": 9.405318274766827,
+        "dist_to_vwap_pct": 10.928264760256855,
+        "distance_to_event_high_pct": 4.920049200492004,
+        "ema20": 0.021196410161487118,
+        "entry_distance_below_high_pct": 4.920049200492004,
+        "event_high": 0.02439,
+        "event_range_pct": 26.43856920684291,
+        "failed_high_pct": 4.920049200492004,
+        "fast_monitor": true,
+        "funding": 5e-05,
+        "funding_rate": 5e-05,
+        "inside_short_zone_flag": false,
+        "last_close": 0.02319,
+        "last_high": 0.02326,
+        "last_low": 0.02111,
+        "latest_body_atr_ratio": 1.0151438017889263,
+        "latest_failed_retest": false,
+        "liquidity_available": true,
+        "liquidity_warning": true,
+        "lower_wick_ratio": 0.25581395348837144,
+        "model_version": "climax-v1",
+        "oi_change_15m": -1.867431,
+        "oi_change_1h": 4.351896,
+        "oi_change_5m": -1.867431,
+        "oi_change_pct": -1.867431,
+        "oi_confirmation_state": "falling",
+        "open_interest": 186082280.0,
+        "orderbook_depth_usdt_1pct": 9135.97996,
+        "orderbook_depth_usdt_2pct": 18858.92444,
+        "premium": null,
+        "previous_leg_high": 0.02439,
+        "previous_leg_volume": 30557101.0,
+        "price": 0.02319,
+        "price_change_15m": -0.3865979381443285,
+        "price_change_5m": 7.063711911357351,
+        "pullback_from_high_pct": 4.920049200492004,
+        "range_atr_ratio": 2.1165416520958646,
+        "reasons": [
+          "Climax exhaustion confirmed",
+          "Failed continuation below event high"
+        ],
+        "recent_high_breakout": false,
+        "rejection_from_high_pct": 0.30094582975064754,
+        "rejection_pct": 4.920049200492004,
+        "ret_15m": -0.3865979381443285,
+        "ret_1h": 18.2559918408975,
+        "ret_4h": 10.797897754419484,
+        "ret_5m": 7.063711911357351,
+        "risk_flags": [
+          "Повышенный риск ликвидности"
+        ],
+        "rsi_15m": 57.59388777001485,
+        "score_breakdown": {
+          "climax_v1": 100.0
+        },
+        "slippage_pct": 0.49414798528969356,
+        "spread_pct": 0.04316857327865138,
+        "squeeze_guard_action": "NONE",
+        "squeeze_risk_level": "LOW",
+        "squeeze_risk_reasons": [],
+        "squeeze_risk_score": 0,
+        "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
+        "strategy_type": "CLIMAX_EXHAUSTION",
+        "symbol": "ESPORTSUSDT",
+        "upper_wick_ratio": 0.03255813953488402,
+        "veto_reasons": [],
+        "vol_zscore_1h": 1.744758762114829,
+        "vol_zscore_30m": 2.1533225488262184,
+        "volume_efficiency_ratio": 0.6704211567713835,
+        "volume_zscore": 2.1533225488262184,
+        "vwap": 0.02090540228869465
+      },
+      "created_at": "2026-07-17 18:10:14.635215",
+      "entry": 0.02319,
+      "event_high": 0.02439,
+      "event_id": "ESPORTSUSDT:1h:1784311200:24390",
+      "grade": "B",
+      "score": 100,
+      "signal_id": 90,
+      "signal_time": "2026-07-17 18:10:00.000000",
+      "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
+      "symbol": "ESPORTSUSDT"
+    },
+    {
+      "candles_1m": [
+        {
+          "close": 0.00144,
+          "high": 0.0014532,
+          "low": 0.0014376,
+          "open": 0.0014442,
+          "timestamp": 1784320260,
+          "volume": 84237700.0
+        },
+        {
+          "close": 0.0014397,
+          "high": 0.0014473,
+          "low": 0.0014366,
+          "open": 0.00144,
+          "timestamp": 1784320320,
+          "volume": 38726900.0
+        },
+        {
+          "close": 0.0014428,
+          "high": 0.0014435,
+          "low": 0.0014293,
+          "open": 0.0014397,
+          "timestamp": 1784320380,
+          "volume": 61624200.0
+        },
+        {
+          "close": 0.0014401,
+          "high": 0.001446,
+          "low": 0.0014345,
+          "open": 0.0014428,
+          "timestamp": 1784320440,
+          "volume": 69762800.0
+        },
+        {
+          "close": 0.0014366,
+          "high": 0.0014401,
+          "low": 0.0014254,
+          "open": 0.0014401,
+          "timestamp": 1784320500,
+          "volume": 75129500.0
+        },
+        {
+          "close": 0.0014139,
+          "high": 0.0014388,
+          "low": 0.0014106,
+          "open": 0.0014366,
+          "timestamp": 1784320560,
+          "volume": 113804000.0
+        },
+        {
+          "close": 0.0014341,
+          "high": 0.0014371,
+          "low": 0.0014067,
+          "open": 0.0014139,
+          "timestamp": 1784320620,
+          "volume": 197077500.0
+        },
+        {
+          "close": 0.0014582,
+          "high": 0.0014654,
+          "low": 0.0014341,
+          "open": 0.0014341,
+          "timestamp": 1784320680,
+          "volume": 260918200.0
+        },
+        {
+          "close": 0.0014842,
+          "high": 0.001486,
+          "low": 0.0014563,
+          "open": 0.0014582,
+          "timestamp": 1784320740,
+          "volume": 366267500.0
+        },
+        {
+          "close": 0.0015618,
+          "high": 0.0015841,
+          "low": 0.0014773,
+          "open": 0.0014842,
+          "timestamp": 1784320800,
+          "volume": 1990976300.0
+        },
+        {
+          "close": 0.0017701,
+          "high": 0.0019591,
+          "low": 0.0015517,
+          "open": 0.0015618,
+          "timestamp": 1784320860,
+          "volume": 4440529000.0
+        },
+        {
+          "close": 0.0016738,
+          "high": 0.0017952,
+          "low": 0.0016235,
+          "open": 0.0017701,
+          "timestamp": 1784320920,
+          "volume": 1106947700.0
+        },
+        {
+          "close": 0.0017294,
+          "high": 0.0017333,
+          "low": 0.0016573,
+          "open": 0.0016738,
+          "timestamp": 1784320980,
+          "volume": 879858500.0
+        },
+        {
+          "close": 0.001657,
+          "high": 0.0018011,
+          "low": 0.0016328,
+          "open": 0.0017294,
+          "timestamp": 1784321040,
+          "volume": 881787900.0
+        },
+        {
+          "close": 0.0016011,
+          "high": 0.0016759,
+          "low": 0.0015775,
+          "open": 0.001657,
+          "timestamp": 1784321100,
+          "volume": 1084471800.0
+        },
+        {
+          "close": 0.0016089,
+          "high": 0.0016738,
+          "low": 0.0015874,
+          "open": 0.0016011,
+          "timestamp": 1784321160,
+          "volume": 833109900.0
+        },
+        {
+          "close": 0.0016432,
+          "high": 0.0016527,
+          "low": 0.001578,
+          "open": 0.0016089,
+          "timestamp": 1784321220,
+          "volume": 528174800.0
+        },
+        {
+          "close": 0.001603,
+          "high": 0.0016483,
+          "low": 0.0015751,
+          "open": 0.0016432,
+          "timestamp": 1784321280,
+          "volume": 381394100.0
+        },
+        {
+          "close": 0.0015975,
+          "high": 0.0016065,
+          "low": 0.0015646,
+          "open": 0.001603,
+          "timestamp": 1784321340,
+          "volume": 263826200.0
+        },
+        {
+          "close": 0.001598,
+          "high": 0.001623,
+          "low": 0.0015815,
+          "open": 0.0015975,
+          "timestamp": 1784321400,
+          "volume": 211553700.0
+        },
+        {
+          "close": 0.0016077,
+          "high": 0.00163,
+          "low": 0.0015843,
+          "open": 0.001598,
+          "timestamp": 1784321460,
+          "volume": 195997600.0
+        },
+        {
+          "close": 0.0016255,
+          "high": 0.00163,
+          "low": 0.0015942,
+          "open": 0.0016077,
+          "timestamp": 1784321520,
+          "volume": 177624000.0
+        },
+        {
+          "close": 0.0016888,
+          "high": 0.0017527,
+          "low": 0.0016221,
+          "open": 0.0016255,
+          "timestamp": 1784321580,
+          "volume": 554144100.0
+        },
+        {
+          "close": 0.0016843,
+          "high": 0.0017148,
+          "low": 0.0016713,
+          "open": 0.0016888,
+          "timestamp": 1784321640,
+          "volume": 232816900.0
+        },
+        {
+          "close": 0.0016774,
+          "high": 0.0016879,
+          "low": 0.0016572,
+          "open": 0.0016843,
+          "timestamp": 1784321700,
+          "volume": 199709200.0
+        }
+      ],
+      "context": {
+        "actionable": true,
+        "asof": "2026-07-17T20:54:00+00:00",
+        "atr_14": 9.193037222909242e-05,
+        "blockers": [],
+        "body_pct": 0.596199524940618,
+        "close_position_in_range": 0.6775534441805228,
+        "current_leg_high": 0.0017148,
+        "current_leg_volume": 1173264700.0,
+        "current_previous_volume_ratio": 0.379577323259107,
+        "current_volume": 33945300.0,
+        "data_quality_warnings": [],
+        "decision_type": "SIGNAL",
+        "depth_1pct_usdt": 13851.43521,
+        "depth_2pct_usdt": 13851.43521,
+        "derivatives_reasons": [],
+        "derivatives_status": "OK",
+        "dist_to_ema20_atr": 3.053191706233593,
+        "dist_to_ema20_pct": 19.798074226835727,
+        "dist_to_vwap_pct": 15.804798526044905,
+        "distance_to_event_high_pct": 13.307130825378998,
+        "ema20": 0.001417718949959168,
+        "entry_distance_below_high_pct": 13.307130825378998,
+        "event_high": 0.0019591,
+        "event_range_pct": 39.26921163005617,
+        "failed_high_pct": 13.307130825378998,
+        "fast_monitor": true,
+        "funding": 0.00013703,
+        "funding_rate": 0.00013703,
+        "inside_short_zone_flag": false,
+        "last_close": 0.0016984,
+        "last_high": 0.0017527,
+        "last_low": 0.0015843,
+        "latest_body_atr_ratio": 1.0921308982607092,
+        "latest_failed_retest": false,
+        "liquidity_available": true,
+        "liquidity_warning": true,
+        "lower_wick_ratio": 0.08135391923990473,
+        "model_version": "climax-v1",
+        "oi_change_15m": -12.815591,
+        "oi_change_1h": -12.761245,
+        "oi_change_5m": -12.815591,
+        "oi_change_pct": -12.815591,
+        "oi_confirmation_state": "falling",
+        "open_interest": 16955868200.0,
+        "orderbook_depth_usdt_1pct": 13851.43521,
+        "orderbook_depth_usdt_2pct": 13851.43521,
+        "premium": null,
+        "previous_leg_high": 0.0019591,
+        "previous_leg_volume": 3090976800.0,
+        "price": 0.0016984,
+        "price_change_15m": 14.432017248349283,
+        "price_change_5m": 6.316118935837256,
+        "pullback_from_high_pct": 13.307130825378998,
+        "range_atr_ratio": 2.046113764570113,
+        "reasons": [
+          "Climax exhaustion confirmed",
+          "Failed continuation below event high"
+        ],
+        "recent_high_breakout": false,
+        "rejection_from_high_pct": 3.0980772522394,
+        "rejection_pct": 13.307130825378998,
+        "ret_15m": 14.432017248349283,
+        "ret_1h": 14.65604536555729,
+        "ret_4h": 31.546743087289908,
+        "ret_5m": 6.316118935837256,
+        "risk_flags": [
+          "Повышенный риск ликвидности"
+        ],
+        "rsi_15m": 90.4303183112638,
+        "score_breakdown": {
+          "climax_v1": 100.0
+        },
+        "slippage_pct": 0.31664607086446134,
+        "spread_pct": 0.023504524620990116,
+        "squeeze_guard_action": "NONE",
+        "squeeze_risk_level": "LOW",
+        "squeeze_risk_reasons": [],
+        "squeeze_risk_score": 0,
+        "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
+        "strategy_type": "CLIMAX_EXHAUSTION",
+        "symbol": "AKEUSDT",
+        "upper_wick_ratio": 0.3224465558194773,
+        "veto_reasons": [],
+        "vol_zscore_1h": 1.086267508571234,
+        "vol_zscore_30m": 1.3465347822380052,
+        "volume_efficiency_ratio": 0.379577323259107,
+        "volume_zscore": 1.3465347822380052,
+        "vwap": 0.0014666058933801643
+      },
+      "created_at": "2026-07-17 20:54:07.905505",
+      "entry": 0.0016984,
+      "event_high": 0.0019591,
+      "event_id": "AKEUSDT:15m:1784320860:1959",
+      "grade": "B",
+      "score": 100,
+      "signal_id": 91,
+      "signal_time": "2026-07-17 20:54:00.000000",
+      "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
+      "symbol": "AKEUSDT"
+    },
+    {
+      "candles_1m": [
+        {
+          "close": 0.0343,
+          "high": 0.03442,
+          "low": 0.0342,
+          "open": 0.03421,
+          "timestamp": 1784337660,
+          "volume": 464646.0
+        },
+        {
+          "close": 0.03447,
+          "high": 0.03459,
+          "low": 0.03425,
+          "open": 0.0343,
+          "timestamp": 1784337720,
+          "volume": 657916.0
+        },
+        {
+          "close": 0.03444,
+          "high": 0.03457,
+          "low": 0.0344,
+          "open": 0.03447,
+          "timestamp": 1784337780,
+          "volume": 510304.0
+        },
+        {
+          "close": 0.03457,
+          "high": 0.0346,
+          "low": 0.03432,
+          "open": 0.03444,
+          "timestamp": 1784337840,
+          "volume": 293682.0
+        },
+        {
+          "close": 0.03456,
+          "high": 0.0348,
+          "low": 0.03442,
+          "open": 0.03457,
+          "timestamp": 1784337900,
+          "volume": 1018871.0
+        },
+        {
+          "close": 0.03487,
+          "high": 0.035,
+          "low": 0.03455,
+          "open": 0.03456,
+          "timestamp": 1784337960,
+          "volume": 3703421.0
+        },
+        {
+          "close": 0.03481,
+          "high": 0.03489,
+          "low": 0.0346,
+          "open": 0.03487,
+          "timestamp": 1784338020,
+          "volume": 1576890.0
+        },
+        {
+          "close": 0.03466,
+          "high": 0.03481,
+          "low": 0.03442,
+          "open": 0.03481,
+          "timestamp": 1784338080,
+          "volume": 2283304.0
+        },
+        {
+          "close": 0.0345,
+          "high": 0.03467,
+          "low": 0.03444,
+          "open": 0.03466,
+          "timestamp": 1784338140,
+          "volume": 1158623.0
+        },
+        {
+          "close": 0.03479,
+          "high": 0.03489,
+          "low": 0.0345,
+          "open": 0.0345,
+          "timestamp": 1784338200,
+          "volume": 1116159.0
+        },
+        {
+          "close": 0.03493,
+          "high": 0.03521,
+          "low": 0.03478,
+          "open": 0.03479,
+          "timestamp": 1784338260,
+          "volume": 1831096.0
+        },
+        {
+          "close": 0.03484,
+          "high": 0.03515,
+          "low": 0.03463,
+          "open": 0.03493,
+          "timestamp": 1784338320,
+          "volume": 3371235.0
+        },
+        {
+          "close": 0.03324,
+          "high": 0.03495,
+          "low": 0.0331,
+          "open": 0.03484,
+          "timestamp": 1784338380,
+          "volume": 5995910.0
+        },
+        {
+          "close": 0.0337,
+          "high": 0.03403,
+          "low": 0.03317,
+          "open": 0.03324,
+          "timestamp": 1784338440,
+          "volume": 5257455.0
+        },
+        {
+          "close": 0.03315,
+          "high": 0.03402,
+          "low": 0.03311,
+          "open": 0.0337,
+          "timestamp": 1784338500,
+          "volume": 3749307.0
+        },
+        {
+          "close": 0.03235,
+          "high": 0.0335,
+          "low": 0.03229,
+          "open": 0.03315,
+          "timestamp": 1784338560,
+          "volume": 4797562.0
+        },
+        {
+          "close": 0.03354,
+          "high": 0.03426,
+          "low": 0.03065,
+          "open": 0.03235,
+          "timestamp": 1784338620,
+          "volume": 21650455.0
+        },
+        {
+          "close": 0.034,
+          "high": 0.03468,
+          "low": 0.03353,
+          "open": 0.03354,
+          "timestamp": 1784338680,
+          "volume": 6019890.0
+        },
+        {
+          "close": 0.03411,
+          "high": 0.03418,
+          "low": 0.03363,
+          "open": 0.034,
+          "timestamp": 1784338740,
+          "volume": 2146930.0
+        },
+        {
+          "close": 0.03459,
+          "high": 0.03491,
+          "low": 0.03405,
+          "open": 0.03411,
+          "timestamp": 1784338800,
+          "volume": 4481930.0
+        },
+        {
+          "close": 0.03471,
+          "high": 0.03474,
+          "low": 0.03402,
+          "open": 0.03459,
+          "timestamp": 1784338860,
+          "volume": 1624776.0
+        },
+        {
+          "close": 0.03455,
+          "high": 0.03471,
+          "low": 0.03426,
+          "open": 0.03471,
+          "timestamp": 1784338920,
+          "volume": 1306524.0
+        },
+        {
+          "close": 0.0348,
+          "high": 0.03499,
+          "low": 0.0345,
+          "open": 0.03455,
+          "timestamp": 1784338980,
+          "volume": 1460938.0
+        },
+        {
+          "close": 0.03331,
+          "high": 0.03483,
+          "low": 0.03311,
+          "open": 0.0348,
+          "timestamp": 1784339040,
+          "volume": 3627111.0
+        },
+        {
+          "close": 0.03379,
+          "high": 0.03383,
+          "low": 0.03234,
+          "open": 0.03331,
+          "timestamp": 1784339100,
+          "volume": 5384036.0
+        },
+        {
+          "close": 0.0329,
+          "high": 0.03384,
+          "low": 0.03279,
+          "open": 0.03379,
+          "timestamp": 1784339160,
+          "volume": 2267411.0
+        },
+        {
+          "close": 0.03336,
+          "high": 0.0335,
+          "low": 0.03289,
+          "open": 0.0329,
+          "timestamp": 1784339220,
+          "volume": 1675438.0
+        },
+        {
+          "close": 0.03331,
+          "high": 0.03352,
+          "low": 0.03326,
+          "open": 0.03336,
+          "timestamp": 1784339280,
+          "volume": 1232875.0
+        },
+        {
+          "close": 0.03298,
+          "high": 0.03367,
+          "low": 0.03298,
+          "open": 0.03331,
+          "timestamp": 1784339340,
+          "volume": 2065427.0
+        },
+        {
+          "close": 0.03353,
+          "high": 0.03384,
+          "low": 0.03281,
+          "open": 0.03298,
+          "timestamp": 1784339400,
+          "volume": 3740849.0
+        },
+        {
+          "close": 0.03339,
+          "high": 0.03367,
+          "low": 0.03317,
+          "open": 0.03353,
+          "timestamp": 1784339460,
+          "volume": 1369460.0
+        },
+        {
+          "close": 0.03355,
+          "high": 0.03358,
+          "low": 0.03331,
+          "open": 0.03339,
+          "timestamp": 1784339520,
+          "volume": 630609.0
+        },
+        {
+          "close": 0.03342,
+          "high": 0.03364,
+          "low": 0.03329,
+          "open": 0.03355,
+          "timestamp": 1784339580,
+          "volume": 649156.0
+        },
+        {
+          "close": 0.03283,
+          "high": 0.03352,
+          "low": 0.03257,
+          "open": 0.03342,
+          "timestamp": 1784339640,
+          "volume": 1711416.0
+        },
+        {
+          "close": 0.03288,
+          "high": 0.03299,
+          "low": 0.03272,
+          "open": 0.03283,
+          "timestamp": 1784339700,
+          "volume": 1142802.0
+        },
+        {
+          "close": 0.033,
+          "high": 0.03315,
+          "low": 0.03281,
+          "open": 0.03288,
+          "timestamp": 1784339760,
+          "volume": 823660.0
+        },
+        {
+          "close": 0.03326,
+          "high": 0.03346,
+          "low": 0.033,
+          "open": 0.033,
+          "timestamp": 1784339820,
+          "volume": 1250988.0
+        },
+        {
+          "close": 0.03314,
+          "high": 0.03329,
+          "low": 0.03306,
+          "open": 0.03326,
+          "timestamp": 1784339880,
+          "volume": 1192718.0
+        },
+        {
+          "close": 0.03277,
+          "high": 0.03318,
+          "low": 0.03251,
+          "open": 0.03314,
+          "timestamp": 1784339940,
+          "volume": 1700536.0
+        },
+        {
+          "close": 0.03299,
+          "high": 0.03302,
+          "low": 0.03271,
+          "open": 0.03277,
+          "timestamp": 1784340000,
+          "volume": 537195.0
+        },
+        {
+          "close": 0.033,
+          "high": 0.03319,
+          "low": 0.03283,
+          "open": 0.03299,
+          "timestamp": 1784340060,
+          "volume": 719683.0
+        },
+        {
+          "close": 0.03312,
+          "high": 0.03316,
+          "low": 0.033,
+          "open": 0.033,
+          "timestamp": 1784340120,
+          "volume": 294507.0
+        },
+        {
+          "close": 0.03328,
+          "high": 0.03352,
+          "low": 0.03305,
+          "open": 0.03312,
+          "timestamp": 1784340180,
+          "volume": 1509329.0
+        },
+        {
+          "close": 0.03312,
+          "high": 0.03332,
+          "low": 0.03293,
+          "open": 0.03328,
+          "timestamp": 1784340240,
+          "volume": 693824.0
+        },
+        {
+          "close": 0.0332,
+          "high": 0.03332,
+          "low": 0.03306,
+          "open": 0.03312,
+          "timestamp": 1784340300,
+          "volume": 362113.0
+        },
+        {
+          "close": 0.03318,
+          "high": 0.03338,
+          "low": 0.03316,
+          "open": 0.0332,
+          "timestamp": 1784340360,
+          "volume": 648547.0
+        },
+        {
+          "close": 0.03346,
+          "high": 0.03346,
+          "low": 0.03311,
+          "open": 0.03318,
+          "timestamp": 1784340420,
+          "volume": 257924.0
+        },
+        {
+          "close": 0.03334,
+          "high": 0.03349,
+          "low": 0.03334,
+          "open": 0.03346,
+          "timestamp": 1784340480,
+          "volume": 770994.0
+        },
+        {
+          "close": 0.03354,
+          "high": 0.03379,
+          "low": 0.03333,
+          "open": 0.03334,
+          "timestamp": 1784340540,
+          "volume": 1400196.0
+        },
+        {
+          "close": 0.03341,
+          "high": 0.03358,
+          "low": 0.03327,
+          "open": 0.03354,
+          "timestamp": 1784340600,
+          "volume": 1336094.0
+        },
+        {
+          "close": 0.03334,
+          "high": 0.03412,
+          "low": 0.03318,
+          "open": 0.03341,
+          "timestamp": 1784340660,
+          "volume": 7219581.0
+        },
+        {
+          "close": 0.03291,
+          "high": 0.03334,
+          "low": 0.03282,
+          "open": 0.03334,
+          "timestamp": 1784340720,
+          "volume": 1598407.0
+        },
+        {
+          "close": 0.03223,
+          "high": 0.03311,
+          "low": 0.03209,
+          "open": 0.03291,
+          "timestamp": 1784340780,
+          "volume": 2770174.0
+        },
+        {
+          "close": 0.03266,
+          "high": 0.03294,
+          "low": 0.03187,
+          "open": 0.03223,
+          "timestamp": 1784340840,
+          "volume": 4112440.0
+        },
+        {
+          "close": 0.03212,
+          "high": 0.03274,
+          "low": 0.032,
+          "open": 0.03266,
+          "timestamp": 1784340900,
+          "volume": 2223508.0
+        },
+        {
+          "close": 0.03251,
+          "high": 0.03265,
+          "low": 0.032,
+          "open": 0.03212,
+          "timestamp": 1784340960,
+          "volume": 4015371.0
+        },
+        {
+          "close": 0.03314,
+          "high": 0.03331,
+          "low": 0.03204,
+          "open": 0.03251,
+          "timestamp": 1784341020,
+          "volume": 5337814.0
+        },
+        {
+          "close": 0.033,
+          "high": 0.03349,
+          "low": 0.03279,
+          "open": 0.03314,
+          "timestamp": 1784341080,
+          "volume": 2256313.0
+        },
+        {
+          "close": 0.03315,
+          "high": 0.03333,
+          "low": 0.033,
+          "open": 0.033,
+          "timestamp": 1784341140,
+          "volume": 1027820.0
+        },
+        {
+          "close": 0.03319,
+          "high": 0.03329,
+          "low": 0.0328,
+          "open": 0.03315,
+          "timestamp": 1784341200,
+          "volume": 1527081.0
+        },
+        {
+          "close": 0.0333,
+          "high": 0.03335,
+          "low": 0.03309,
+          "open": 0.03319,
+          "timestamp": 1784341260,
+          "volume": 528363.0
+        },
+        {
+          "close": 0.03347,
+          "high": 0.03351,
+          "low": 0.03328,
+          "open": 0.0333,
+          "timestamp": 1784341320,
+          "volume": 519133.0
+        },
+        {
+          "close": 0.03356,
+          "high": 0.03376,
+          "low": 0.03347,
+          "open": 0.03347,
+          "timestamp": 1784341380,
+          "volume": 731563.0
+        },
+        {
+          "close": 0.03366,
+          "high": 0.03381,
+          "low": 0.03352,
+          "open": 0.03356,
+          "timestamp": 1784341440,
+          "volume": 669044.0
+        },
+        {
+          "close": 0.03329,
+          "high": 0.03366,
+          "low": 0.03322,
+          "open": 0.03366,
+          "timestamp": 1784341500,
+          "volume": 683166.0
+        },
+        {
+          "close": 0.03382,
+          "high": 0.03413,
+          "low": 0.033,
+          "open": 0.03329,
+          "timestamp": 1784341560,
+          "volume": 7010196.0
+        },
+        {
+          "close": 0.03347,
+          "high": 0.03384,
+          "low": 0.03341,
+          "open": 0.03382,
+          "timestamp": 1784341620,
+          "volume": 830080.0
+        },
+        {
+          "close": 0.03356,
+          "high": 0.03374,
+          "low": 0.03347,
+          "open": 0.03347,
+          "timestamp": 1784341680,
+          "volume": 375604.0
+        },
+        {
+          "close": 0.03336,
+          "high": 0.03356,
+          "low": 0.03328,
+          "open": 0.03356,
+          "timestamp": 1784341740,
+          "volume": 830117.0
+        },
+        {
+          "close": 0.03353,
+          "high": 0.03358,
+          "low": 0.03322,
+          "open": 0.03336,
+          "timestamp": 1784341800,
+          "volume": 522582.0
+        },
+        {
+          "close": 0.03431,
+          "high": 0.03459,
+          "low": 0.03339,
+          "open": 0.03353,
+          "timestamp": 1784341860,
+          "volume": 11488398.0
+        },
+        {
+          "close": 0.0368,
+          "high": 0.03895,
+          "low": 0.03419,
+          "open": 0.03431,
+          "timestamp": 1784341920,
+          "volume": 36827970.0
+        },
+        {
+          "close": 0.03739,
+          "high": 0.03801,
+          "low": 0.03673,
+          "open": 0.0368,
+          "timestamp": 1784341980,
+          "volume": 4581977.0
+        },
+        {
+          "close": 0.03661,
+          "high": 0.03744,
+          "low": 0.0365,
+          "open": 0.03739,
+          "timestamp": 1784342040,
+          "volume": 4823927.0
+        }
+      ],
+      "context": {
+        "actionable": true,
+        "asof": "2026-07-18T02:33:00+00:00",
+        "atr_14": 0.0020508098241789293,
+        "blockers": [],
+        "body_pct": 0.620503597122303,
+        "breakout_reference": 0.03503395,
+        "close_position_in_range": 0.6456834532374098,
+        "closed_candles_after_high": 3,
+        "current_close": 0.03698,
+        "current_leg_high": 0.037,
+        "current_leg_volume": 50964724.0,
+        "current_previous_volume_ratio": 5.326530582383736,
+        "current_volume": 1295657.0,
+        "data_quality_warnings": [],
+        "decision_type": "SIGNAL",
+        "depth_1pct_usdt": 18131.4562,
+        "depth_2pct_usdt": 18131.4562,
+        "derivatives_reasons": [],
+        "derivatives_status": "OK",
+        "dist_to_ema20_atr": 2.527061953612031,
+        "dist_to_ema20_pct": 16.29853701643014,
+        "dist_to_vwap_pct": 17.880702674711067,
+        "distance_to_event_high_pct": -5.02698097131497,
+        "ema20": 0.03179747651922365,
+        "entry_distance_below_high_pct": 5.057766367137355,
+        "event_high": 0.03895,
+        "event_range_pct": 41.69014084507041,
+        "failed_high_pct": 5.057766367137355,
+        "fast_monitor": true,
+        "funding": 5e-05,
+        "funding_rate": 5e-05,
+        "inside_short_zone_flag": false,
+        "last_close": 0.03698,
+        "last_high": 0.03895,
+        "last_low": 0.03339,
+        "latest_body_atr_ratio": 1.6822622747973512,
+        "latest_failed_retest": false,
+        "liquidity_available": true,
+        "liquidity_warning": true,
+        "local_swing_low": 0.033,
+        "lower_wick_ratio": 0.025179856115106907,
+        "model_version": "climax-v1",
+        "oi_change_15m": -1.132158,
+        "oi_change_1h": -11.142905,
+        "oi_change_5m": -1.132158,
+        "oi_change_pct": -1.132158,
+        "open_interest": 151544006.0,
+        "orderbook_depth_usdt_1pct": 18131.4562,
+        "orderbook_depth_usdt_2pct": 18131.4562,
+        "post_high_closes": [
+          0.03484,
+          0.03324,
+          0.0337
+        ],
+        "post_high_high": 0.03895,
+        "premium": null,
+        "previous_leg_high": 0.03521,
+        "previous_leg_volume": 9568090.0,
+        "price": 0.03698,
+        "price_change_15m": 12.06060606060606,
+        "price_change_5m": 10.190703218116814,
+        "pullback_from_high_pct": -5.02698097131497,
+        "range_atr_ratio": 2.7111241298183364,
+        "reasons": [
+          "Climax exhaustion confirmed",
+          "Failed continuation below event high"
+        ],
+        "recent_high_breakout": true,
+        "rejection_from_high_pct": 5.057766367137355,
+        "rejection_pct": 5.057766367137355,
+        "ret_15m": 12.06060606060606,
+        "ret_1h": 11.251504211793018,
+        "ret_4h": 41.957773512476,
+        "ret_5m": 10.190703218116814,
+        "risk_flags": [
+          "Повышенный риск ликвидности"
+        ],
+        "rsi_15m": 58.21440685414539,
+        "score_breakdown": {
+          "climax_v1": 70.0
+        },
+        "slippage_pct": 0.4441257535388708,
+        "spread_pct": 0.0794596742153233,
+        "squeeze_guard_action": "NONE",
+        "squeeze_risk_level": "LOW",
+        "squeeze_risk_reasons": [],
+        "squeeze_risk_score": 0,
+        "strategy_subtype": "VOLUME_CLIMAX_UNWIND",
+        "strategy_type": "CLIMAX_EXHAUSTION",
+        "symbol": "ESPORTSUSDT",
+        "upper_wick_ratio": 0.3543165467625901,
+        "veto_reasons": [],
+        "vol_zscore_1h": 2.807383117708133,
+        "vol_zscore_30m": 2.9728349202599524,
+        "volume_efficiency_ratio": 5.326530582383736,
+        "volume_ratio": 5.326530582383736,
+        "volume_window_current_candles": 5,
+        "volume_window_previous_candles": 5,
+        "volume_windows_equal": true,
+        "volume_zscore": 2.9728349202599524,
+        "vwap": 0.03137069864780617
+      },
+      "created_at": "2026-07-18 02:33:12.405613",
+      "entry": 0.03698,
+      "event_high": 0.03521,
+      "event_id": "ESPORTSUSDT:4h:1784338260:35210",
+      "grade": "B",
+      "score": 70,
+      "signal_id": 92,
+      "signal_time": "2026-07-18 02:33:00.000000",
+      "strategy_subtype": "VOLUME_CLIMAX_UNWIND",
+      "symbol": "ESPORTSUSDT"
+    }
+  ],
+  "source": "live production DB + Bybit public historical 1m klines"
+}

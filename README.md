@@ -103,6 +103,10 @@ Run the service loop only after reviewing configuration and delivery policy:
 - Never commit Telegram tokens, API keys, private keys, passwords, chat exports or connection strings.
 - The repository deliberately contains no production SQLite database.
 
+## Export provenance
+
+This sanitized export preserves the selected live Lane A source and the referenced Lane B/C snapshots. See [docs/EXPORT.md](docs/EXPORT.md), [deploy/README.md](deploy/README.md), and [research-collector/README_EXPORT.md](research-collector/README_EXPORT.md).
+
 ## License
 
 Operational deployment files, credentials, databases, and host-specific state are intentionally excluded from this public mirror.

@@ -22,10 +22,7 @@ class SignalModel(Base):
     """Saved Telegram signal or WATCH entry."""
 
     __tablename__ = "signals"
-    __table_args__ = (
-        UniqueConstraint("symbol", "event_id", "strategy_subtype", "model_version", name="uq_signal_enriched_identity"),
-        UniqueConstraint("signal_identity", name="uq_signal_identity"),
-    )
+    __table_args__ = (UniqueConstraint("symbol", "event_id", "strategy_subtype", "model_version", name="uq_signal_enriched_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
@@ -57,7 +54,6 @@ class SignalModel(Base):
     strategy_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     strategy_subtype: Mapped[str | None] = mapped_column(String(64), nullable=True)
     model_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    signal_identity: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     telegram_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -69,14 +65,15 @@ class SignalProvenanceModel(Base):
 
     __tablename__ = "signal_provenance"
     __table_args__ = (
+        UniqueConstraint("root_event_id", "strategy_branch", "event_revision", "entry_trigger_time", name="uq_signal_provenance_v2_identity"),
         CheckConstraint(
-            "strategy_branch IN ('BASELINE_PULLBACK', 'VOLUME_CLIMAX_UNWIND', 'LOW_VOLUME_EXTENSION_FAILURE', 'TRAPPED_LONGS_REVERSAL')",
+            "strategy_branch IN ('BASELINE_PULLBACK', 'VOLUME_CLIMAX_UNWIND', 'LOW_VOLUME_EXTENSION_FAILURE', 'LOW_VOLUME_EXTENSION_FAILURE_V2', 'TRAPPED_LONGS_REVERSAL')",
             name="ck_signal_provenance_strategy_branch",
         ),
         CheckConstraint(
             "(strategy_branch = 'BASELINE_PULLBACK' AND strategy_family = 'BASELINE_PULLBACK' "
             "AND root_event_id IS NULL AND decision_evaluation_id IS NULL AND admission_evaluation_id IS NULL) "
-            "OR (strategy_branch IN ('VOLUME_CLIMAX_UNWIND', 'LOW_VOLUME_EXTENSION_FAILURE') "
+            "OR (strategy_branch IN ('VOLUME_CLIMAX_UNWIND', 'LOW_VOLUME_EXTENSION_FAILURE', 'LOW_VOLUME_EXTENSION_FAILURE_V2') "
             "AND strategy_family = 'CLIMAX_EXHAUSTION' AND root_event_id IS NOT NULL "
             "AND decision_evaluation_id IS NOT NULL) "
             "OR (strategy_branch = 'TRAPPED_LONGS_REVERSAL' "
@@ -103,6 +100,8 @@ class SignalProvenanceModel(Base):
     decision_event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     decision_distance_from_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     provenance_anomaly: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    event_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    entry_trigger_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SignalOutcomeModel(Base):
@@ -133,6 +132,20 @@ class SignalOutcomeModel(Base):
     signal: Mapped[SignalModel] = relationship(back_populates="outcome")
 
 
+class OutcomeFetchRetryModel(Base):
+    """Technical provider failures, never trading outcomes."""
+
+    __tablename__ = "outcome_fetch_retries"
+
+    task_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    exhausted: Mapped[bool] = mapped_column(Boolean, default=False)
+    first_failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    data_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class TelegramDeliveryOutboxModel(Base):
     """Durable, at-least-once Telegram delivery intent for new rows only."""
 
@@ -153,6 +166,27 @@ class TelegramDeliveryOutboxModel(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class EarlyDropWarningModel(Base):
+    """Separate non-actionable early-drop observation."""
+
+    __tablename__ = "early_drop_warnings"
+    __table_args__ = (
+        UniqueConstraint("root_event_id", "event_revision", name="uq_early_drop_warning_root_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lane: Mapped[str] = mapped_column(String(8), default="LANE-A")
+    root_event_id: Mapped[str] = mapped_column(String(128), index=True)
+    event_revision: Mapped[int] = mapped_column(Integer)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(String(128))
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    non_actionable: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    telegram_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class WatchCandidateModel(Base):
@@ -209,15 +243,40 @@ class RejectStatModel(Base):
     logged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class LowVolumeV2EpisodeStateModel(Base):
+    """Durable independent V2 episode state; never changes V1 event rows."""
+
+    __tablename__ = "low_volume_v2_episode_states"
+    __table_args__ = (
+        UniqueConstraint("root_event_id", "event_revision", name="uq_low_volume_v2_episode_identity"),
+        Index("ix_low_volume_v2_episode_symbol_state", "symbol", "v2_state"),
+    )
+
+    root_event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    event_revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    first_event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    current_anchor_high: Mapped[float] = mapped_column(Float)
+    current_anchor_high_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_retest_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_closed_candle_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    episode_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reset_count: Mapped[int] = mapped_column(Integer, default=0)
+    entry_trigger_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    v2_state: Mapped[str] = mapped_column(String(32), default="DISCOVERED", index=True)
+    emitted: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
 class EventStateModel(Base):
-    """Persistent symbol-level event state."""
+    """Persisted event lifecycle state per symbol."""
 
     __tablename__ = "event_states"
 
     symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
     event_id: Mapped[str] = mapped_column(String(128), index=True)
     state: Mapped[str] = mapped_column(String(32), index=True)
-    lifecycle_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     event_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     event_high_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -345,7 +404,6 @@ class StrategyObservationModel(Base):
     strategy: Mapped[str] = mapped_column(String(64), index=True)
     evaluation_phase: Mapped[str] = mapped_column(String(32), index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
-    event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     root_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     event_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attempt_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
@@ -365,11 +423,6 @@ class StrategyObservationModel(Base):
     config_hash: Mapped[str] = mapped_column(String(64), index=True)
     input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     input_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    initial_evaluation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    initial_decision: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    final_decision: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    final_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     outcome_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     outcome_json: Mapped[dict] = mapped_column(JSON, default=dict)
     outcome_mfe_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -380,6 +433,32 @@ class StrategyObservationModel(Base):
     outcome_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     outcome_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     outcome_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class StrategyCandidateModel(Base):
+    """Independent V2 candidate lifecycle ledger, separate from delivery."""
+
+    __tablename__ = "strategy_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "root_event_id", "event_revision", "strategy",
+            name="uq_strategy_candidate_root_revision_strategy",
+        ),
+        Index("ix_strategy_candidates_state_last_observed_at", "state", "last_observed_at"),
+    )
+
+    candidate_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    root_event_id: Mapped[str] = mapped_column(String(128), index=True)
+    event_revision: Mapped[int] = mapped_column(Integer)
+    strategy: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    attempt_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    terminal_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class ClimaxRootEventModel(Base):
@@ -481,16 +560,6 @@ class RuntimeHeartbeatModel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    process_last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    full_scan_last_complete: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    fast_monitor_last_complete: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    market_data_last_healthy: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    outbox_last_progress: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    outbox_last_observed: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    market_data_health: Mapped[str] = mapped_column(String(16), default="UNKNOWN")
-    outbox_health: Mapped[str] = mapped_column(String(16), default="UNKNOWN")
-    last_scan_duration_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
-    last_event_loop_lag_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     fast_monitor_last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fast_monitor_last_complete_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fast_monitor_pool_size: Mapped[int] = mapped_column(Integer, default=0)
@@ -869,3 +938,99 @@ class CurrentRootPredicateSnapshotModel(Base):
     evaluation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+
+class CausalPumpV2RootModel(Base):
+    """Mutable current state for one V2 causal pump root."""
+
+    __tablename__ = "causal_pump_v2_roots"
+    __table_args__ = (
+        Index("ix_causal_pump_v2_symbol_state", "symbol", "state"),
+        Index("ix_causal_pump_v2_created", "created_at"),
+    )
+
+    root_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str] = mapped_column(String(255))
+    event_low_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    event_low_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_high_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    event_high_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_range_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trigger_window: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    condition_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    method_version: Mapped[str] = mapped_column(String(64))
+
+
+class CausalPumpV2ComparisonModel(Base):
+    """Idempotent V1 vs V2 causal pump timing comparison."""
+
+    __tablename__ = "causal_pump_v2_comparisons"
+    __table_args__ = (
+        UniqueConstraint("pairing_key", name="uq_causal_pump_v2_comparison_pairing"),
+        Index("ix_causal_pump_v2_comp_symbol", "symbol", "compared_at"),
+        Index("ix_causal_pump_v2_comp_verdict", "verdict"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pairing_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    compared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    v1_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    v1_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    v1_event_high_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    v1_event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    v1_trigger_window: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    v2_root_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    v2_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    v2_event_low_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    v2_event_low_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    v2_event_high_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    v2_event_high_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    v2_trigger_window: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    verdict: Mapped[str] = mapped_column(String(32), index=True)
+    price_at_comparison: Mapped[float] = mapped_column(Float)
+    v2_ahead_by_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    method_version: Mapped[str] = mapped_column(String(64))
+
+
+class OutcomeContractV2Model(Base):
+    """Persisted, idempotent result of the Outcome Contract V2 evaluator."""
+
+    __tablename__ = "outcome_contract_v2_results"
+    __table_args__ = (
+        UniqueConstraint("result_id", name="uq_outcome_contract_v2_result"),
+        Index("ix_outcome_contract_v2_symbol_decision", "symbol", "decision_time"),
+        Index("ix_outcome_contract_v2_status_evaluated", "evaluation_status", "evaluated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    result_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    signal_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    decision_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    entry_fill_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    entry_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_fill_status: Mapped[str] = mapped_column(String(32))
+    tp_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sl_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp_hit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sl_hit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_passage: Mapped[str] = mapped_column(String(32))
+    resolution_detail: Mapped[str] = mapped_column(Text)
+    mfe_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_at_expiry_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_cost_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evaluation_status: Mapped[str] = mapped_column(String(32), index=True)
+    horizons_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    method_version: Mapped[str] = mapped_column(String(64))

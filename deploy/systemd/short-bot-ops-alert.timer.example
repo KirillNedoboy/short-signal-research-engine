@@ -1,0 +1,11 @@
+[Unit]
+Description=Evaluate operator alert rules periodically
+
+[Timer]
+OnCalendar=*:05/15:00
+AccuracySec=1min
+Persistent=true
+Unit=short-bot-ops-alert.service
+
+[Install]
+WantedBy=timers.target

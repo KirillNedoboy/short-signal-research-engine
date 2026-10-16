@@ -9,6 +9,24 @@ from enum import StrEnum
 
 BYBIT_PUBLIC_WS_SOURCE = "BYBIT_PUBLIC_WS"
 REST_BACKFILL_SOURCE = "REST_BACKFILL"
+TICKER_DECIMAL_FIELDS = {
+    "lastPrice": "last_price",
+    "markPrice": "mark_price",
+    "indexPrice": "index_price",
+    "fundingRate": "funding_rate",
+    "openInterest": "open_interest",
+    "volume24h": "volume_24h",
+    "turnover24h": "turnover_24h",
+    "price24hPcnt": "price_24h_pcnt",
+    "highPrice24h": "high_price_24h",
+    "lowPrice24h": "low_price_24h",
+    "prevPrice24h": "prev_price_24h",
+    "bid1Price": "bid1_price",
+    "bid1Size": "bid1_size",
+    "ask1Price": "ask1_price",
+    "ask1Size": "ask1_size",
+    "openInterestValue": "open_interest_value",
+}
 
 
 @dataclass(frozen=True, slots=True)

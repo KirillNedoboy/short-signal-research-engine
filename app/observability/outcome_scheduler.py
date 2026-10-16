@@ -5,14 +5,19 @@ from __future__ import annotations
 import logging
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 
+from app.infra.provider_errors import OutcomeBudgetUnavailable, ProviderRateLimited
+from app.infra.request_scheduler import RequestPriority
 from app.market.candles import klines_to_frame
 from app.observability.root_detector_shadow import evaluate_shadow_outcome
+from app.outcomes.fetch import OutcomeCandleFetcher
+from app.runtime.blocking import run_blocking
 
 
 logger = logging.getLogger(__name__)
@@ -166,8 +171,11 @@ class ShadowOutcomeScheduler:
         runtime_max_batch: int = 100,
         capacity_margin: float = 2.0,
         v2_enabled: bool,
+        fetcher: OutcomeCandleFetcher | None = None,
     ) -> None:
-        self._client = client
+        self._fetcher = fetcher
+        self._client = fetcher or client
+        self._cohort_cursor = 0
         self._repository = repository
         self._runtime_batch_size = max(0, runtime_batch_size)
         self._legacy_batch_size = max(0, legacy_batch_size)
@@ -180,6 +188,10 @@ class ShadowOutcomeScheduler:
         self._v2_enabled = bool(v2_enabled)
 
     async def run_cycle(self, *, now: datetime | None = None) -> SchedulerStats:
+        with self._fetcher.cycle() if self._fetcher is not None else nullcontext():
+            return await self._run_cycle(now=now)
+
+    async def _run_cycle(self, *, now: datetime | None = None) -> SchedulerStats:
         started = time.perf_counter()
         asof = _utc(now or datetime.now(timezone.utc))
         stats = SchedulerStats()
@@ -187,12 +199,14 @@ class ShadowOutcomeScheduler:
             runtime_batch_size = self._runtime_batch_size
             rate_fn = getattr(self._repository, "estimate_shadow_episode_rate", None)
             if rate_fn is not None:
+                incoming_rate = await run_blocking(rate_fn, now=asof)
                 runtime_batch_size = quota_for_rate(
-                    float(rate_fn(now=asof)), scan_interval_sec=self._scan_interval_sec,
+                    float(incoming_rate), scan_interval_sec=self._scan_interval_sec,
                     minimum=self._runtime_min_batch, maximum=self._runtime_max_batch,
                     capacity_margin=self._capacity_margin,
                 )
-            batches = self._repository.list_shadow_episode_outcomes_due(
+            batches = await run_blocking(
+                self._repository.list_shadow_episode_outcomes_due,
                 now=asof,
                 runtime_limit=runtime_batch_size,
                 legacy_limit=self._legacy_batch_size,
@@ -207,7 +221,9 @@ class ShadowOutcomeScheduler:
                 if v2_due_fn is None:
                     raise RuntimeError("V2 scheduler enabled but repository lacks V2 outcomes query")
                 try:
-                    v2_rows = list(v2_due_fn(now=asof, limit=runtime_batch_size))
+                    v2_rows = list(
+                        await run_blocking(v2_due_fn, now=asof, limit=runtime_batch_size)
+                    )
                 except Exception:
                     stats.v2_errors += 1
                     raise
@@ -215,9 +231,15 @@ class ShadowOutcomeScheduler:
             live_root_rows = []
             live_due_fn = getattr(self._repository, "list_current_root_outcomes_due", None)
             if live_due_fn is not None:
-                live_root_rows = list(live_due_fn(now=asof, limit=runtime_batch_size))
+                live_root_rows = list(
+                    await run_blocking(live_due_fn, now=asof, limit=runtime_batch_size)
+                )
             stats.live_root_due_seen = len(live_root_rows)
-            rows = [("runtime", row) for row in runtime_rows] + [("legacy", row) for row in legacy_rows] + [("v2", row) for row in v2_rows] + [("live_root", row) for row in live_root_rows]
+            cohorts = [("runtime", runtime_rows), ("legacy", legacy_rows), ("v2", v2_rows), ("live_root", live_root_rows)]
+            offset = self._cohort_cursor % len(cohorts)
+            self._cohort_cursor += 1
+            cohorts = cohorts[offset:] + cohorts[:offset]
+            rows = [(cohort, row) for cohort, batch in cohorts for row in batch]
             due_times = [_utc(row["next_due_at"]) for _, row in rows if row.get("next_due_at")]
             if due_times:
                 stats.oldest_overdue_seconds = max(0.0, (asof - min(due_times)).total_seconds())
@@ -225,22 +247,35 @@ class ShadowOutcomeScheduler:
             for symbol, symbol_rows in grouped.items():
                 try:
                     frame = await self._fetch_group(symbol, symbol_rows, asof, stats)
+                except OutcomeBudgetUnavailable:
+                    break
+                except ProviderRateLimited as exc:
+                    for cohort, row in symbol_rows:
+                        await self._record_rate_limit(row, exc, symbol=symbol)
+                    stats.retries += len(symbol_rows)
+                    continue
                 except Exception:
                     stats.errors += len(symbol_rows)
                     stats.v2_errors += sum(1 for cohort, _ in symbol_rows if cohort == "v2")
                     stats.live_root_errors += sum(1 for cohort, _ in symbol_rows if cohort == "live_root")
                     stats.retries += len(symbol_rows)
                     for cohort, row in symbol_rows:
-                        self._record_error(row, asof, stats)
+                        await self._record_error(row, asof, stats)
                     logger.exception("shadow outcome grouped fetch failed symbol=%s", symbol)
                     continue
                 for cohort, row in symbol_rows:
-                    self._process_row(cohort, row, frame, asof, stats)
+                    await self._process_row(cohort, row, frame, asof, stats)
             count_due = getattr(self._repository, "count_shadow_episode_outcomes_due", None)
-            stats.remaining_due = int(count_due(now=asof)) if count_due is not None else 0
+            stats.remaining_due = (
+                int(await run_blocking(count_due, now=asof))
+                if count_due is not None
+                else 0
+            )
             count_live_due = getattr(self._repository, "count_current_root_outcomes_due", None)
             if count_live_due is not None:
-                stats.remaining_due += int(count_live_due(now=asof))
+                stats.remaining_due += int(
+                    await run_blocking(count_live_due, now=asof)
+                )
             stats.episodes_deferred = max(0, stats.remaining_due - stats.errors)
         except Exception:
             stats.errors += 1
@@ -261,6 +296,7 @@ class ShadowOutcomeScheduler:
             symbol, "5", limit=limit,
             start_ms=int(start.timestamp() * 1000),
             end_ms=int(min(end, asof).timestamp() * 1000),
+            priority=RequestPriority.OUTCOME_REPLAY,
         )
         if isinstance(raw, pd.DataFrame):
             frame = raw
@@ -273,7 +309,7 @@ class ShadowOutcomeScheduler:
             frame["close_time"] = pd.to_datetime(frame["timestamp"], utc=True) + timedelta(minutes=5)
         return frame
 
-    def _process_row(self, cohort: str, row: dict[str, Any], frame: pd.DataFrame, asof: datetime, stats: SchedulerStats) -> None:
+    async def _process_row(self, cohort: str, row: dict[str, Any], frame: pd.DataFrame, asof: datetime, stats: SchedulerStats) -> None:
         try:
             outcome = evaluate_shadow_outcome(
                 observed_at=_utc(row["anchor_time"]),
@@ -292,21 +328,26 @@ class ShadowOutcomeScheduler:
                 data_gap_retry_minutes=self._data_gap_retry_minutes,
             )
             if cohort == "v2":
-                persisted = self._repository.record_root_detector_shadow_v2_outcome_attempt(
+                persisted = await run_blocking(
+                    self._repository.record_root_detector_shadow_v2_outcome_attempt,
                     row["shadow_v2_root_id"], outcome=outcome, next_due_at=next_due, computed_at=asof,
                 )
                 if persisted is False:
                     raise RuntimeError("V2 outcome persistence returned failure")
             elif cohort == "live_root":
-                persisted = self._repository.record_live_root_outcome_attempt(
+                persisted = await run_blocking(
+                    self._repository.record_live_root_outcome_attempt,
                     root_event_id=row["root_event_id"], outcome=outcome, next_due_at=next_due, computed_at=asof,
                 )
                 if persisted is False:
                     raise RuntimeError("LIVE_ROOT outcome persistence returned failure")
             else:
-                self._repository.record_root_detector_shadow_episode_outcome_attempt(
+                await run_blocking(
+                    self._repository.record_root_detector_shadow_episode_outcome_attempt,
                     row["episode_id"], outcome=outcome, next_due_at=next_due, computed_at=asof,
                 )
+            if self._fetcher is not None:
+                await run_blocking(self._fetcher.recovered, self._task_key(row))
             if cohort == "runtime":
                 stats.runtime_processed += 1
             elif cohort == "v2":
@@ -323,30 +364,65 @@ class ShadowOutcomeScheduler:
             elif cohort == "live_root":
                 stats.live_root_errors += 1
             try:
-                self._record_error(row, asof, stats)
+                await self._record_error(row, asof, stats)
             except Exception:
                 logger.exception("shadow outcome error bookkeeping failed episode_id=%s", row.get("episode_id"))
             logger.exception("shadow outcome computation failed episode_id=%s", row.get("episode_id"))
 
-    def _record_error(self, row: dict[str, Any], asof: datetime, stats: SchedulerStats) -> None:
+    @staticmethod
+    def _task_key(row: dict[str, Any]) -> str:
+        for kind, field in (("v2", "shadow_v2_root_id"), ("root", "root_event_id"), ("episode", "episode_id")):
+            if row.get(field):
+                return f"{kind}:{row[field]}"
+        raise ValueError("outcome task identity missing")
+
+    async def _record_rate_limit(self, row, exc, *, symbol):
+        fetcher = self._fetcher or OutcomeCandleFetcher(self._client, self._repository)
+        data, retry_at, now = await run_blocking(
+            fetcher.defer, self._task_key(row), exc, symbol=symbol, interval="5"
+        )
+        data["outcome_status"] = "DEFERRED"
+        kwargs = dict(outcome=data, error="provider_rate_limited", next_due_at=retry_at, computed_at=now)
+        if row.get("shadow_v2_root_id"):
+            saved = await run_blocking(
+                self._repository.record_root_detector_shadow_v2_outcome_attempt,
+                row["shadow_v2_root_id"], **kwargs
+            )
+        elif row.get("root_event_id"):
+            saved = await run_blocking(
+                self._repository.record_live_root_outcome_attempt,
+                root_event_id=row["root_event_id"], **kwargs
+            )
+        else:
+            saved = await run_blocking(
+                self._repository.record_root_detector_shadow_episode_outcome_attempt,
+                row["episode_id"], **kwargs
+            )
+        if saved is False:
+            raise RuntimeError("rate-limit deferral persistence failed")
+
+    async def _record_error(self, row: dict[str, Any], asof: datetime, stats: SchedulerStats) -> None:
         attempt = int(row.get("attempt_count") or 0)
         delay = min(60, 2 ** min(attempt, 6))
         if row.get("shadow_v2_root_id"):
-            self._repository.record_root_detector_shadow_v2_outcome_attempt(
+            await run_blocking(
+                self._repository.record_root_detector_shadow_v2_outcome_attempt,
                 row["shadow_v2_root_id"],
                 outcome={"outcome_status": "RETRYABLE_ERROR", "outcome_method_version": OUTCOME_METHOD_VERSION},
                 next_due_at=asof + timedelta(minutes=delay), computed_at=asof,
                 error="OUTCOME_SCHEDULER_ERROR",
             )
         elif row.get("root_event_id"):
-            self._repository.record_live_root_outcome_attempt(
+            await run_blocking(
+                self._repository.record_live_root_outcome_attempt,
                 root_event_id=row["root_event_id"],
                 outcome={"outcome_status": "RETRYABLE_ERROR", "outcome_method_version": OUTCOME_METHOD_VERSION, "anchor_type": "LIVE_ROOT"},
                 next_due_at=asof + timedelta(minutes=delay), computed_at=asof,
                 error="OUTCOME_SCHEDULER_ERROR",
             )
         else:
-            self._repository.record_root_detector_shadow_episode_outcome_attempt(
+            await run_blocking(
+                self._repository.record_root_detector_shadow_episode_outcome_attempt,
                 row["episode_id"],
                 outcome={"outcome_status": "RETRYABLE_ERROR", "outcome_method_version": OUTCOME_METHOD_VERSION},
                 next_due_at=asof + timedelta(minutes=delay), computed_at=asof,

@@ -9,7 +9,8 @@ from typing import Any, Generic, TypeVar
 
 from pybit.unified_trading import HTTP
 
-from app.infra.request_scheduler import RequestScheduler
+from app.infra.request_scheduler import RequestPriority, RequestScheduler
+from app.infra.provider_errors import ProviderRateLimited, retry_after_seconds
 
 T = TypeVar("T")
 
@@ -73,8 +74,30 @@ class BybitClient:
             # non-matching sentinel so RequestScheduler owns all retries.
             retry_codes={-1},
         )
+    async def _schedule(self, func, *, priority=None, **kwargs):
+        return await self._scheduler.schedule(self._call_once, func, priority=priority, **kwargs)
 
-    async def fetch_instruments(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _call_once(func, **params):
+        try:
+            response = func(**params)
+        except Exception as exc:
+            code = getattr(exc, "status_code", None)
+            if code in (10006, 429):
+                raise ProviderRateLimited(
+                    code,
+                    retry_after=retry_after_seconds(getattr(exc, "resp_headers", None)),
+                    global_scope=code == 429,
+                ) from None
+            raise
+        if isinstance(response, Mapping) and response.get("retCode") in (10006, "10006"):
+            raise ProviderRateLimited(10006)
+        return response
+
+
+    async def fetch_instruments(
+        self, *, priority: RequestPriority | None = None
+    ) -> list[dict[str, Any]]:
         """Fetch all linear instruments with cursor pagination."""
 
         instruments: list[dict[str, Any]] = []
@@ -84,7 +107,10 @@ class BybitClient:
             params: dict[str, Any] = {"category": "linear", "limit": 1000}
             if cursor:
                 params["cursor"] = cursor
-            response = await self._scheduler.schedule(self._client.get_instruments_info, **params)
+            response = await self._schedule(self._client.get_instruments_info,
+            priority=priority,
+            operation="fetch_instruments",
+            **params,)
             result = _validated_result(response, "fetch_instruments", require_list=True)
             instruments.extend(result.get("list", []))
             cursor = result.get("nextPageCursor") or None
@@ -93,19 +119,52 @@ class BybitClient:
 
         return instruments
 
-    async def fetch_tickers(self) -> list[dict[str, Any]]:
+    async def fetch_tickers(
+        self, *, priority: RequestPriority | None = None
+    ) -> list[dict[str, Any]]:
         """Fetch current linear ticker snapshots."""
 
-        return (await self.fetch_tickers_with_metadata()).data
+        return (await self.fetch_tickers_with_metadata(priority=priority)).data
 
     async def fetch_tickers_with_metadata(
-        self,
+        self, *, priority: RequestPriority | None = None
     ) -> RestMarketResponse[list[dict[str, Any]]]:
         """Fetch tickers while retaining the public response timestamp."""
 
-        response = await self._scheduler.schedule(self._client.get_tickers, category="linear")
+        response = await self._schedule(self._client.get_tickers,
+        priority=priority,
+        operation="fetch_tickers",
+        category="linear",)
         data = _validated_result(response, "fetch_tickers", require_list=True)["list"]
         return RestMarketResponse(data=data, server_time=_server_time(response))
+
+    async def fetch_symbol_ticker_with_metadata(
+        self,
+        symbol: str,
+        *,
+        priority: RequestPriority | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> RestMarketResponse[dict[str, Any]]:
+        """Fetch one current public linear ticker within the scan deadline."""
+        symbol = symbol.upper()
+        response = await self._schedule(
+            self._client.get_tickers,
+            priority=priority,
+            operation="fetch_symbol_ticker",
+            deadline_monotonic=deadline_monotonic,
+            category="linear",
+            symbol=symbol,
+        )
+        rows = _validated_result(
+            response, "fetch_symbol_ticker", require_list=True
+        )["list"]
+        if (
+            len(rows) != 1
+            or not isinstance(rows[0], dict)
+            or rows[0].get("symbol") != symbol
+        ):
+            raise BybitResponseError("fetch_symbol_ticker", 0, "symbol ticker missing")
+        return RestMarketResponse(data=rows[0], server_time=_server_time(response))
 
     async def fetch_klines(
         self,
@@ -114,6 +173,9 @@ class BybitClient:
         limit: int = 240,
         start_ms: int | None = None,
         end_ms: int | None = None,
+        *,
+        priority: RequestPriority | None = None,
+        deadline_monotonic: float | None = None,
     ) -> list[list[str]]:
         """Fetch recent klines."""
 
@@ -124,6 +186,8 @@ class BybitClient:
                 limit=limit,
                 start_ms=start_ms,
                 end_ms=end_ms,
+                priority=priority,
+                deadline_monotonic=deadline_monotonic,
             )
         ).data
 
@@ -134,6 +198,9 @@ class BybitClient:
         limit: int = 240,
         start_ms: int | None = None,
         end_ms: int | None = None,
+        *,
+        priority: RequestPriority | None = None,
+        deadline_monotonic: float | None = None,
     ) -> RestMarketResponse[list[list[str]]]:
         """Fetch klines while retaining the public response timestamp."""
 
@@ -147,42 +214,61 @@ class BybitClient:
             params["start"] = start_ms
         if end_ms is not None:
             params["end"] = end_ms
-        response = await self._scheduler.schedule(self._client.get_kline, **params)
+        response = await self._schedule(self._client.get_kline,
+        priority=priority,
+        operation="fetch_klines",
+        deadline_monotonic=deadline_monotonic,
+        **params,)
         data = _validated_result(response, "fetch_klines", require_list=True)["list"]
         return RestMarketResponse(data=data, server_time=_server_time(response))
 
-    async def fetch_open_interest(self, symbol: str, interval: str = "15min", limit: int = 5) -> list[dict[str, Any]]:
+    async def fetch_open_interest(
+        self,
+        symbol: str,
+        interval: str = "15min",
+        limit: int = 5,
+        *,
+        priority: RequestPriority | None = None,
+    ) -> list[dict[str, Any]]:
         """Fetch open-interest history for a symbol."""
 
-        response = await self._scheduler.schedule(
-            self._client.get_open_interest,
-            category="linear",
-            symbol=symbol,
-            intervalTime=interval,
-            limit=limit,
-        )
+        response = await self._schedule(self._client.get_open_interest,
+        priority=priority,
+        operation="fetch_open_interest",
+        category="linear",
+        symbol=symbol,
+        intervalTime=interval,
+        limit=limit,)
         return _validated_result(response, "fetch_open_interest", require_list=True)["list"]
 
-    async def fetch_funding(self, symbol: str, limit: int = 1) -> list[dict[str, Any]]:
+    async def fetch_funding(
+        self, symbol: str, limit: int = 1, *, priority: RequestPriority | None = None
+    ) -> list[dict[str, Any]]:
         """Fetch funding history for a symbol."""
 
-        response = await self._scheduler.schedule(
-            self._client.get_funding_rate_history,
-            category="linear",
-            symbol=symbol,
-            limit=limit,
-        )
+        response = await self._schedule(self._client.get_funding_rate_history,
+        priority=priority,
+        operation="fetch_funding",
+        category="linear",
+        symbol=symbol,
+        limit=limit,)
         return _validated_result(response, "fetch_funding", require_list=True)["list"]
 
-    async def fetch_orderbook(self, symbol: str, limit: int = 50) -> dict[str, Any]:
+    async def fetch_orderbook(
+        self,
+        symbol: str,
+        limit: int = 50,
+        *,
+        priority: RequestPriority | None = None,
+    ) -> dict[str, Any]:
         """Fetch the current linear orderbook for a symbol."""
 
-        response = await self._scheduler.schedule(
-            self._client.get_orderbook,
-            category="linear",
-            symbol=symbol,
-            limit=limit,
-        )
+        response = await self._schedule(self._client.get_orderbook,
+        priority=priority,
+        operation="fetch_orderbook",
+        category="linear",
+        symbol=symbol,
+        limit=limit,)
         return dict(_validated_result(response, "fetch_orderbook", require_list=False))
 
     @staticmethod
