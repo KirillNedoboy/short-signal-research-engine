@@ -1,0 +1,66 @@
+[Unit]
+Description=Lane C bounded shadow supervisor with a root read-only probe guard
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=/opt/short-bot-lane-c-shadow-release
+ConditionPathExists=/var/lib/short-bot-lane-c-shadow/p95-probes.json
+
+[Service]
+Type=simple
+# The supervisor is root only because production A is mode 0600.  The
+# application process is always dropped before exec with setpriv below.
+User=root
+Group=root
+WorkingDirectory=/opt/short-bot-lane-c-shadow-release
+
+# shadow_guard.py creates these paths with mode 0700.  Make them child-owned
+# before startup so the root supervisor cannot leave a root-owned writable
+# tree that the dropped child cannot use.  These are fixed isolated paths;
+# never replace them with a wildcard or a production directory.
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/short-bot-lane-c-shadow
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/short-bot-lane-c-shadow/db /var/lib/short-bot-lane-c-shadow/runtime /var/lib/short-bot-lane-c-shadow/locks /var/lib/short-bot-lane-c-shadow/checkpoints /var/lib/short-bot-lane-c-shadow/comparisons /var/lib/short-bot-lane-c-shadow/raw /var/lib/short-bot-lane-c-shadow/logs /var/lib/short-bot-lane-c-shadow/runtime/cache /var/lib/short-bot-lane-c-shadow/runtime/tmp
+ExecStartPre=/usr/bin/chown short-bot-c-shadow:short-bot-c-shadow /var/lib/short-bot-lane-c-shadow /var/lib/short-bot-lane-c-shadow/db /var/lib/short-bot-lane-c-shadow/runtime /var/lib/short-bot-lane-c-shadow/locks /var/lib/short-bot-lane-c-shadow/checkpoints /var/lib/short-bot-lane-c-shadow/comparisons /var/lib/short-bot-lane-c-shadow/raw /var/lib/short-bot-lane-c-shadow/logs /var/lib/short-bot-lane-c-shadow/runtime/cache /var/lib/short-bot-lane-c-shadow/runtime/tmp
+ExecStartPre=/usr/bin/chmod 0700 /var/lib/short-bot-lane-c-shadow /var/lib/short-bot-lane-c-shadow/db /var/lib/short-bot-lane-c-shadow/runtime /var/lib/short-bot-lane-c-shadow/locks /var/lib/short-bot-lane-c-shadow/checkpoints /var/lib/short-bot-lane-c-shadow/comparisons /var/lib/short-bot-lane-c-shadow/raw /var/lib/short-bot-lane-c-shadow/logs /var/lib/short-bot-lane-c-shadow/runtime/cache /var/lib/short-bot-lane-c-shadow/runtime/tmp
+ExecStartPre=/usr/bin/test -r /var/lib/short-bot-lane-c-shadow/p95-probes.json
+
+# The wrapper owns gate/control files; UMask=0022 leaves those isolated files
+# readable by the dropped child.  No production EnvironmentFile is loaded.
+ExecStart=/opt/short-bot-lane-c-shadow-release/.venv/bin/python /opt/short-bot-lane-c-shadow-release/tools/shadow_guard.py --root /var/lib/short-bot-lane-c-shadow --p95-probes /var/lib/short-bot-lane-c-shadow/p95-probes.json --ab-interval-sec 1800 --max-runtime-sec 86400 --max-storage-bytes 1073741824 --raw-storage-threshold-bytes 268435456 --raw-disable-grace-sec 90 --min-free-bytes 10737418240 -- /usr/bin/setpriv --reuid=short-bot-c-shadow --regid=short-bot-c-shadow --clear-groups --no-new-privs -- /opt/short-bot-lane-c-shadow-release/.venv/bin/python /opt/short-bot-lane-c-shadow-release/run_live.py
+Environment=PYTHONNOUSERSITE=1
+Environment=AUTOEXECUTION=OFF
+Environment=SHADOW_DELIVERY_GATE=CLOSED
+UMask=0022
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+# Root can read the mode-0600 A database.  The child receives none of these
+# capabilities after setpriv drops uid/gid/groups.  ProtectSystem plus the
+# explicit read-only production paths prevents writes even from the guard.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID
+ReadOnlyPaths=/opt/short-telegram-bot-lite /opt/short-telegram-bot-lite-admin -/opt/short-bot-lane-c
+ReadWritePaths=/var/lib/short-bot-lane-c-shadow
+MemoryMax=2G
+TasksMax=256
+LimitNOFILE=4096
+TimeoutStopSec=20s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

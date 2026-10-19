@@ -1,0 +1,31 @@
+[Unit]
+Description=Lane C bounded shadow supervisor (manual template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=short-bot-c-shadow
+Group=short-bot-c-shadow
+WorkingDirectory=/opt/short-bot-lane-c-shadow-release
+# The supervisor closes delivery and supplies all writable paths before the
+# child starts. Keep the child command exact after the ``--`` separator.
+ExecStart=/opt/short-bot-lane-c-shadow-release/.venv/bin/python /opt/short-bot-lane-c-shadow-release/tools/shadow_guard.py --root /var/lib/short-bot-lane-c-shadow --raw-storage-threshold-bytes 268435456 --raw-disable-grace-sec 90 -- /opt/short-bot-lane-c-shadow-release/.venv/bin/python /opt/short-bot-lane-c-shadow-release/run_live.py
+Environment=PYTHONNOUSERSITE=1
+Environment=AUTOEXECUTION=OFF
+Environment=SHADOW_DELIVERY_GATE=CLOSED
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Production lane roots are visible only read-only. The shadow root is the
+# sole writable location and must be a separate filesystem path.
+ReadOnlyPaths=/opt/short-telegram-bot-lite /opt/short-telegram-bot-lite-admin -/opt/short-bot-lane-c
+ReadWritePaths=/var/lib/short-bot-lane-c-shadow
+MemoryMax=2G
+LimitNOFILE=4096
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target

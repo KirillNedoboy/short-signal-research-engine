@@ -1,0 +1,32 @@
+[Unit]
+Description=Lane C candidate event-driven runtime (manual template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/short-telegram-bot-lite-admin/lane-c
+ExecStart=/opt/short-bot-c-runtime-validation/candidate-venv/bin/python /opt/short-bot-lane-c-live/run_live.py
+Environment=LANE_C_CONFIG_PATH=/opt/short-telegram-bot-lite-admin/lane-c/config.yaml
+Environment=LANE_C_ENV_PATH=/opt/short-telegram-bot-lite-admin/lane-c/.env
+Environment=LANE_C_LOCK_PATH=/opt/short-telegram-bot-lite-admin/lane-c/runtime/lane-c.lock
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPYCACHEPREFIX=/var/lib/short-bot-lane-c-live/runtime/pycache
+Environment=CANONICAL_MARKET_DATA_PROVIDER_EVIDENCE_PATH=/var/lib/short-bot-lane-c-live/runtime/canonical-marketdata-provider-evidence.json
+Environment=AUTOEXECUTION=OFF
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The existing C config/.env select the production DB and REST_ONLY settings.
+# Only its DB data directory, existing fence file, and candidate runtime
+# boundary are writable; credentials are loaded from the existing env file.
+ReadOnlyPaths=/opt/short-bot-lane-c-live /opt/short-telegram-bot-lite-admin/lane-c
+ReadWritePaths=/opt/short-telegram-bot-lite-admin/lane-c/data /opt/short-telegram-bot-lite-admin/lane-c/runtime/lane-c.lock /var/lib/short-bot-lane-c-live/runtime
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
