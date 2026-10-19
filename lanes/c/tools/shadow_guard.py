@@ -588,9 +588,16 @@ def _load_p95_probes(path: Path) -> list[dict[str, Any]]:
                 raise ShadowGuardError(f"p95 probe {name} has an invalid scheduled_symbols_range")
             cohort_min = range_min if cohort_min is None else cohort_min
             cohort_max = range_max if cohort_max is None else cohort_max
-        if cohort_min is None or cohort_max is None or cohort_min <= 0 or cohort_max < cohort_min:
+        if (
+            cohort_min is None
+            or cohort_max is None
+            or cohort_min < 0
+            or cohort_max <= 0
+            or cohort_max < cohort_min
+        ):
             raise ShadowGuardError(
-                f"p95 probe {name} requires a positive scheduled-symbol cohort range"
+                f"p95 probe {name} requires a non-negative scheduled-symbol cohort range "
+                "with a positive maximum"
             )
         baseline = _safe_existing_path(baseline_value)
         production = _safe_existing_path(production_value, allow_production_readonly=True)

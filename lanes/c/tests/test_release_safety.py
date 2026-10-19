@@ -375,8 +375,8 @@ def test_shadow_guard_loads_named_ab_probes_and_filters_real_cycle_schema(tmp_pa
         json.dumps(
             {
                 "records": [
-                    {"duration_ms": 1500, "scheduled_symbols": 18},
-                    {"duration_ms": 1700, "scheduled_symbols": 22},
+                    {"duration_ms": 1500, "scheduled_symbols": 0},
+                    {"duration_ms": 1700, "scheduled_symbols": 1},
                     {"duration_ms": 9000, "scheduled_symbols": 121},
                 ]
             }
@@ -400,7 +400,7 @@ def test_shadow_guard_loads_named_ab_probes_and_filters_real_cycle_schema(tmp_pa
             INSERT INTO market_scan_cycles VALUES
                 ('a', '2026-10-17T00:00:00Z', '2026-10-17T00:01:00Z', 1100, 121, 'ok', 0, 0),
                 ('b', '2026-10-17T00:02:00Z', '2026-10-17T00:03:00Z', 1300, 149, 'ok', 0, 0),
-                ('c', '2026-10-17T00:04:00Z', '2026-10-17T00:05:00Z', 9900, 22, 'ok', 0, 0);
+                ('c', '2026-10-17T00:04:00Z', '2026-10-17T00:05:00Z', 9900, 0, 'ok', 0, 0);
             """
         )
     config = tmp_path / "p95-probes.json"
@@ -419,8 +419,8 @@ def test_shadow_guard_loads_named_ab_probes_and_filters_real_cycle_schema(tmp_pa
                         "name": "B",
                         "baseline": str(baseline_b),
                         "production_readonly_db": str(production),
-                        "cohort_min": 18,
-                        "cohort_max": 22,
+                        "cohort_min": 0,
+                        "cohort_max": 1,
                     },
                 ]
             }
@@ -434,12 +434,23 @@ def test_shadow_guard_loads_named_ab_probes_and_filters_real_cycle_schema(tmp_pa
         production, cohort_min=100, cohort_max=150
     )
     b_metrics = guard._metrics_from_path(
-        production, cohort_min=18, cohort_max=22
+        production, cohort_min=0, cohort_max=1
     )
     assert a_metrics["samples"] == 2
     assert b_metrics["samples"] == 1
     assert a_metrics["cohort_min"] == 121
     assert a_metrics["cohort_max"] == 149
+    assert b_metrics["cohort_min"] == 0
+    assert b_metrics["cohort_max"] == 0
+
+    for cohort_min, cohort_max in ((-1, 1), (0, 0)):
+        invalid = json.loads(config.read_text(encoding="utf-8"))
+        invalid["probes"][1]["cohort_min"] = cohort_min
+        invalid["probes"][1]["cohort_max"] = cohort_max
+        invalid_path = tmp_path / f"p95-probes-invalid-{cohort_min}-{cohort_max}.json"
+        invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(guard.ShadowGuardError):
+            guard._load_p95_probes(invalid_path)
 
 
 def test_shadow_guard_p95_uses_recorded_cycle_window_and_reports_sample_range(tmp_path: Path) -> None:

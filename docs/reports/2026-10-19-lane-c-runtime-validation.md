@@ -2,9 +2,9 @@
 
 Status: implementation is complete for the approved design. Scoped Linux
 candidate verification and release provenance are recorded. Overall validation
-remains IN PROGRESS because the isolated 24-hour shadow is NOT_STARTED at this
-report snapshot. Production Lane C has not been switched, and no production
-cutover has been performed.
+remains IN PROGRESS; the isolated 24-hour shadow is RUNNING from its verified
+start at 2026-10-19 18:49:48 UTC. Production Lane C has not been switched, and
+no production cutover has been performed.
 
 ## Pinned references
 
@@ -29,7 +29,8 @@ cutover has been performed.
 | Final raw-capture watermark guard | 2026-10-19 | `1 passed, 9 deselected` for `shadow_guard_requests_raw_disable_at_watermark_without_total_stop`; unit `lane-c-cguard-final-raw-85fc.service` |
 | Linux valid-data benchmark | 2026-10-19 | `120` windows × `100` symbols; `12000 SCANNED_OK`, coverage `1.0`, window median `4536.226 ms`, p95 `4871.118 ms`, P0 p95 `11998.862 ms` over `100` P0 samples, `0` P0 deadline misses; synthetic seams disclosed below |
 | Candidate release archive | 2026-10-19 | SHA-256 `7dd001008bbff38bf122a172806078ff7e973095a07252d984f9427c75df6bc7`; remote verification `157` files / `139` source files |
-| Production process check | 2026-10-19 | A/B/C/collector running with unchanged PIDs; no shadow service running |
+| Production process check before shadow start | 2026-10-19 | A/B/C/collector running with unchanged PIDs; no production process was changed |
+| Actual isolated shadow observation | 2026-10-19 18:52:30 UTC | RUNNING; verified start `18:49:48 UTC`; unit active; `runtime_started=true`; readiness remains `false` with `process_started`; `3` cycles / `300` coverage; no `429`; isolation gate closed; footprint approximately `2.6 MB`; free disk approximately `13.5 GiB`; production PIDs unchanged |
 
 The historical database compatibility check used a consistent private SQLite
 copy. It did not scan the large `strategy_observations` table. The temporary
@@ -69,16 +70,22 @@ does not establish candidate readiness.
   shadow-root limit. The watermark can be crossed during that bounded grace
   while raw capture is being disabled, so these values are not a claim of a
   strict per-recorder `256 MiB` cap.
-- The production services and production databases remain unchanged. No
-  candidate process was started by this handoff; the actual shadow start/end
-  timestamps will be appended after root start approval.
+- The production services and production databases remain unchanged. The
+  isolated shadow unit is active, but its readiness status remains false with
+  reason `process_started`; `runtime_started=true` does not claim readiness.
 
-## Execution status (2026-10-19)
+## Execution status (2026-10-19 18:52:30 UTC)
 
 - Source pin, release archive, scoped Linux validation, and the final raw-capture
   watermark guard are recorded above.
-- The actual isolated shadow is NOT_STARTED. Overall validation remains
-  IN PROGRESS; no 24-hour elapsed-time or parity result is claimed.
+- The actual isolated shadow is RUNNING, with verified start at
+  `2026-10-19 18:49:48 UTC` and last status at `2026-10-19 18:52:30 UTC`:
+  `3` cycles / `300` coverage, no `429`, isolation gate closed, approximately
+  `2.6 MB` footprint, and approximately `13.5 GiB` free disk. Readiness remains
+  `false` with `process_started`; the unit being active does not claim
+  readiness.
+- Overall validation remains IN PROGRESS; the 24-hour observation is not
+  complete and no parity result or production cutover is claimed.
 - Production A/B/C/collector processes and production databases remain
   unchanged.
 
@@ -98,7 +105,8 @@ not performance acceptance evidence. The duplicate Windows run was stopped.
 - Collect bounded real input/state capture and run exact offline comparison with
   frozen C; missing inputs and final rechecks remain `UNKNOWN`.
 - Complete the isolated 24-hour shadow report before user review of production
-  cutover. The shadow has not started at this snapshot.
+  cutover. The observation is active and has not reached 24 hours at this
+  snapshot.
 
 Final synthetic measurements must disclose in-memory provider/repository seams.
 They cannot substitute for the real-market observation. Missing comparison
