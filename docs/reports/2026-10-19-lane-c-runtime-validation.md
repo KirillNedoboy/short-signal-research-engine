@@ -29,8 +29,9 @@ no production cutover has been performed.
 | Final raw-capture watermark guard | 2026-10-19 | `1 passed, 9 deselected` for `shadow_guard_requests_raw_disable_at_watermark_without_total_stop`; unit `lane-c-cguard-final-raw-85fc.service` |
 | Linux valid-data benchmark | 2026-10-19 | `120` windows × `100` symbols; `12000 SCANNED_OK`, coverage `1.0`, window median `4536.226 ms`, p95 `4871.118 ms`, P0 p95 `11998.862 ms` over `100` P0 samples, `0` P0 deadline misses; synthetic seams disclosed below |
 | Candidate release archive | 2026-10-19 | SHA-256 `7dd001008bbff38bf122a172806078ff7e973095a07252d984f9427c75df6bc7`; remote verification `157` files / `139` source files |
+| Shadow release archive | 2026-10-19 | SHA-256 `60933640588363b152e2a2c7a4356112d44bd4ee72e21e3e0bc94b4b8b79c649`; isolated deployment archive, with the candidate source pin unchanged |
 | Production process check before shadow start | 2026-10-19 | A/B/C/collector running with unchanged PIDs; no production process was changed |
-| Actual isolated shadow observation | 2026-10-19 18:52:30 UTC | RUNNING; verified start `18:49:48 UTC`; unit active; `runtime_started=true`; readiness remains `false` with `process_started`; `3` cycles / `300` coverage; no `429`; isolation gate closed; footprint approximately `2.6 MB`; free disk approximately `13.5 GiB`; production PIDs unchanged |
+| Actual isolated shadow observation | 2026-10-19 18:58:11 UTC | RUNNING; verified start `18:49:48 UTC`; unit active with no restarts; `runtime_started=true`; readiness remains `false` with `process_started`; `8` cycles / `800` coverage; no `429`; isolation gate closed; raw capture `6.9 MB`, total footprint `10.0 MB`; free disk approximately `13.5 GiB`; production PIDs unchanged |
 
 The historical database compatibility check used a consistent private SQLite
 copy. It did not scan the large `strategy_observations` table. The temporary
@@ -74,16 +75,16 @@ does not establish candidate readiness.
   isolated shadow unit is active, but its readiness status remains false with
   reason `process_started`; `runtime_started=true` does not claim readiness.
 
-## Execution status (2026-10-19 18:52:30 UTC)
+## Execution status (2026-10-19 18:58:11 UTC)
 
 - Source pin, release archive, scoped Linux validation, and the final raw-capture
   watermark guard are recorded above.
 - The actual isolated shadow is RUNNING, with verified start at
-  `2026-10-19 18:49:48 UTC` and last status at `2026-10-19 18:52:30 UTC`:
-  `3` cycles / `300` coverage, no `429`, isolation gate closed, approximately
-  `2.6 MB` footprint, and approximately `13.5 GiB` free disk. Readiness remains
-  `false` with `process_started`; the unit being active does not claim
-  readiness.
+  `2026-10-19 18:49:48 UTC` and last status at `2026-10-19 18:58:11 UTC`:
+  `8` cycles / `800` coverage, no `429`, isolation gate closed, `6.9 MB` raw
+  capture, `10.0 MB` total footprint, and approximately `13.5 GiB` free disk.
+  Readiness remains `false` with `process_started`; the unit being active does
+  not claim readiness.
 - Overall validation remains IN PROGRESS; the 24-hour observation is not
   complete and no parity result or production cutover is claimed.
 - Production A/B/C/collector processes and production databases remain
