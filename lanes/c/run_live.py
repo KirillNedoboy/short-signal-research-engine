@@ -67,9 +67,32 @@ from app.runtime.instance_fence import InstanceFence, run_fenced  # noqa: E402
 from app.runtime.shadow import load_shadow_config  # noqa: E402
 
 
-CONFIG_PATH = _SHADOW_PATHS.config_path if _SHADOW_PATHS is not None else ROOT / "config.yaml"
-ENV_PATH = _SHADOW_PATHS.env_path if _SHADOW_PATHS is not None else ROOT / ".env"
-LOCK_PATH = _SHADOW_PATHS.lock_path if _SHADOW_PATHS is not None else ROOT / "runtime" / "lane-c.lock"
+def _path_override(environment_name: str, fallback: Path) -> Path:
+    """Return a full-mode path override without changing shadow resolution.
+
+    Production cutover keeps the existing C config and environment files in
+    their installation root while placing the process fence in a separate
+    writable state directory.  Empty overrides retain the archive defaults;
+    shadow mode never reaches this helper because its validated paths are
+    authoritative above.
+    """
+
+    value = os.environ.get(environment_name)
+    if value is None or not value.strip():
+        return fallback
+    return Path(value).expanduser()
+
+
+if _SHADOW_PATHS is not None:
+    CONFIG_PATH = _SHADOW_PATHS.config_path
+    ENV_PATH = _SHADOW_PATHS.env_path
+    LOCK_PATH = _SHADOW_PATHS.lock_path
+else:
+    CONFIG_PATH = _path_override("LANE_C_CONFIG_PATH", ROOT / "config.yaml")
+    ENV_PATH = _path_override("LANE_C_ENV_PATH", ROOT / ".env")
+    LOCK_PATH = _path_override(
+        "LANE_C_LOCK_PATH", ROOT / "runtime" / "lane-c.lock"
+    )
 INSTANCE_IDENTITY = "short-telegram-bot-lite-c"
 _validated_config = None
 
@@ -92,7 +115,7 @@ def verify_source_pin() -> None:
 
 
 def instance_fence() -> InstanceFence:
-    """Return the Lane C fence; no environment override can select a shared lock."""
+    """Return the Lane C fence for the selected full-mode state boundary."""
 
     if _SHADOW_PATHS is not None:
         return InstanceFence(
