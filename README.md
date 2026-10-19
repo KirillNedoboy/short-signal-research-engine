@@ -2,6 +2,21 @@
 
 > Documentation status: sanitized public mirror of the signal and research runtime; operational deployment state is excluded.
 
+## Lane C runtime candidate
+
+`lanes/c/src/app` and `lanes/c/run_live.py` contain the Lane C runtime candidate
+under development. The pinned historical C source remains in `lanes/c/release/`.
+The design retains C's strategy configuration and uses bounded background
+workers and fixed minute scheduling. Deployment acceptance is still in progress;
+the production C service has not been switched.
+
+Use [Lane C's instructions](lanes/c/README.md), the
+[implementation plan](docs/superpowers/plans/2026-10-16-lane-c-runtime-upgrade.md),
+and the [validation record](docs/reports/2026-10-19-lane-c-runtime-validation.md)
+for its configuration and current acceptance status. The defaults documented
+below describe the root application; each Lane's effective configuration is
+authoritative for its enabled strategies and delivery settings.
+
 ## Documentation map
 
 - [Mathematical specification](docs/MATHEMATICS.md)

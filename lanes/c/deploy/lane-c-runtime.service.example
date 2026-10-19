@@ -1,0 +1,22 @@
+[Unit]
+Description=Lane C candidate event-driven runtime (manual template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/short-bot-lane-c
+ExecStart=/opt/short-bot-lane-c/.venv/bin/python /opt/short-bot-lane-c/run_live.py
+Environment=PYTHONNOUSERSITE=1
+Environment=AUTOEXECUTION=OFF
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/short-bot-lane-c/data /opt/short-bot-lane-c/runtime
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
